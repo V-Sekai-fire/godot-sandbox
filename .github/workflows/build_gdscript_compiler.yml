@@ -1,0 +1,50 @@
+name: Build GDScript Compiler ELF
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{github.workspace}}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y gcc-14-riscv64-linux-gnu g++-14-riscv64-linux-gnu cmake
+
+      - name: Build unittests ELF (contains compile_to_elf)
+        working-directory: ${{github.workspace}}/tests
+        env:
+          CXX: riscv64-linux-gnu-g++-14
+          CC: riscv64-linux-gnu-gcc-14
+        run: |
+          mkdir -p .build_compiler
+          cd .build_compiler
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake \
+            -DSTRIPPED=OFF \
+            -DFLTO=ON
+          make -j$(nproc) unittests
+
+      - name: Upload GDScript compiler ELF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdscript-compiler-elf
+          path: tests/.build_compiler/unittests
+          retention-days: 30
+
