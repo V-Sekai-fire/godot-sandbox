@@ -13,8 +13,8 @@ else
 	fi
 fi
 
-export CC="zig;cc;-target riscv64-linux-musl"
-export CXX="zig;c++;-target riscv64-linux-musl"
+export CC="zig cc -target riscv64-linux-musl"
+export CXX="zig c++ -target riscv64-linux-musl"
 
 # Build the unit test ELF file
 mkdir -p .zig
