@@ -618,9 +618,9 @@ APICALL(api_vclone) {
 
 	if (vret_addr != 0) {
 		// Find scoped Variant and clone it.
-		std::optional<const Variant *> var = emu.get_scoped_variant(vp->v.i);
+		std::optional<const Variant *> var = emu.get_scoped_variant(static_cast<int32_t>(vp->v.i));
 		if (var.has_value()) {
-			const unsigned index = emu.create_scoped_variant(var.value()->duplicate());
+			const int32_t index = emu.create_scoped_variant(var.value()->duplicate());
 			// Duplicate the Variant and store the index in the guest memory.
 			GuestVariant *vret = machine.memory.memarray<GuestVariant>(vret_addr, 1);
 			vret->type = var.value()->get_type();
@@ -631,8 +631,8 @@ APICALL(api_vclone) {
 		}
 	} else {
 		// Duplicate or move the Variant into permanent storage (m_level[0]).
-		const unsigned idx = vp->v.i;
-		unsigned new_idx = emu.create_permanent_variant(idx);
+		const int32_t idx = static_cast<int32_t>(vp->v.i);
+		int32_t new_idx = emu.create_permanent_variant(idx);
 		// Update the Variant with the new index.
 		vp->v.i = new_idx;
 	}

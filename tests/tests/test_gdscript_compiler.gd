@@ -395,3 +395,86 @@ func pf32a_operation(array):
 		print("%s benchmark took %d us" % [name, end_time - start_time])
 
 		s.queue_free()
+
+func test_variant_index_64bit_corruption():
+	# Test for 64-bit variant index corruption bug
+	# This test verifies that permanent variants (negative indices) are correctly preserved
+	# The bug was that negative indices were being returned as unsigned, causing corruption
+	var gdscript_code = """
+func return_array():
+	var arr = [1, 2, 3, 4, 5]
+	return arr
+
+func return_dict():
+	var dict = {"key1": "value1", "key2": 42, "key3": true}
+	return dict
+
+func nested_array_return():
+	return return_array()
+
+func nested_dict_return():
+	return return_dict()
+
+func chained_array_returns():
+	var arr1 = return_array()
+	var arr2 = nested_array_return()
+	return [arr1, arr2]
+
+func complex_return():
+	var arr = return_array()
+	var dict = return_dict()
+	return {"array": arr, "dict": dict, "nested": {"inner": arr}}
+"""
+
+	var ts : Sandbox = Sandbox.new()
+	ts.set_program(Sandbox_TestsTests)
+	var compiled_elf = ts.vmcall("compile_to_elf", gdscript_code)
+	assert_eq(compiled_elf.is_empty(), false, "Compiled ELF should not be empty")
+
+	var s = Sandbox.new()
+	s.load_buffer(compiled_elf)
+	s.set_instructions_max(6000)
+	assert_true(s.has_function("return_array"), "Compiled ELF should have function 'return_array'")
+	assert_true(s.has_function("return_dict"), "Compiled ELF should have function 'return_dict'")
+	assert_true(s.has_function("nested_array_return"), "Compiled ELF should have function 'nested_array_return'")
+	assert_true(s.has_function("nested_dict_return"), "Compiled ELF should have function 'nested_dict_return'")
+	assert_true(s.has_function("chained_array_returns"), "Compiled ELF should have function 'chained_array_returns'")
+	assert_true(s.has_function("complex_return"), "Compiled ELF should have function 'complex_return'")
+
+	# Test direct array return (should be stored as permanent variant)
+	var result = s.vmcallv("return_array")
+	assert_eq(result.size(), 5, "return_array should return array of size 5")
+	assert_eq(result[0], 1, "return_array[0] should be 1")
+	assert_eq(result[4], 5, "return_array[4] should be 5")
+
+	# Test direct dict return (should be stored as permanent variant)
+	result = s.vmcallv("return_dict")
+	assert_eq(result.size(), 3, "return_dict should return dict of size 3")
+	assert_eq(result["key1"], "value1", "return_dict['key1'] should be 'value1'")
+	assert_eq(result["key2"], 42, "return_dict['key2'] should be 42")
+	assert_eq(result["key3"], true, "return_dict['key3'] should be true")
+
+	# Test nested array return (tests variant index preservation through function calls)
+	result = s.vmcallv("nested_array_return")
+	assert_eq(result.size(), 5, "nested_array_return should return array of size 5")
+	assert_eq(result[0], 1, "nested_array_return[0] should be 1")
+
+	# Test nested dict return
+	result = s.vmcallv("nested_dict_return")
+	assert_eq(result.size(), 3, "nested_dict_return should return dict of size 3")
+	assert_eq(result["key1"], "value1", "nested_dict_return['key1'] should be 'value1'")
+
+	# Test chained returns (multiple permanent variants)
+	result = s.vmcallv("chained_array_returns")
+	assert_eq(result.size(), 2, "chained_array_returns should return array of size 2")
+	assert_eq(result[0].size(), 5, "chained_array_returns[0] should be array of size 5")
+	assert_eq(result[1].size(), 5, "chained_array_returns[1] should be array of size 5")
+
+	# Test complex return with nested structures
+	result = s.vmcallv("complex_return")
+	assert_eq(result.size(), 3, "complex_return should return dict of size 3")
+	assert_eq(result["array"].size(), 5, "complex_return['array'] should be array of size 5")
+	assert_eq(result["dict"].size(), 3, "complex_return['dict'] should be dict of size 3")
+	assert_eq(result["nested"]["inner"].size(), 5, "complex_return['nested']['inner'] should be array of size 5")
+
+	s.queue_free()

@@ -1115,7 +1115,7 @@ void Sandbox::add_cached_address(const String &name, gaddr_t address) const {
 
 //-- Scoped objects and variants --//
 
-unsigned Sandbox::add_scoped_variant(const Variant *value) const {
+int32_t Sandbox::add_scoped_variant(const Variant *value) const {
 	CurrentState &st = this->state();
 	if (st.scoped_variants.size() >= st.variants.capacity()) {
 		ERR_PRINT("Maximum number of scoped variants reached.");
@@ -1127,7 +1127,7 @@ unsigned Sandbox::add_scoped_variant(const Variant *value) const {
 	else
 		return -int32_t(st.scoped_variants.size());
 }
-unsigned Sandbox::create_scoped_variant(Variant &&value) const {
+int32_t Sandbox::create_scoped_variant(Variant &&value) const {
 	CurrentState &st = this->state();
 	if (st.scoped_variants.size() >= st.variants.capacity()) {
 		ERR_PRINT("Maximum number of scoped variants reached.");
@@ -1177,8 +1177,8 @@ Variant &Sandbox::get_mutable_scoped_variant(int32_t index) {
 	}
 	return *it;
 }
-unsigned Sandbox::create_permanent_variant(unsigned idx) {
-	if (int32_t(idx) < 0) {
+int32_t Sandbox::create_permanent_variant(int32_t idx) {
+	if (idx < 0) {
 		// It's already a permanent variant
 		return idx;
 	}
@@ -1207,9 +1207,9 @@ unsigned Sandbox::create_permanent_variant(unsigned idx) {
 		// Move the variant to the permanent list, leave the old one in the scoped list
 		perm_state.append(std::move(*it));
 	}
-	unsigned perm_idx = perm_state.variants.size() - 1;
+	int32_t perm_idx = static_cast<int32_t>(perm_state.variants.size() - 1);
 	// Return the index of the new permanent variant converted to negative
-	return -int32_t(perm_idx) - 1;
+	return -perm_idx - 1;
 }
 void Sandbox::assign_permanent_variant(int32_t idx, Variant &&val) {
 	if (idx < 0) {

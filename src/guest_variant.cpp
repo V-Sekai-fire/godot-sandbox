@@ -45,7 +45,7 @@ Variant GuestVariant::toVariant(const Sandbox &emu) const {
 		}
 
 		default:
-			if (std::optional<const Variant *> v = emu.get_scoped_variant(this->v.i)) {
+			if (std::optional<const Variant *> v = emu.get_scoped_variant(static_cast<int32_t>(this->v.i))) {
 				const Variant *var = *v;
 				return *var;
 			} else {
@@ -58,7 +58,7 @@ Variant GuestVariant::toVariant(const Sandbox &emu) const {
 }
 
 const Variant *GuestVariant::toVariantPtr(const Sandbox &emu) const {
-	if (std::optional<const Variant *> v = emu.get_scoped_variant(this->v.i))
+	if (std::optional<const Variant *> v = emu.get_scoped_variant(static_cast<int32_t>(this->v.i)))
 		return v.value();
 
 	char buffer[128];
@@ -217,7 +217,7 @@ void GuestVariant::create(Sandbox &emu, Variant &&value) {
 
 		default: {
 			// Store the variant in the current state
-			unsigned int idx = emu.create_scoped_variant(std::move(value));
+			int32_t idx = emu.create_scoped_variant(std::move(value));
 			this->v.i = idx;
 		}
 	}

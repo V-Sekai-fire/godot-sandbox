@@ -224,13 +224,13 @@ public:
 
 	/// @brief Add a scoped variant to the current state.
 	/// @param var The variant to add.
-	/// @return The index of the added variant, passed to and used by the guest.
-	unsigned add_scoped_variant(const Variant *var) const;
+	/// @return The index of the added variant, passed to and used by the guest (can be negative for permanent variants).
+	int32_t add_scoped_variant(const Variant *var) const;
 
 	/// @brief Create a new scoped variant, storing it in the current state.
 	/// @param var The variant to add.
-	/// @return The index of the added variant, passed to and used by the guest.
-	unsigned create_scoped_variant(Variant &&var) const;
+	/// @return The index of the added variant, passed to and used by the guest (can be negative for permanent variants).
+	int32_t create_scoped_variant(Variant &&var) const;
 
 	/// @brief Get a scoped variant by its index.
 	/// @param idx The index of the variant to get.
@@ -243,9 +243,9 @@ public:
 	Variant &get_mutable_scoped_variant(int32_t idx);
 
 	/// @brief Create a new permanent variant, storing it in the current state.
-	/// @param idx The index of the variant to duplicate or move.
-	/// @return The index of the new permanent variant, passed to and used by the guest.
-	unsigned create_permanent_variant(unsigned idx);
+	/// @param idx The index of the variant to duplicate or move (can be negative for permanent variants).
+	/// @return The index of the new permanent variant, passed to and used by the guest (always negative).
+	int32_t create_permanent_variant(int32_t idx);
 
 	/// @brief Check if a variant index is a permanent variant.
 	/// @param idx The index of the variant to check.
