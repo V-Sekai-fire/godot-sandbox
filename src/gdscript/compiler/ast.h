@@ -152,6 +152,7 @@ struct AssignStmt : Stmt {
 	std::string name;        // For simple variable assignment
 	ExprPtr target;          // For indexed assignment (IndexExpr)
 	ExprPtr value;
+	// Future: std::optional<std::string> type_hint; // For: arr[0]: int = 5
 
 	// Simple variable assignment
 	AssignStmt(std::string n, ExprPtr v)

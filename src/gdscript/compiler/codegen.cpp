@@ -142,8 +142,8 @@ void CodeGenerator::gen_assign(const AssignStmt* stmt, IRFunction& func) {
 	// Store value into variable's register
 	if (var->register_num != value_reg) {
 		func.instructions.emplace_back(IROpcode::MOVE,
-		                               IRValue::reg(var->register_num),
-		                               IRValue::reg(value_reg));
+				IRValue::reg(var->register_num),
+				IRValue::reg(value_reg));
 	}
 
 	free_register(value_reg);
