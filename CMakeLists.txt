@@ -13,6 +13,7 @@ set(SOURCES
 	src/elf/resource_loader_elf.cpp
 	src/elf/resource_saver_elf.cpp
 	src/elf/script_elf.cpp
+	src/elf/script_gde.cpp
 	src/elf/script_instance.cpp
 	src/elf/script_language_elf.cpp
 	src/rust/resource_loader_rust.cpp

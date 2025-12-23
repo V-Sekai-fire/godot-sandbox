@@ -15,7 +15,7 @@ String ELFScriptLanguage::_get_name() const {
 }
 void ELFScriptLanguage::_init() {}
 String ELFScriptLanguage::_get_type() const {
-	return "ELFScript";
+	return "ELFScript";  // Base type, but also handles GDEScript
 }
 String ELFScriptLanguage::_get_extension() const {
 	return "elf";
@@ -141,6 +141,7 @@ void ELFScriptLanguage::_reload_tool_script(const Ref<Script> &p_script, bool p_
 PackedStringArray ELFScriptLanguage::_get_recognized_extensions() const {
 	PackedStringArray array;
 	array.push_back("elf");
+	array.push_back("gde");  // Support .gde extension files
 	return array;
 }
 TypedArray<Dictionary> ELFScriptLanguage::_get_public_functions() const {
@@ -186,7 +187,7 @@ void ELFScriptLanguage::load_icon() {
 	reenter = false;
 }
 bool ELFScriptLanguage::_handles_global_class_type(const String &p_type) const {
-	return p_type == "ELFScript" || p_type == "Sandbox";
+	return p_type == "ELFScript" || p_type == "GDEScript" || p_type == "Sandbox";
 }
 Dictionary ELFScriptLanguage::_get_global_class_name(const String &p_path) const {
 	Ref<Resource> resource = ResourceLoader::get_singleton()->load(p_path);
@@ -194,7 +195,13 @@ Dictionary ELFScriptLanguage::_get_global_class_name(const String &p_path) const
 	Dictionary dict;
 	if (elf_model.is_valid()) {
 		dict["name"] = elf_model->_get_global_name();
-		dict["base_type"] = "Sandbox";
+		// Use GDEScript as base type for .gde files, ELFScript for .elf files
+		String ext = p_path.get_extension().to_lower();
+		if (ext == "gde") {
+			dict["base_type"] = "GDEScript";
+		} else {
+			dict["base_type"] = "ELFScript";
+		}
 		dict["icon_path"] = String("res://addons/godot_sandbox/Sandbox.svg");
 	}
 	return dict;

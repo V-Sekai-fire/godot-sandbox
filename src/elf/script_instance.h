@@ -40,6 +40,7 @@ class ELFScriptInstance : public ScriptInstanceExtension {
 	std::tuple<Sandbox *, bool> get_sandbox() const;
 	Sandbox *create_sandbox(const Ref<ELFScript> &p_script);
 	friend class ELFScript;
+	friend class GDEScript;
 	friend class CPPScriptInstance;
 
 	static inline std::vector<StringName> godot_functions;

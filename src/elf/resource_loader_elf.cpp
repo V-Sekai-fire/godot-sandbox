@@ -1,6 +1,7 @@
 #include "resource_loader_elf.h"
 #include "../sandbox.h"
 #include "script_elf.h"
+#include "script_gde.h"
 #include <godot_cpp/classes/file_access.hpp>
 static constexpr bool VERBOSE_LOADER = false;
 
@@ -26,31 +27,46 @@ Variant ResourceFormatLoaderELF::_load(const String &p_path, const String &origi
 		WARN_PRINT("Binary translation library not found: " + dllpath);
 	}
 #endif
-	Ref<ELFScript> elf_model = memnew(ELFScript);
-	elf_model->set_file(p_path);
-	elf_model->reload(false);
-	return elf_model;
+	// Use GDEScript for .gde files (textual GDScript), ELFScript for .elf files (binary)
+	String ext = p_path.get_extension().to_lower();
+	if (ext == "gde") {
+		// .gde files contain textual GDScript that gets compiled to ELF
+		Ref<GDEScript> gde_model = memnew(GDEScript);
+		gde_model->set_file(p_path);
+		gde_model->reload(false);
+		return gde_model;
+	} else {
+		// .elf files are binary ELF files
+		Ref<ELFScript> elf_model = memnew(ELFScript);
+		elf_model->set_file(p_path);
+		elf_model->reload(false);
+		return elf_model;
+	}
 }
 PackedStringArray ResourceFormatLoaderELF::_get_recognized_extensions() const {
 	PackedStringArray array;
 	array.push_back("elf");
+	array.push_back("gde");  // Support .gde extension files
 	return array;
 }
 bool ResourceFormatLoaderELF::_recognize_path(const godot::String &path, const godot::StringName &type) const {
 	String el = path.get_extension().to_lower();
-	if (el == "elf") {
+	if (el == "elf" || el == "gde") {
 		return true;
 	}
 	return false;
 }
 bool ResourceFormatLoaderELF::_handles_type(const StringName &type) const {
 	String type_str = type;
-	return type_str == "ELFScript" || type_str == "Script";
+	return type_str == "ELFScript" || type_str == "GDEScript" || type_str == "Script";
 }
 String ResourceFormatLoaderELF::_get_resource_type(const String &p_path) const {
 	String el = p_path.get_extension().to_lower();
 	if (el == "elf") {
 		return "ELFScript";
+	}
+	if (el == "gde") {
+		return "GDEScript";
 	}
 	return "";
 }
