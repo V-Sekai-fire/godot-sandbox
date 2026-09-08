@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+title: godot-sandbox
+message: >-
+  The RISC-V sandbox module of the Godot fork (libriscv underneath, vendored in
+  thirdparty/libriscv), supplied to entities-godot-sandbox through the goal
+  manifest rather than vendored. It hosts the FBD guests, the export guests and
+  the godot-vrm ELF.
+type: software
+authors:
+  - family-names: Walla
+    given-names: Alf-André
+license: BSD-3-Clause
+repository-code: https://github.com/libriscv/godot-sandbox
+url: https://github.com/v-sekai-fabric/godot-sandbox
+version: 51853e964bba
+date-accessed: "2026-09-08"
+references:
+  - type: software
+    title: libriscv
+    authors:
+      - family-names: Walla
+        given-names: Alf-André
+    license: BSD-3-Clause
+    repository-code: https://github.com/libriscv/libriscv
+    version: 2b681b996992d91ee7da0d228d0e5935b42bb879
