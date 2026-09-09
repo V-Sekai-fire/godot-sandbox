@@ -41,6 +41,3 @@ src/gen/
 bin/libsandbox.*
 
 thirdparty/godot-sandbox-demo/
-
-# Supplied by the repo manifest, not vendored. See default.xml.
-thirdparty/libriscv/

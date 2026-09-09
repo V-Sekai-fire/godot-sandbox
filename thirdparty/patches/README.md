@@ -42,12 +42,6 @@ for p in ../patches/libriscv__*.patch; do patch -p4 < "$p"; done
 
 ### Notes
 
-`tr_emit.cpp` was stale and is regenerated. The vendored tree replaced `std::abs`
-with an explicit branch for mingw and libc++, and this patch did not carry that
-change. Applying the old patch to `6770061e` produced a tree that does not build on
-those toolchains. The other 18 patches were checked the same way and reproduce their
-vendored files exactly.
-
 `decoded_exec_segment.hpp` was patched against `33e283e1` (zero-length allocation guard)
 but upstream `6770061e` superseded it with sandbox hardening (`exlen + 8` allocation +
 `if (exlen > 0)` guard). No local patch needed.
