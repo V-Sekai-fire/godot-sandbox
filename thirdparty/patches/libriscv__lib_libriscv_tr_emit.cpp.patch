@@ -1,16 +1,6 @@
 --- a/modules/sandbox/thirdparty/libriscv/lib/libriscv/tr_emit.cpp
 +++ b/modules/sandbox/thirdparty/libriscv/lib/libriscv/tr_emit.cpp
-@@ -321,7 +321,8 @@
- 	}
- 
- 	static bool offset_is_within_overallocation(int64_t old_offset, int64_t new_offset, size_t size) {
--		return std::abs(new_offset - old_offset) <= int64_t(Memory<W>::OVERALLOCATE - size);
-+		const int64_t diff = new_offset - old_offset;
-+		return (diff >= 0 ? diff : -diff) <= int64_t(Memory<W>::OVERALLOCATE - size);
- 	}
- 
- 	bool skip_load_bounds_check(int reg, int64_t offset, size_t size) {
-@@ -642,7 +643,6 @@
+@@ -642,7 +642,6 @@
  template <int W>
  inline void Emitter<W>::emit_branch(const BranchInfo& binfo, const std::string& op)
  {
@@ -18,7 +8,7 @@
  	if (binfo.sign == false)
  		code += "if (" + from_reg(instr.Btype.rs1) + op + from_reg(instr.Btype.rs2) + ")";
  	else
-@@ -877,13 +877,13 @@
+@@ -877,13 +876,13 @@
  			this->reset_all_tracked_registers();
  		}
  
@@ -35,7 +25,7 @@
  				current_callable_pc = this->pc();
  			else
  				current_callable_pc = 0;
-@@ -2145,8 +2145,8 @@
+@@ -2145,8 +2144,8 @@
  			// Assumption: Dynamic calls are like regular function calls
  			// Note: This behavior can be turned off by disabling register_caching
  			// Load and realize registers A0-A7

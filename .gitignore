@@ -42,5 +42,5 @@ bin/libsandbox.*
 
 thirdparty/godot-sandbox-demo/
 
-# Supplied by the repo manifest, not vendored. See default.xml.
+# placed as its own checkout by the goal manifest, not vendored here
 thirdparty/libriscv/
