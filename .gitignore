@@ -41,3 +41,6 @@ src/gen/
 bin/libsandbox.*
 
 thirdparty/godot-sandbox-demo/
+
+# placed as its own checkout by the goal manifest, not vendored here
+thirdparty/libriscv/
