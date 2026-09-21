@@ -16,7 +16,11 @@
 /* #undef RISCV_MEMORY_TRAPS */
 /* #undef RISCV_MULTIPROCESS */
 #define RISCV_BINARY_TRANSLATION
-#define RISCV_FLAT_RW_ARENA
+/* Undefined so a guest can be snapshotted: Memory::serialize_to throws
+   FEATURE_DISABLED under a flat read-write arena. The arena is what gives
+   zero-copy host-guest calls, so this trades that for save_state(). Measure
+   the ecall round-trip before assuming the trade is worth it. */
+/* #undef RISCV_FLAT_RW_ARENA */
 #define RISCV_VIRTUAL_PAGING
 /* #undef RISCV_ENCOMPASSING_ARENA */
 #define RISCV_THREADED

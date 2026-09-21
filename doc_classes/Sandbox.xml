@@ -306,6 +306,23 @@
 				Does not work properly right now. Do not use.
 			</description>
 		</method>
+		<method name="restore_state">
+			<return type="bool" />
+			<param index="0" name="image" type="PackedByteArray" />
+			<description>
+				Restores a guest machine from an image produced by [method save_state], returning [code]true[/code] on success.
+				The call state is reset, because the image does not carry it. Host-side state does not travel either: file descriptors, threads, memory traps and any [Object] the guest was holding are absent and must be re-established by the caller.
+				Fails rather than half-restoring: an empty image, a rejected image, or a call to this method while inside a sandbox call all return [code]false[/code].
+			</description>
+		</method>
+		<method name="save_state" qualifiers="const">
+			<return type="PackedByteArray" />
+			<description>
+				Serializes the whole guest machine — registers, instruction counter and every memory page — into a byte array that [method restore_state] can load, including in another process.
+				Returns an empty array on failure. Execute segments are not carried; they are re-derived from the restored memory, so binary translation costs nothing here.
+				Requires a paged machine. Built with [code]RISCV_FLAT_RW_ARENA[/code], libriscv refuses to serialize and this returns empty.
+			</description>
+		</method>
 		<method name="set">
 			<return type="void" />
 			<param index="0" name="name" type="StringName" />

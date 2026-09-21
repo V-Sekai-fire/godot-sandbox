@@ -213,6 +213,8 @@ void Sandbox::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_current_instruction"), &Sandbox::get_current_instruction);
 	ClassDB::bind_method(D_METHOD("make_resumable"), &Sandbox::make_resumable);
 	ClassDB::bind_method(D_METHOD("resume", "max_instructions"), &Sandbox::resume);
+	ClassDB::bind_method(D_METHOD("save_state"), &Sandbox::save_state);
+	ClassDB::bind_method(D_METHOD("restore_state", "image"), &Sandbox::restore_state);
 
 	ClassDB::bind_method(D_METHOD("assault", "test", "iterations"), &Sandbox::assault);
 	ClassDB::bind_method(D_METHOD("has_function", "function"), &Sandbox::has_function);
@@ -967,6 +969,9 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 
 		auto options = std::make_shared<riscv::MachineOptions<RISCV_ARCH>>(riscv::MachineOptions<RISCV_ARCH>{
 				.memory_max = uint64_t(get_memory_max()) << 20, // in MiB
+				// Paged, not the flat arena, so the machine can be serialised.
+				// libriscv's own serialize test sets this the same way.
+				.use_memory_arena = riscv::flat_readwrite_arena,
 				.stack_size = GUEST_STACK_SIZE,
 				//.verbose_loader = true,
 #ifdef RISCV_BINARY_TRANSLATION

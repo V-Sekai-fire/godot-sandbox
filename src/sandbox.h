@@ -919,6 +919,22 @@ public:
 	/// @brief Resume execution of the program. Loses the current call state.
 	bool resume(uint64_t max_instructions);
 
+	/// @brief Serialize the whole guest machine into a byte array.
+	/// @return The image, or an empty array on failure.
+	/// @note Registers, the instruction counter and every memory page travel.
+	/// Host-side state does not: file descriptors, threads, memory traps, the
+	/// call-state stack and any Godot ObjectID the guest was holding are all
+	/// absent, and the destination re-establishes them. Execute segments are
+	/// re-derived from the restored memory rather than carried.
+	/// @note Requires a paged machine. Under a flat read-write arena libriscv
+	/// refuses to serialize, and this returns empty rather than throwing.
+	PackedByteArray save_state() const;
+
+	/// @brief Restore a guest machine from an image produced by save_state().
+	/// @return True on success. The call state is reset, because the image
+	/// carries none of it.
+	bool restore_state(const PackedByteArray &image);
+
 	/// @brief Hash of the current execute segment and every ABI-affecting translator option.
 	/// @return Zero when program/translator is unavailable.
 	int64_t get_translation_hash() const;

@@ -76,3 +76,73 @@ bool Sandbox::resume(uint64_t max_instructions) {
 		return true; // Can't (shouldn't) be resumed anymore
 	}
 }
+
+PackedByteArray Sandbox::save_state() const {
+	PackedByteArray result;
+	if (this->m_machine == nullptr) {
+		ERR_PRINT("Sandbox: No machine to save.");
+		return result;
+	}
+	// libriscv refuses to serialize a flat read-write arena. Say which setting
+	// is responsible rather than letting the exception read as a bug.
+	if (riscv::flat_readwrite_arena) {
+		ERR_PRINT("Sandbox: Cannot save state: built with RISCV_FLAT_RW_ARENA. "
+				  "A paged machine is required for serialization.");
+		return result;
+	}
+
+	std::vector<uint8_t> image;
+	try {
+		this->m_machine->serialize_to(image);
+	} catch (const std::exception &e) {
+		ERR_PRINT(String("Sandbox: serialize_to failed: ") + String(e.what()));
+		return result;
+	}
+
+	// An image with no pages restores into a machine with no memory, which runs
+	// wrong instead of failing. Refuse to hand one out.
+	if (image.empty()) {
+		ERR_PRINT("Sandbox: serialize_to produced an empty image.");
+		return result;
+	}
+
+	result.resize(image.size());
+	std::memcpy(result.ptrw(), image.data(), image.size());
+	return result;
+}
+
+bool Sandbox::restore_state(const PackedByteArray &p_image) {
+	if (this->m_machine == nullptr) {
+		ERR_PRINT("Sandbox: No machine to restore into.");
+		return false;
+	}
+	if (p_image.is_empty()) {
+		ERR_PRINT("Sandbox: Cannot restore from an empty image.");
+		return false;
+	}
+	if (this->m_current_state != &this->m_states[0]) {
+		ERR_PRINT("Sandbox: Cannot restore while in a call.");
+		return false;
+	}
+
+	const std::vector<uint8_t> image(p_image.ptr(), p_image.ptr() + p_image.size());
+	int rc = -1;
+	try {
+		rc = this->m_machine->deserialize_from(image);
+	} catch (const std::exception &e) {
+		ERR_PRINT(String("Sandbox: deserialize_from failed: ") + String(e.what()));
+		return false;
+	}
+	if (rc != 0) {
+		ERR_PRINT(String("Sandbox: deserialize_from rejected the image, code ") + String::num_int64(rc));
+		return false;
+	}
+
+	// The image carries no host state, so anything host-side that referred to
+	// the old machine is now stale and must go rather than be reused.
+	for (auto &state : this->m_states) {
+		state.reset();
+	}
+	this->m_current_state = &this->m_states[0];
+	return true;
+}
