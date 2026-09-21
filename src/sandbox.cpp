@@ -970,11 +970,11 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 
 		auto options = std::make_shared<riscv::MachineOptions<RISCV_ARCH>>(riscv::MachineOptions<RISCV_ARCH>{
 				.memory_max = uint64_t(get_memory_max()) << 20, // in MiB
+				.stack_size = GUEST_STACK_SIZE,
+				//.verbose_loader = true,
 				// Paged, not the flat arena, so the machine can be serialised.
 				// libriscv's own serialize test sets this the same way.
 				.use_memory_arena = riscv::flat_readwrite_arena,
-				.stack_size = GUEST_STACK_SIZE,
-				//.verbose_loader = true,
 #ifdef RISCV_BINARY_TRANSLATION
 				// The execute segment stores its translation hash. Sharing it between
 				// machines with different checked/n-bit/limit options would reuse the
