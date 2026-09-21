@@ -31,34 +31,42 @@ uint64_t hash_bytes(const uint8_t *data, size_t len) {
 } // namespace
 
 uint64_t Sandbox::state_program_hash() const {
-	if (this->m_machine == nullptr)
+	if (this->m_machine == nullptr) {
 		return 0;
+	}
 	const auto &binary = machine().memory.binary();
-	if (binary.empty())
+	if (binary.empty()) {
 		return 0;
+	}
 	return hash_bytes(reinterpret_cast<const uint8_t *>(binary.data()), binary.size());
 }
 
 bool Sandbox::can_save_state() const {
-	if (this->m_machine == nullptr)
+	if (this->m_machine == nullptr) {
 		return false;
+	}
 	// A flat read-write arena cannot be serialized by libriscv at all.
-	if (riscv::flat_readwrite_arena)
+	if (riscv::flat_readwrite_arena) {
 		return false;
-	if (machine().memory.binary().empty())
+	}
+	if (machine().memory.binary().empty()) {
 		return false;
+	}
 	// A suspended coroutine's frame refers to live Godot ObjectIDs, which no
 	// image can carry, so it is refused rather than silently losing them.
-	if (this->get_coroutine_count() > 0)
+	if (this->get_coroutine_count() > 0) {
 		return false;
+	}
 	// The call-state stack is host-side and would disagree after a restore.
-	if (this->m_current_state != &this->m_states[0])
+	if (this->m_current_state != &this->m_states[0]) {
 		return false;
+	}
 	// Permanent handles live in guest memory as slot+generation indices into
 	// this process's table. An image carrying them cannot be rebound elsewhere:
 	// the indices would resolve to different objects rather than fail.
-	if (!this->m_states[0].scoped_variants.empty())
+	if (!this->m_states[0].scoped_variants.empty()) {
 		return false;
+	}
 	return true;
 }
 
