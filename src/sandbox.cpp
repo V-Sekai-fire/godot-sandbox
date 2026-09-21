@@ -213,6 +213,7 @@ void Sandbox::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_current_instruction"), &Sandbox::get_current_instruction);
 	ClassDB::bind_method(D_METHOD("make_resumable"), &Sandbox::make_resumable);
 	ClassDB::bind_method(D_METHOD("resume", "max_instructions"), &Sandbox::resume);
+	ClassDB::bind_method(D_METHOD("can_save_state"), &Sandbox::can_save_state);
 	ClassDB::bind_method(D_METHOD("save_state"), &Sandbox::save_state);
 	ClassDB::bind_method(D_METHOD("restore_state", "image"), &Sandbox::restore_state);
 

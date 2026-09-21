@@ -33,6 +33,7 @@ set(SOURCES
 	src/sandbox_bintr.cpp
 	src/sandbox_coroutines.cpp
 	src/sandbox_debug.cpp
+	src/sandbox_state.cpp
 	src/sandbox_exception.cpp
 	src/sandbox_functions.cpp
 	src/sandbox_globals.cpp

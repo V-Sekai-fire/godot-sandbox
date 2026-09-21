@@ -928,6 +928,14 @@ public:
 	/// re-derived from the restored memory rather than carried.
 	/// @note Requires a paged machine. Under a flat read-write arena libriscv
 	/// refuses to serialize, and this returns empty rather than throwing.
+	/// @brief Whether a snapshot can be taken right now.
+	/// @return False when built with a flat arena, when no program is loaded,
+	/// while inside a call, or while coroutines are suspended.
+	bool can_save_state() const;
+
+	/// @brief Identity of the loaded program, used to bind an image to it.
+	uint64_t state_program_hash() const;
+
 	PackedByteArray save_state() const;
 
 	/// @brief Restore a guest machine from an image produced by save_state().
