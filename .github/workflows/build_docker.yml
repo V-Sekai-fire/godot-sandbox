@@ -32,6 +32,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # GHCR rejects an uppercase image name, and github.repository_owner keeps
+      # the org's own casing, so a fork under a capitalised org fails the push.
+      - name: Lowercase the owner
+        id: owner
+        run: echo "lc=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push Docker image
         id: push
         uses: docker/build-push-action@v6
@@ -40,4 +46,4 @@ jobs:
           registry: ${{ env.REGISTRY }}
           context: program/${{ matrix.compiler }}/docker
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.compiler }}_compiler:latest
+          tags: ghcr.io/${{ steps.owner.outputs.lc }}/${{ matrix.compiler }}_compiler:latest
