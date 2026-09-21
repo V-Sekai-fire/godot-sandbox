@@ -50,11 +50,15 @@ public:
 		UNBOXED,
 	};
 	static constexpr unsigned MAX_INSTRUCTIONS = 8000; // Millions
-	static constexpr unsigned MAX_HEAP = 20ul; // MBs
+	// Sized for a guest that carries a real workload -- a physics step over a
+	// non-trivial model needs tens of MB of live state, which 20 would refuse.
+	// A paged machine commits pages on demand, so the ceiling costs address
+	// space rather than memory until the guest actually touches it.
+	static constexpr unsigned MAX_HEAP = 256ul; // MBs
 	// Power of two: the binary translator can only use the AND-masked arena on a
 	// Po2 arena, and that mask is what the default relies on for its guard.
-	static constexpr unsigned MAX_VMEM = 32ul; // MBs
-	static constexpr unsigned MAX_HEAP_ALLOCS = 4000; // Max guest heap allocations
+	static constexpr unsigned MAX_VMEM = 512ul; // MBs
+	static constexpr unsigned MAX_HEAP_ALLOCS = 65536; // Max guest heap allocations
 	static constexpr unsigned MAX_LEVEL = 4; // Maximum call recursion depth
 	// Shared across MAX_LEVEL recursion levels.
 	static constexpr unsigned GUEST_STACK_SIZE = 2u << 20; // 2MB
