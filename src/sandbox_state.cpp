@@ -45,10 +45,6 @@ bool Sandbox::can_save_state() const {
 	if (this->m_machine == nullptr) {
 		return false;
 	}
-	// A flat read-write arena cannot be serialized by libriscv at all.
-	if (riscv::flat_readwrite_arena) {
-		return false;
-	}
 	if (machine().memory.binary().empty()) {
 		return false;
 	}
@@ -74,11 +70,6 @@ PackedByteArray Sandbox::save_state() const {
 	PackedByteArray result;
 	if (this->m_machine == nullptr) {
 		ERR_PRINT("Sandbox: No machine to save.");
-		return result;
-	}
-	if (riscv::flat_readwrite_arena) {
-		ERR_PRINT("Sandbox: Cannot save state: built with RISCV_FLAT_RW_ARENA. "
-				  "A paged machine is required for serialization.");
 		return result;
 	}
 	if (machine().memory.binary().empty()) {

@@ -1068,7 +1068,22 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 
 		this->install_self_instrumentation_clock();
 
-		const gaddr_t heap_size = gaddr_t(machine().memory.memory_arena_size() * 0.8) & ~0xFFFLL;
+		// memory_arena_size() counts the flat arena's pages, and the flat arena
+		// is off whenever the machine has to be serialisable. Sizing the heap
+		// from it then hands the guest a zero-byte heap, and the program dies in
+		// libc startup with Cannot allocate memory rather than anywhere useful.
+		const gaddr_t arena = gaddr_t(machine().memory.memory_arena_size());
+		gaddr_t heap_size;
+		if (arena > 0) {
+			heap_size = gaddr_t(arena * 0.8) & ~0xFFFLL;
+		} else {
+			// Half the address space, capped at the heap budget, so the program,
+			// its stack and the mmap region still fit. Taking a fraction of the
+			// whole address space instead leaves nowhere to map the heap.
+			const gaddr_t half = (gaddr_t(get_memory_max()) << 20) / 2;
+			const gaddr_t cap = gaddr_t(MAX_HEAP) << 20;
+			heap_size = (half < cap ? half : cap) & ~0xFFFLL;
+		}
 		const gaddr_t heap_area = machine().memory.mmap_allocate(heap_size);
 
 		// Add native system call interfaces
