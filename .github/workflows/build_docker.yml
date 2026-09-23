@@ -32,12 +32,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Lowercase the registry owner (Docker rejects capitals in image names)
+        run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+
       - name: Build and push Docker image
         id: push
         uses: docker/build-push-action@v6
         with:
           platforms: linux/amd64,linux/arm64
-          registry: ${{ env.REGISTRY }}
           context: program/${{ matrix.compiler }}/docker
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.compiler }}_compiler:latest
+          tags: ghcr.io/${{ env.OWNER_LC }}/${{ matrix.compiler }}_compiler:latest
