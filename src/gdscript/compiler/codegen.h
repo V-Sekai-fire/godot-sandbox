@@ -415,7 +415,7 @@ private:
 		const NamedArguments& names, FunctionContext& func, const Expr* site);
 	int gen_class_method_call(const StructDecl& decl, const FunctionDecl& method,
 		const StructDecl& owner, int self_reg, const std::vector<ExprPtr>& arguments,
-		const NamedArguments& names, FunctionContext& func, const Expr* site);
+		const NamedArguments& names, FunctionContext& func, const Expr* site, bool direct = false);
 	int class_field_self(const std::string& name, FunctionContext& func);
 	bool is_super(const Expr* expr, FunctionContext& func);
 	int gen_super_call(const MemberCallExpr* expr, FunctionContext& func);
@@ -546,6 +546,10 @@ private:
 
 	bool fold_global_initializer(const Expr* expr, IRGlobalVar& out,
 		const FunctionContext* func = nullptr, const StructDecl* owner = nullptr) const;
+	// True when a call that passes only `supplied` arguments must go through
+	// the callee's arity wrapper. That happens when an omitted default is not
+	// a constant, since only the callee's scope can resolve its names.
+	bool omits_evaluated_default(const std::vector<Parameter>& params, size_t supplied) const;
 
 	// Decline reason; match ignores it, switch promotes it to a compile error.
 	struct JumpTableReject {

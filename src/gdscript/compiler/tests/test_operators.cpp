@@ -277,6 +277,31 @@ static void test_is_on_a_class_name_asks_the_engine() {
 	std::cout << "  ✓ 'is' on a class name asks the engine" << std::endl;
 }
 
+// `x is Tool` where `const Tool = preload(...)`. The name is a constant and not
+// a global class. The script it holds has no global name to compare, so the old
+// walk answered false even for an instance of that very script.
+static void test_is_on_a_preloaded_script_compares_identity() {
+	const IRProgram ir = compile_to_ir(
+		"const Tool = preload(\"res://tool.sgd\")\n"
+		"func f(a) -> bool:\n\treturn a is Tool\n", false);
+	const IRFunction& f = find_function(ir, "f");
+	std::vector<std::string> called;
+	bool compares_identity = false;
+	for (const auto& instr : f.instructions) {
+		if (instr.opcode == IROpcode::VCALL) {
+			called.push_back(ir.strings[instr.operands[2].string_id]);
+		}
+		if (instr.opcode == IROpcode::GLOBAL_CALL) {
+			compares_identity = true;
+		}
+	}
+	assert((called == std::vector<std::string>{ "get_script", "get_base_script" }));
+	assert(compares_identity);
+	assert(count_opcode(f, IROpcode::LOAD_STRING_AS) == 0);
+
+	std::cout << "  \u2713 'is' on a preloaded script compares the script itself" << std::endl;
+}
+
 // `x as int` is the conversion the constructor performs, and shares its
 // lowering. A class name is rejected: there the cast yields null for an object
 // of the wrong class, which a conversion does not.
@@ -354,6 +379,13 @@ static void test_not_binds_looser_than_comparison() {
 	assert(!run_bool("func f() -> bool:\n\treturn not not false\n", "f"));
 	// `and` is looser still, so this is `(not a) and b`, not `not (a and b)`.
 	assert(run_bool("func f(a: bool, b: bool) -> bool:\n\treturn not a and b\n", "f", {false, true}));
+
+	assert(run_int("func f(a: bool, b: bool) -> bool:\n\treturn a == not b\n", "f", {true, false}));
+	assert(run_int("func f(a: bool, b: bool) -> bool:\n\treturn a != not b\n", "f", {false, false}));
+	assert(run_int("func f(a: bool, b: int, c: int) -> bool:\n\treturn a == not b < c\n",
+		"f", {false, int64_t(1), int64_t(2)}));
+	assert(run_int("func f(a: bool, b: bool) -> bool:\n\treturn a == not not b\n", "f", {true, true}));
+	assert(!run_int("func f(a: bool, b: bool) -> bool:\n\treturn a == not b and false\n", "f", {true, false}));
 
 	std::cout << "  ✓ 'not' binds looser than a comparison" << std::endl;
 }
@@ -834,6 +866,7 @@ int main() {
 	test_is_on_a_known_type_is_decided_at_compile_time();
 	test_is_not();
 	test_is_on_a_class_name_asks_the_engine();
+	test_is_on_a_preloaded_script_compares_identity();
 	test_as_is_the_matching_conversion();
 	test_as_covers_every_builtin_type();
 
