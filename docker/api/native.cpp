@@ -1,7 +1,8 @@
 #include "syscalls.h"
-#include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #define NATIVE_MEM_FUNCATTR /* */
 #define NATIVE_SYSCALLS_BASE 480 /* libc starts at 480 */
@@ -57,10 +58,8 @@
 #if !WRAP_FANCY
 CREATE_SYSCALL(malloc, SYSCALL_MALLOC);
 CREATE_SYSCALL(calloc, SYSCALL_CALLOC);
-// interactor-dress-on: realloc and free are C functions further down that
-// know about aligned blocks; these are the heap's own.
-CREATE_SYSCALL(sandbox_native_realloc, SYSCALL_REALLOC);
-CREATE_SYSCALL(sandbox_native_free, SYSCALL_FREE);
+CREATE_SYSCALL(__sandbox_realloc, SYSCALL_REALLOC);
+CREATE_SYSCALL(__sandbox_free, SYSCALL_FREE);
 CREATE_SYSCALL(memset, SYSCALL_MEMSET);
 CREATE_SYSCALL(memcpy, SYSCALL_MEMCPY);
 CREATE_SYSCALL(memmove, SYSCALL_MEMMOVE);
@@ -87,10 +86,8 @@ extern "C" void __wrap_free(void *ptr) {
 
 CREATE_SYSCALL(__wrap_malloc, SYSCALL_MALLOC);
 CREATE_SYSCALL(__wrap_calloc, SYSCALL_CALLOC);
-// interactor-dress-on: __wrap_realloc and __wrap_free are C functions
-// further down that know about aligned blocks; these are the heap's own.
-CREATE_SYSCALL(sandbox_native_realloc, SYSCALL_REALLOC);
-CREATE_SYSCALL(sandbox_native_free, SYSCALL_FREE);
+CREATE_SYSCALL(__sandbox_realloc, SYSCALL_REALLOC);
+CREATE_SYSCALL(__sandbox_free, SYSCALL_FREE);
 CREATE_SYSCALL(__wrap_memset, SYSCALL_MEMSET);
 CREATE_SYSCALL(__wrap_memcpy, SYSCALL_MEMCPY);
 CREATE_SYSCALL(__wrap_memmove, SYSCALL_MEMMOVE);
@@ -104,8 +101,8 @@ extern "C" void *__wrap_malloc(size_t size);
 extern "C" void __wrap_free(void *ptr);
 #endif // WRAP_FANCY
 
-extern "C" void *sandbox_native_realloc(void *ptr, size_t size);
-extern "C" void sandbox_native_free(void *ptr);
+extern "C" void *__sandbox_realloc(void *ptr, size_t size);
+extern "C" void __sandbox_free(void *ptr);
 
 // extern "C" void *__wrap_memset(void *vdest, const int ch, size_t size) {
 // 	register char *a0 __asm__("a0") = (char *)vdest;
@@ -196,112 +193,82 @@ extern "C" void sandbox_native_free(void *ptr);
 // 	return a0_out;
 // }
 
-// Aligned allocations.
-//
-// interactor-dress-on: the host heap hands out 16-byte-aligned blocks and has
-// no aligned entry point. Upstream's fallback retried malloc(size) up to 16
-// times for an aligned block and, when every try missed, returned the last
-// block after it had already freed it (the loop freed each miss). At 4096
-// alignment that is nearly every call; Geogram's 64-byte blocks hit it too
-// (Gate 4: "Possible double-free for freed pointer" in ~Delaunay3d, then
-// glibc's pthread_mutex_lock assertion).
-//
-// Now: over-allocate by alignment - 1 bytes and return the aligned address
-// inside the block. The host heap keeps its bookkeeping outside guest memory
-// and only accepts the pointer it returned, so the base cannot live in a
-// header below the block: a small open-addressing table maps each aligned
-// pointer that differs from its base to that base and its size. free and
-// realloc (the --wrap targets, or the plain names under zig) consult it
-// first; with no aligned block live the table is freed and the check is one
-// load. A base that happens to be aligned already is returned as a plain
-// block and never enters the table.
+// The host heap only frees the exact pointer it returned, so over-aligned
+// blocks are carved out of a larger one and their base is kept here.
 namespace {
-struct AlignedEntry {
-	uintptr_t user; // 0 empty, 1 tombstone; else an aligned pointer (>= 32-aligned)
-	void *raw; // what the host heap returned
-	size_t size; // the size asked for, for realloc
+struct AlignedBlock {
+	uintptr_t ptr;
+	void *base;
+	size_t size;
 };
-constexpr uintptr_t AL_EMPTY = 0;
-constexpr uintptr_t AL_TOMB = 1;
-AlignedEntry *al_tab = nullptr;
-size_t al_cap = 0; // a power of two, or 0 with no table
-size_t al_live = 0;
-size_t al_used = 0; // live + tombstones
+AlignedBlock *aligned_table = nullptr;
+size_t aligned_capacity = 0;
+size_t aligned_count = 0;
 
-inline size_t al_slot(uintptr_t user) {
-	return size_t((uint64_t(user) >> 5) * 0x9E3779B97F4A7C15ull >> 17) & (al_cap - 1);
+size_t aligned_slot(uintptr_t ptr) {
+	return size_t(uint64_t(ptr >> 5) * 0x9E3779B97F4A7C15ull >> 32) & (aligned_capacity - 1);
 }
 
-AlignedEntry *al_find(uintptr_t user) {
-	if (al_live == 0) {
-		return nullptr;
-	}
-	for (size_t i = al_slot(user);; i = (i + 1) & (al_cap - 1)) {
-		if (al_tab[i].user == user) {
-			return &al_tab[i];
-		}
-		if (al_tab[i].user == AL_EMPTY) {
+AlignedBlock *aligned_find(uintptr_t ptr) {
+	for (size_t i = aligned_slot(ptr);; i = (i + 1) & (aligned_capacity - 1)) {
+		if (aligned_table[i].ptr == 0) {
 			return nullptr;
 		}
-	}
-}
-
-void al_put(uintptr_t user, void *raw, size_t size) {
-	size_t i = al_slot(user);
-	while (al_tab[i].user != AL_EMPTY && al_tab[i].user != AL_TOMB) {
-		i = (i + 1) & (al_cap - 1);
-	}
-	if (al_tab[i].user == AL_EMPTY) {
-		al_used++;
-	}
-	al_tab[i] = { user, raw, size };
-	al_live++;
-}
-
-bool al_insert(uintptr_t user, void *raw, size_t size) {
-	if ((al_used + 1) * 2 > al_cap) { // keep the load under 1/2, tombstones included
-		size_t cap = 64;
-		while (cap < (al_live + 1) * 4) {
-			cap *= 2;
+		if (aligned_table[i].ptr == ptr) {
+			return &aligned_table[i];
 		}
-		AlignedEntry *tab = static_cast<AlignedEntry *>(__wrap_malloc(cap * sizeof(AlignedEntry)));
-		if (tab == nullptr) {
+	}
+}
+
+void aligned_place(const AlignedBlock &block) {
+	size_t i = aligned_slot(block.ptr);
+	while (aligned_table[i].ptr != 0) {
+		i = (i + 1) & (aligned_capacity - 1);
+	}
+	aligned_table[i] = block;
+}
+
+bool aligned_insert(uintptr_t ptr, void *base, size_t size) {
+	if ((aligned_count + 1) * 2 > aligned_capacity) {
+		const size_t capacity = aligned_capacity ? aligned_capacity * 2 : 64;
+		AlignedBlock *table = static_cast<AlignedBlock *>(__wrap_malloc(capacity * sizeof(AlignedBlock)));
+		if (table == nullptr) {
 			return false;
 		}
-		for (size_t i = 0; i < cap; i++) {
-			tab[i] = { AL_EMPTY, nullptr, 0 };
+		for (size_t i = 0; i < capacity; i++) {
+			table[i].ptr = 0;
 		}
-		AlignedEntry *old = al_tab;
-		const size_t old_cap = al_cap;
-		al_tab = tab;
-		al_cap = cap;
-		al_live = 0;
-		al_used = 0;
-		for (size_t i = 0; i < old_cap; i++) {
-			if (old[i].user != AL_EMPTY && old[i].user != AL_TOMB) {
-				al_put(old[i].user, old[i].raw, old[i].size);
+		AlignedBlock *old = aligned_table;
+		const size_t old_capacity = aligned_capacity;
+		aligned_table = table;
+		aligned_capacity = capacity;
+		for (size_t i = 0; i < old_capacity; i++) {
+			if (old[i].ptr != 0) {
+				aligned_place(old[i]);
 			}
 		}
-		if (old != nullptr) {
-			sandbox_native_free(old);
-		}
+		__sandbox_free(old);
 	}
-	al_put(user, raw, size);
+	aligned_place({ ptr, base, size });
+	aligned_count++;
 	return true;
 }
 
-// Drops the entry and answers the base to hand back to the host heap.
-void *al_remove(AlignedEntry *e) {
-	void *raw = e->raw;
-	e->user = AL_TOMB;
-	e->raw = nullptr;
-	if (--al_live == 0) {
-		sandbox_native_free(al_tab);
-		al_tab = nullptr;
-		al_cap = 0;
-		al_used = 0;
+// Backward-shift deletion keeps probe chains intact without tombstones.
+void *aligned_erase(AlignedBlock *block) {
+	void *base = block->base;
+	const size_t mask = aligned_capacity - 1;
+	size_t hole = block - aligned_table;
+	for (size_t i = (hole + 1) & mask; aligned_table[i].ptr != 0; i = (i + 1) & mask) {
+		const size_t home = aligned_slot(aligned_table[i].ptr);
+		if (((i - home) & mask) >= ((i - hole) & mask)) {
+			aligned_table[hole] = aligned_table[i];
+			hole = i;
+		}
 	}
-	return raw;
+	aligned_table[hole].ptr = 0;
+	aligned_count--;
+	return base;
 }
 } // namespace
 
@@ -314,79 +281,60 @@ void *al_remove(AlignedEntry *e) {
 #endif
 
 extern "C" void SANDBOX_FREE(void *ptr) {
-	if (ptr != nullptr && al_live != 0) {
-		if (AlignedEntry *e = al_find(uintptr_t(ptr))) {
-			sandbox_native_free(al_remove(e));
-			return;
+	if (aligned_count != 0) {
+		if (AlignedBlock *block = aligned_find(uintptr_t(ptr))) {
+			ptr = aligned_erase(block);
 		}
 	}
-	sandbox_native_free(ptr);
+	__sandbox_free(ptr);
 }
 
-// An aligned block reallocates into a plain one (C does not keep the
-// alignment across realloc either).
 extern "C" void *SANDBOX_REALLOC(void *ptr, size_t size) {
-	if (ptr != nullptr && al_live != 0) {
-		if (AlignedEntry *e = al_find(uintptr_t(ptr))) {
-			if (size == 0) {
-				sandbox_native_free(al_remove(e));
+	if (aligned_count != 0) {
+		if (AlignedBlock *block = aligned_find(uintptr_t(ptr))) {
+			void *result = __wrap_malloc(size);
+			if (result == nullptr) {
 				return nullptr;
 			}
-			void *q = __wrap_malloc(size);
-			if (q == nullptr) {
-				return nullptr; // the old block stays valid
-			}
-			const size_t keep = e->size < size ? e->size : size;
-			for (size_t i = 0; i < keep; i++) {
-				static_cast<unsigned char *>(q)[i] = static_cast<const unsigned char *>(ptr)[i];
-			}
-			sandbox_native_free(al_remove(e));
-			return q;
+			std::memcpy(result, ptr, block->size < size ? block->size : size);
+			__sandbox_free(aligned_erase(block));
+			return result;
 		}
 	}
-	return sandbox_native_realloc(ptr, size);
+	return __sandbox_realloc(ptr, size);
 }
 
 extern "C" void *memalign(size_t alignment, size_t size) {
 	if (alignment <= 16) {
 		return __wrap_malloc(size);
 	}
-	if ((alignment & (alignment - 1)) != 0) {
+	if ((alignment & (alignment - 1)) != 0 || size > SIZE_MAX - alignment) {
 		return nullptr;
 	}
-	if (size == 0) {
-		size = 1;
-	}
-	if (size > SIZE_MAX - alignment) {
+	void *base = __wrap_malloc(size + alignment - 1);
+	if (base == nullptr) {
 		return nullptr;
 	}
-	void *raw = __wrap_malloc(size + alignment - 1);
-	if (raw == nullptr) {
+	const uintptr_t ptr = (uintptr_t(base) + alignment - 1) & ~uintptr_t(alignment - 1);
+	if (ptr != uintptr_t(base) && !aligned_insert(ptr, base, size)) {
+		__sandbox_free(base);
 		return nullptr;
 	}
-	const uintptr_t user = (uintptr_t(raw) + alignment - 1) & ~uintptr_t(alignment - 1);
-	if (user == uintptr_t(raw)) {
-		return raw; // aligned as it came: a plain block
-	}
-	if (!al_insert(user, raw, size)) {
-		sandbox_native_free(raw);
-		return nullptr;
-	}
-	return reinterpret_cast<void *>(user);
+	return reinterpret_cast<void *>(ptr);
 }
 extern "C" void *aligned_alloc(size_t alignment, size_t size) {
 	return memalign(alignment, size);
 }
 extern "C" int posix_memalign(void **memptr, size_t alignment, size_t size) {
 	if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0) {
-		return 22; // EINVAL
+		return EINVAL;
 	}
 	void *result = memalign(alignment, size);
-	if (result) {
-		*memptr = result;
-		return 0;
+	if (result == nullptr) {
+		return ENOMEM;
 	}
-	return 12; // ENOMEM
+	*memptr = result;
+	return 0;
 }
 
 void *operator new(size_t size) noexcept(false) {
