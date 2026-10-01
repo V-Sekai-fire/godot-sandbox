@@ -1,49 +1,13 @@
-// Bulk access to a Packed*Array for compiled GDScript, after JNI's
-// Get<Type>ArrayElements / Release<Type>ArrayElements pair:
-//
-//   ECALL_PACKED_ACQUIRE(GuestVariant *subject, int type, gaddr_t desc, int64_t expected)
-//     Copies the array `subject` refers to into guest memory (the native heap
-//     arena) in one call and fills the descriptor at `desc`. Returns 0 when it
-//     did, 1 when it declined because `expected` element accesses do not pay
-//     for copying the array (expected < 0 means "unknown, always copy"), 2 when
-//     the Variant is not a Packed*Array of `type`, and 3 when there is no room.
-//     Anything but 0 leaves the descriptor untouched: the guest keeps using the
-//     per-element calls. (A host without these calls answers -ENOSYS, which the
-//     guest treats the same way.)
-//
-//   ECALL_PACKED_RELEASE(GuestVariant *subject, int type, gaddr_t desc)
-//     If the guest wrote the copy -- PACKED_WRITTEN in `type`, or the dirty word
-//     of the descriptor set (JNI_COMMIT) -- writes it back into the
-//     SAME host array, resizing it first when the length differs. That is the
-//     array's own storage, reached through the Variant's internal pointer, so
-//     every Variant that shares it -- another variable, a container slot, the
-//     caller of vmcall() -- sees the writes exactly as if they had been made one
-//     element at a time; ECALL_VSTORE would instead install a new array in this
-//     Variant only. A clean copy (JNI_ABORT) is just dropped. The copy is freed
-//     either way and the descriptor cleared, so a second release is harmless.
-//
-// PACKED_WRITTEN (0x100) may be or'ed into `type` of either call: the guest
-// says up front that it writes the copy, so it needs no store to the dirty word
-// per element, and an exception that unwinds the region stores it too.
-//
-// Descriptor, guest memory, little-endian, 32 bytes:
-//   +0 data pointer, +8 element count, +16 identity, +24 dirty flag
-// The identity is a keyed hash of the shared storage: equal for two Variants
-// that alias one array, unrelated otherwise, and no host address is exposed.
-// The guest compares identities to refuse a fast path in which an array it
-// writes could alias another one it copied.
-//
-// An exception (a host call failing, a guest assert, the instruction limit)
-// unwinds a region without its release. The host remembers every copy it has
-// handed out and not had back, and handle_exception() stores the dirty ones
-// and frees them all (commit_packed_acquisitions), so the arrays end up as
-// element-by-element access would have left them and the arena does not leak.
+// ECALL_PACKED_ACQUIRE and ECALL_PACKED_RELEASE (syscalls.h), after JNI's
+// Get<Type>ArrayElements / Release<Type>ArrayElements. handle_exception() stores
+// and frees the copies a region it unwound left behind.
 #include "guest_datatypes.h"
 #include "syscalls.h"
 
 #include <godot_cpp/variant/variant.hpp>
 #include <cstring>
 #include <random>
+#include <tuple>
 #include "syscalls_helpers.hpp"
 
 // As in sandbox_syscalls.cpp: charge the instruction budget unless profiling.
@@ -61,6 +25,7 @@ static constexpr int64_t MAX_PACKED_ELEMENTS = 16'777'216;
 // when at least one access per this many elements is expected.
 static constexpr int64_t ELEMENTS_PER_ACCESS = 64;
 
+// Guest ABI. The identity is a keyed hash of the shared storage: no host address leaks.
 struct PackedDescriptor {
 	uint64_t data;
 	uint64_t size;
@@ -162,7 +127,12 @@ void store_typed(machine_t &machine, void *storage, int type, const PackedDescri
 } // namespace
 
 APICALL(api_packed_acquire) {
-	auto [g_subject, flagged_type, desc, expected] = machine.sysargs<const GuestVariant *, int, gaddr_t, int64_t>();
+	const std::tuple<const GuestVariant *, int, gaddr_t, int64_t> args =
+			machine.sysargs<const GuestVariant *, int, gaddr_t, int64_t>();
+	const GuestVariant *g_subject = std::get<0>(args);
+	const int flagged_type = std::get<1>(args);
+	const gaddr_t desc = std::get<2>(args);
+	const int64_t expected = std::get<3>(args);
 	const bool written = (flagged_type & PACKED_WRITTEN) != 0;
 	const int type = flagged_type & ~PACKED_WRITTEN;
 	Sandbox &emu = riscv::emu(machine);
@@ -199,7 +169,10 @@ APICALL(api_packed_acquire) {
 }
 
 APICALL(api_packed_release) {
-	auto [g_subject, flagged_type, desc] = machine.sysargs<const GuestVariant *, int, gaddr_t>();
+	const std::tuple<const GuestVariant *, int, gaddr_t> args = machine.sysargs<const GuestVariant *, int, gaddr_t>();
+	const GuestVariant *g_subject = std::get<0>(args);
+	const int flagged_type = std::get<1>(args);
+	const gaddr_t desc = std::get<2>(args);
 	const bool written = (flagged_type & PACKED_WRITTEN) != 0;
 	const int type = flagged_type & ~PACKED_WRITTEN;
 	Sandbox &emu = riscv::emu(machine);
@@ -230,10 +203,8 @@ APICALL(api_packed_release) {
 } // namespace riscv
 
 void Sandbox::packed_acquired(const PackedAcquisition &acquisition) {
-	// A descriptor slot is reused only after its release, except by a guest that
-	// never releases: then the newer copy replaces the record, and the older one
-	// is freed rather than leaked.
-	for (auto it = m_packed_acquisitions.begin(); it != m_packed_acquisitions.end(); ++it) {
+	// A guest that never released this descriptor: the older copy is freed, not leaked.
+	for (std::vector<PackedAcquisition>::iterator it = m_packed_acquisitions.begin(); it != m_packed_acquisitions.end(); ++it) {
 		if (it->descriptor == acquisition.descriptor) {
 			if (it->data != 0 && it->data != acquisition.data && machine().has_arena()) {
 				machine().arena().free(it->data);
@@ -246,7 +217,7 @@ void Sandbox::packed_acquired(const PackedAcquisition &acquisition) {
 }
 
 void Sandbox::packed_released(gaddr_t descriptor) {
-	for (auto it = m_packed_acquisitions.begin(); it != m_packed_acquisitions.end(); ++it) {
+	for (std::vector<PackedAcquisition>::iterator it = m_packed_acquisitions.begin(); it != m_packed_acquisitions.end(); ++it) {
 		if (it->descriptor == descriptor) {
 			m_packed_acquisitions.erase(it);
 			return;
@@ -258,10 +229,9 @@ void Sandbox::commit_packed_acquisitions() {
 	if (m_packed_acquisitions.empty()) {
 		return;
 	}
-	// This call level and deeper: an error in a nested vmcall() leaves the regions
-	// of the calls that are still running alone.
+	// This call level and deeper: the regions of calls still running stay.
 	std::vector<PackedAcquisition> unwound;
-	for (auto it = m_packed_acquisitions.begin(); it != m_packed_acquisitions.end();) {
+	for (std::vector<PackedAcquisition>::iterator it = m_packed_acquisitions.begin(); it != m_packed_acquisitions.end();) {
 		if (it->level >= m_current_state) {
 			unwound.push_back(*it);
 			it = m_packed_acquisitions.erase(it);
@@ -269,7 +239,7 @@ void Sandbox::commit_packed_acquisitions() {
 			++it;
 		}
 	}
-	for (auto it = unwound.rbegin(); it != unwound.rend(); ++it) {
+	for (std::vector<PackedAcquisition>::reverse_iterator it = unwound.rbegin(); it != unwound.rend(); ++it) {
 		try {
 			riscv::PackedDescriptor descriptor;
 			machine().memory.memcpy_out(&descriptor, it->descriptor, sizeof(descriptor));
