@@ -949,6 +949,25 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 		return false;
 	}
 	const std::string_view binary_view = std::string_view{ (const char *)buffer->ptr(), static_cast<size_t>(buffer->size()) };
+#ifndef SAFEGDSCRIPT_DISABLED
+	{
+		// A compiled GDScript lays its Variants out for one real_t; on the other host every
+		// value it passes or returns is misread.
+		const std::string_view metadata = Sandbox::elf_section_bytes(binary_view, gdscript::GDSMETA_SECTION);
+		gdscript::ScriptMetadata decoded;
+		const bool host_double = sizeof(real_t) == sizeof(double);
+		if (!metadata.empty() && gdscript::decode_script_metadata(
+										 reinterpret_cast<const uint8_t *>(metadata.data()), metadata.size(), decoded) &&
+				decoded.double_precision != host_double) {
+			ERR_PRINT(String("Sandbox: this program was compiled for a ") + (decoded.double_precision ? "double" : "single") +
+					"-precision host, and this build is " + (host_double ? "double" : "single") +
+					" precision. Compile it with" + (host_double ? "" : "out") + " --double-precision.");
+			this->m_unchecked_memory_active = false;
+			this->reset_machine();
+			return false;
+		}
+	}
+#endif
 
 	// Guest addresses are about to change, so names cached against them are no longer valid.
 	this->m_guest_names.clear();
