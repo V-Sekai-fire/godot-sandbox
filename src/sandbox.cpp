@@ -970,13 +970,15 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 		} else {
 			const std::string_view declared = Sandbox::elf_section_bytes(binary_view, ".sandbox_variant");
 			uint32_t variant_size = 24;
-			if (declared.size() >= 8 && std::memcmp(declared.data(), "SBXV", 4) == 0) {
+			const bool named = declared.size() >= 8 && std::memcmp(declared.data(), "SBXV", 4) == 0;
+			if (named) {
 				std::memcpy(&variant_size, declared.data() + 4, sizeof(variant_size));
 			}
 			if (variant_size != sizeof(GuestVariant)) {
-				refusal = "this program's Variant is " + itos(variant_size) + " bytes and this build's is " +
-						itos(sizeof(GuestVariant)) + ". Build it with" + (host_double ? "" : "out") +
-						" the guest API's double precision (the C++ API's DOUBLE_PRECISION option).";
+				refusal = (named ? "this program's Variant is " + itos(variant_size) + " bytes"
+								 : String("this program names no Variant size, so it is taken for 24 bytes")) +
+						", and this build's is " + itos(sizeof(GuestVariant)) + ". Build it with" +
+						(host_double ? "" : "out") + " the guest API's double precision (the C++ API's DOUBLE_PRECISION option).";
 			}
 		}
 		if (!refusal.is_empty()) {
