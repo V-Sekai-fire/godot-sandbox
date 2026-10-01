@@ -146,8 +146,19 @@
 #define ECALL_STRING_CODEPOINT_BATCH (GAME_API_BASE + 65)
 
 #define ECALL_VARIANT_SET (GAME_API_BASE + 66)
+// A Packed*Array in bulk, JNI-style. ACQUIRE copies the array a guest Variant
+// refers to into guest memory once; RELEASE writes that copy back into the SAME
+// host array (in place, so every Variant sharing it sees the writes) when the
+// guest wrote it (PACKED_WRITTEN, or the descriptor's dirty word), and frees
+// the copy either way. See the addon's src/sandbox_syscalls_packed.cpp for the
+// descriptor layout.
+#define ECALL_PACKED_ACQUIRE (GAME_API_BASE + 67)
+#define ECALL_PACKED_RELEASE (GAME_API_BASE + 68)
+// Or'ed into the type argument of both: the guest writes the copy, so its
+// release stores it back whether or not the dirty word was set.
+#define PACKED_WRITTEN 0x100
 
-#define ECALL_LAST (GAME_API_BASE + 67)
+#define ECALL_LAST (GAME_API_BASE + 69)
 
 #define STRINGIFY_HELPER(x) #x
 #define STRINGIFY(x) STRINGIFY_HELPER(x)
