@@ -262,6 +262,10 @@ void Lexer::scan_token() {
 		case '@': add_token(TokenType::AT); break;
 		case '$': add_token(TokenType::DOLLAR); break;
 		case '?':
+			if (!m_extensions) {
+				error("'?' is a SafeGDScript extension, not GDScript; enable it with --extensions",
+					"EXTENSION_DISABLED");
+			}
 			if (match('?')) {
 				add_token(TokenType::QUESTION_QUESTION);
 			} else if (match('.')) {
@@ -660,7 +664,11 @@ void Lexer::scan_identifier() {
 
 	auto it = keywords.find(text);
 	TokenType type = (it != keywords.end()) ? it->second : TokenType::IDENTIFIER;
-	if (text == "uses") {
+	if (!m_extensions && (type == TokenType::STRUCT || type == TokenType::TRAIT ||
+			type == TokenType::TRAIT_NAME || type == TokenType::SWITCH)) {
+		type = TokenType::IDENTIFIER;
+	}
+	if (m_extensions && text == "uses") {
 		size_t next = m_current;
 		while (next < m_source.size() &&
 			(m_source[next] == ' ' || m_source[next] == '\t')) next++;

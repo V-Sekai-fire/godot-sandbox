@@ -16,15 +16,15 @@
 // The table is a second lowering, not a replacement, so the key cases here are
 // what it must not decide alone: a subject that is not an integer, or is out of
 // range, must reach the same arm the compare chain would.
-#include "../lexer.h"
-#include "../parser.h"
 #include "../codegen.h"
+#include "../compiler_exception.h"
 #include "../ir_interpreter.h"
 #include "../ir_optimizer.h"
 #include "../ir_verifier.h"
+#include "../lexer.h"
+#include "../parser.h"
 #include "../riscv_codegen.h"
-#include "../compiler_exception.h"
-#include <cassert>
+#include "witness/doctest.h"
 #include <cstring>
 #include <iostream>
 #include <set>
@@ -35,7 +35,7 @@ using namespace gdscript;
 
 // -= Helpers =-
 
-static IRProgram compile_to_ir(const std::string& source, bool optimize = false) {
+static IRProgram compile_to_ir(const std::string &source, bool optimize = false) {
 	Lexer lexer(source);
 	Parser parser(lexer.tokenize());
 	Program program = parser.parse();
@@ -48,8 +48,8 @@ static IRProgram compile_to_ir(const std::string& source, bool optimize = false)
 	return ir;
 }
 
-static const IRFunction& find_function(const IRProgram& ir, const std::string& name) {
-	for (const auto& func : ir.functions) {
+static const IRFunction &find_function(const IRProgram &ir, const std::string &name) {
+	for (const auto &func : ir.functions) {
 		if (func.name == name) {
 			return func;
 		}
@@ -57,9 +57,9 @@ static const IRFunction& find_function(const IRProgram& ir, const std::string& n
 	throw std::runtime_error("Function not found: " + name);
 }
 
-static int count_opcode(const IRFunction& func, IROpcode opcode) {
+static int count_opcode(const IRFunction &func, IROpcode opcode) {
 	int count = 0;
-	for (const auto& instr : func.instructions) {
+	for (const auto &instr : func.instructions) {
 		if (instr.opcode == opcode) {
 			count++;
 		}
@@ -67,20 +67,20 @@ static int count_opcode(const IRFunction& func, IROpcode opcode) {
 	return count;
 }
 
-static const IRInstruction& only_switch(const IRFunction& func) {
-	const IRInstruction* found = nullptr;
-	for (const auto& instr : func.instructions) {
+static const IRInstruction &only_switch(const IRFunction &func) {
+	const IRInstruction *found = nullptr;
+	for (const auto &instr : func.instructions) {
 		if (instr.opcode == IROpcode::SWITCH) {
-			assert(found == nullptr && "more than one SWITCH in the function");
+			REQUIRE((found == nullptr && "more than one SWITCH in the function"));
 			found = &instr;
 		}
 	}
-	assert(found != nullptr && "expected a SWITCH");
+	REQUIRE((found != nullptr && "expected a SWITCH"));
 	return *found;
 }
 
 // The label a SWITCH sends `value` to, or INVALID_ID if the value is out of range.
-static uint32_t switch_target(const IRInstruction& sw, int64_t value) {
+static uint32_t switch_target(const IRInstruction &sw, int64_t value) {
 	const int64_t base = sw.operands.at(1).immediate();
 	const int64_t count = sw.operands.at(2).immediate();
 	if (value < base || value >= base + count) {
@@ -89,8 +89,8 @@ static uint32_t switch_target(const IRInstruction& sw, int64_t value) {
 	return sw.operands.at(3 + (value - base)).string_id;
 }
 
-static int64_t call_int(const IRProgram& ir, const std::string& function,
-                        const std::vector<IRInterpreter::Value>& args = {}) {
+static int64_t call_int(const IRProgram &ir, const std::string &function,
+						const std::vector<IRInterpreter::Value> &args = {}) {
 	IRInterpreter interp(ir);
 	return std::get<int64_t>(interp.call(function, args));
 }
@@ -98,23 +98,21 @@ static int64_t call_int(const IRProgram& ir, const std::string& function,
 // Every optimizer pass must leave the IR verifiable. SWITCH table entries are
 // branch targets like any other: a pass that deleted one of those labels would
 // leave a jump into nothing.
-static void verify_through_the_pipeline(const std::string& source) {
+static void verify_through_the_pipeline(const std::string &source) {
 	IRProgram ir = compile_to_ir(source, /*optimize=*/false);
-	for (const auto& func : ir.functions) {
+	for (const auto &func : ir.functions) {
 		ir_verify(func, "codegen");
 	}
 	IROptimizer optimizer;
 	optimizer.optimize(ir);
-	for (const auto& func : ir.functions) {
+	for (const auto &func : ir.functions) {
 		ir_verify(func, "the optimizer");
 	}
 }
 
 // -= Constants =-
 
-static void test_const_global_folds_to_an_immediate() {
-	std::cout << "Testing that a const global reaches its use as an immediate..." << std::endl;
-
+TEST_CASE("const global folds to an immediate") {
 	const std::string source = R"(
 const LIMIT = 42
 const NAME = "cpu"
@@ -126,27 +124,23 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRFunction& func = find_function(ir, "test");
+	const IRFunction &func = find_function(ir, "test");
 
 	// The type matters more than the saved load: LOAD_GLOBAL carries no type,
 	// and every native path downstream needs to know this is an integer.
-	assert(count_opcode(func, IROpcode::LOAD_GLOBAL) == 0);
-	assert(count_opcode(func, IROpcode::LOAD_IMM) == 1);
-	for (const auto& instr : func.instructions) {
+	REQUIRE(count_opcode(func, IROpcode::LOAD_GLOBAL) == 0);
+	REQUIRE(count_opcode(func, IROpcode::LOAD_IMM) == 1);
+	for (const auto &instr : func.instructions) {
 		if (instr.opcode == IROpcode::LOAD_IMM) {
-			assert(instr.operands.at(1).immediate() == 42);
-			assert(instr.type_hint == Variant::INT);
+			REQUIRE(instr.operands.at(1).immediate() == 42);
+			REQUIRE(instr.type_hint == Variant::INT);
 		}
 	}
 
-	assert(call_int(ir, "test") == 42);
-
-	std::cout << "  ✓ A const integer is an immediate at its use" << std::endl;
+	REQUIRE(call_int(ir, "test") == 42);
 }
 
-static void test_const_container_stays_a_global() {
-	std::cout << "Testing that a const container is still read from the globals..." << std::endl;
-
+TEST_CASE("const container stays a global") {
 	// A container is a handle: every read must yield the same container, so
 	// materialising a fresh one per read would be a different program.
 	const std::string source = R"(
@@ -157,15 +151,11 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRFunction& func = find_function(ir, "test");
-	assert(count_opcode(func, IROpcode::LOAD_GLOBAL) == 1);
-
-	std::cout << "  ✓ A const array is read, not rebuilt" << std::endl;
+	const IRFunction &func = find_function(ir, "test");
+	REQUIRE(count_opcode(func, IROpcode::LOAD_GLOBAL) == 1);
 }
 
-static void test_a_local_shadows_a_const() {
-	std::cout << "Testing that a local wins over a const of the same name..." << std::endl;
-
+TEST_CASE("a local shadows a const") {
 	const std::string source = R"(
 const VALUE = 1
 
@@ -174,16 +164,14 @@ func test():
 	return VALUE
 )";
 
-	assert(call_int(compile_to_ir(source), "test") == 9);
-	assert(call_int(compile_to_ir(source, /*optimize=*/true), "test") == 9);
-
-	std::cout << "  ✓ Folding a const does not reach past a local of that name" << std::endl;
+	REQUIRE(call_int(compile_to_ir(source), "test") == 9);
+	REQUIRE(call_int(compile_to_ir(source, /*optimize=*/true), "test") == 9);
 }
 
 // -= When a jump table is built, and when it is not =-
 
 // Sixteen opcodes addressed by consts: the target case.
-static const char* OPCODE_MACHINE = R"(
+static const char *OPCODE_MACHINE = R"(
 const OP_HALT  = 0
 const OP_LOADI = 1
 const OP_MOV   = 2
@@ -247,60 +235,50 @@ func test():
 	return total
 )";
 
-static void test_dense_match_becomes_a_jump_table() {
-	std::cout << "Testing that a dense opcode match becomes a jump table..." << std::endl;
-
+TEST_CASE("dense match becomes a jump table") {
 	const IRProgram ir = compile_to_ir(OPCODE_MACHINE);
-	const IRFunction& step = find_function(ir, "step");
-	const IRInstruction& sw = only_switch(step);
+	const IRFunction &step = find_function(ir, "step");
+	const IRInstruction &sw = only_switch(step);
 
-	assert(sw.operands.at(1).immediate() == 0);   // base
-	assert(sw.operands.at(2).immediate() == 16);  // one entry per opcode
-	assert(sw.operands.size() == 3 + 16);
+	REQUIRE(sw.operands.at(1).immediate() == 0); // base
+	REQUIRE(sw.operands.at(2).immediate() == 16); // one entry per opcode
+	REQUIRE(sw.operands.size() == 3 + 16);
 
 	// The subject is declared `int`, so the table decides the whole match and no
 	// compare chain follows it.
-	assert(sw.type_hint == Variant::INT);
-	assert(count_opcode(step, IROpcode::CMP_EQ) == 0);
+	REQUIRE(sw.type_hint == Variant::INT);
+	REQUIRE(count_opcode(step, IROpcode::CMP_EQ) == 0);
 
 	// Sixteen distinct arms, all reachable, none the wildcard.
 	std::set<uint32_t> targets;
 	for (int64_t op = 0; op < 16; op++) {
 		targets.insert(switch_target(sw, op));
 	}
-	assert(targets.size() == 16);
-
-	std::cout << "  ✓ Sixteen opcodes, one table, no compares" << std::endl;
+	REQUIRE(targets.size() == 16);
 }
 
-static void test_the_machine_still_computes_the_same_answers() {
-	std::cout << "Testing that the machine answers the same optimized and not..." << std::endl;
-
+TEST_CASE("the machine still computes the same answers") {
 	const int64_t plain = call_int(compile_to_ir(OPCODE_MACHINE), "test");
 	const int64_t optimized = call_int(compile_to_ir(OPCODE_MACHINE, /*optimize=*/true), "test");
-	assert(plain == optimized);
+	REQUIRE(plain == optimized);
 
 	// Spot-check individual arms: an off-by-one in the table still sums to
 	// something plausible.
 	const IRProgram ir = compile_to_ir(OPCODE_MACHINE, /*optimize=*/true);
-	assert(call_int(ir, "step", { int64_t(0), int64_t(12), int64_t(3) }) == 0);      // HALT
-	assert(call_int(ir, "step", { int64_t(3), int64_t(12), int64_t(3) }) == 15);     // ADD
-	assert(call_int(ir, "step", { int64_t(4), int64_t(12), int64_t(3) }) == 9);      // SUB
-	assert(call_int(ir, "step", { int64_t(5), int64_t(12), int64_t(3) }) == 36);     // MUL
-	assert(call_int(ir, "step", { int64_t(9), int64_t(12), int64_t(3) }) == 96);     // SHL
-	assert(call_int(ir, "step", { int64_t(10), int64_t(12), int64_t(3) }) == 1);     // SHR
-	assert(call_int(ir, "step", { int64_t(15), int64_t(12), int64_t(3) }) == 1012);  // OUT
-	assert(call_int(ir, "step", { int64_t(16), int64_t(12), int64_t(3) }) == -1);    // past the table
-	assert(call_int(ir, "step", { int64_t(-1), int64_t(12), int64_t(3) }) == -1);    // below the table
+	REQUIRE(call_int(ir, "step", { int64_t(0), int64_t(12), int64_t(3) }) == 0); // HALT
+	REQUIRE(call_int(ir, "step", { int64_t(3), int64_t(12), int64_t(3) }) == 15); // ADD
+	REQUIRE(call_int(ir, "step", { int64_t(4), int64_t(12), int64_t(3) }) == 9); // SUB
+	REQUIRE(call_int(ir, "step", { int64_t(5), int64_t(12), int64_t(3) }) == 36); // MUL
+	REQUIRE(call_int(ir, "step", { int64_t(9), int64_t(12), int64_t(3) }) == 96); // SHL
+	REQUIRE(call_int(ir, "step", { int64_t(10), int64_t(12), int64_t(3) }) == 1); // SHR
+	REQUIRE(call_int(ir, "step", { int64_t(15), int64_t(12), int64_t(3) }) == 1012); // OUT
+	REQUIRE(call_int(ir, "step", { int64_t(16), int64_t(12), int64_t(3) }) == -1); // past the table
+	REQUIRE(call_int(ir, "step", { int64_t(-1), int64_t(12), int64_t(3) }) == -1); // below the table
 
 	verify_through_the_pipeline(OPCODE_MACHINE);
-
-	std::cout << "  ✓ Every arm answers what it did before" << std::endl;
 }
 
-static void test_a_short_match_keeps_the_compares() {
-	std::cout << "Testing that a small match is not worth a table..." << std::endl;
-
+TEST_CASE("a short match keeps the compares") {
 	// Three arms: the table setup costs about what the compares do, and the
 	// compares cost no code size.
 	const std::string source = R"(
@@ -320,17 +298,13 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRFunction& pick = find_function(ir, "pick");
-	assert(count_opcode(pick, IROpcode::SWITCH) == 0);
-	assert(count_opcode(pick, IROpcode::CMP_EQ) == 3);
-	assert(call_int(ir, "test") == 100);
-
-	std::cout << "  ✓ Three arms stay three compares" << std::endl;
+	const IRFunction &pick = find_function(ir, "pick");
+	REQUIRE(count_opcode(pick, IROpcode::SWITCH) == 0);
+	REQUIRE(count_opcode(pick, IROpcode::CMP_EQ) == 3);
+	REQUIRE(call_int(ir, "test") == 100);
 }
 
-static void test_a_sparse_match_keeps_the_compares() {
-	std::cout << "Testing that a sparse match is not worth a table..." << std::endl;
-
+TEST_CASE("a sparse match keeps the compares") {
 	// Five values spread over ten thousand: the table would be nearly all holes.
 	const std::string source = R"(
 func pick(n : int) -> int:
@@ -353,15 +327,11 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	assert(count_opcode(find_function(ir, "pick"), IROpcode::SWITCH) == 0);
-	assert(call_int(ir, "test") == 15);
-
-	std::cout << "  ✓ Five values across ten thousand stay compares" << std::endl;
+	REQUIRE(count_opcode(find_function(ir, "pick"), IROpcode::SWITCH) == 0);
+	REQUIRE(call_int(ir, "test") == 15);
 }
 
-static void test_a_non_constant_pattern_forbids_the_table() {
-	std::cout << "Testing that one non-constant pattern rules out the table..." << std::endl;
-
+TEST_CASE("a non constant pattern forbids the table") {
 	// `limit` may hold 2, in which case GDScript takes the first arm. A table
 	// jumping straight to the `2:` body would run the wrong one, so one
 	// unevaluable pattern disqualifies the whole match.
@@ -386,17 +356,13 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	assert(count_opcode(find_function(ir, "pick"), IROpcode::SWITCH) == 0);
-	assert(call_int(ir, "test") == 14); // first arm for n == limit, then the 2: arm
-
-	std::cout << "  ✓ A variable pattern keeps the first-match order honest" << std::endl;
+	REQUIRE(count_opcode(find_function(ir, "pick"), IROpcode::SWITCH) == 0);
+	REQUIRE(call_int(ir, "test") == 14); // first arm for n == limit, then the 2: arm
 }
 
 // -= What the table must not decide by itself =-
 
-static void test_an_untyped_subject_keeps_the_chain_behind_the_table() {
-	std::cout << "Testing that an untyped subject keeps its compares..." << std::endl;
-
+TEST_CASE("an untyped subject keeps the chain behind the table") {
 	// `match 3.0` must reach the `3:` arm, and `match true` the `1:` arm. The
 	// table handles only integers, so unless the subject is known to be one the
 	// compare chain stays behind it and catches every fall-through.
@@ -421,24 +387,20 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRFunction& pick = find_function(ir, "pick");
+	const IRFunction &pick = find_function(ir, "pick");
 
-	const IRInstruction& sw = only_switch(pick);
-	assert(sw.type_hint == IRInstruction::TypeHint_NONE); // so the backend tests the type
-	assert(count_opcode(pick, IROpcode::CMP_EQ) == 5);    // and the chain is still there
+	const IRInstruction &sw = only_switch(pick);
+	REQUIRE(sw.type_hint == IRInstruction::TypeHint_NONE); // so the backend tests the type
+	REQUIRE(count_opcode(pick, IROpcode::CMP_EQ) == 5); // and the chain is still there
 
 	// 13 via the table, 13 via the chain for the float, 11 for the bool, and the
 	// wildcard for a float equal to nothing.
-	assert(call_int(ir, "test") == 13131100 - 1);
+	REQUIRE(call_int(ir, "test") == 13131100 - 1);
 
 	verify_through_the_pipeline(source);
-
-	std::cout << "  ✓ A float and a bool still find their integer arm" << std::endl;
 }
 
-static void test_holes_and_duplicates() {
-	std::cout << "Testing holes, a negative base and a value named twice..." << std::endl;
-
+TEST_CASE("holes and duplicates") {
 	const std::string source = R"(
 const LOWEST = -4
 
@@ -462,35 +424,34 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRInstruction& sw = only_switch(find_function(ir, "classify"));
+	const IRInstruction &sw = only_switch(find_function(ir, "classify"));
 
-	assert(sw.operands.at(1).immediate() == -4);
-	assert(sw.operands.at(2).immediate() == 8); // -4 .. 3
+	REQUIRE(sw.operands.at(1).immediate() == -4);
+	REQUIRE(sw.operands.at(2).immediate() == 8); // -4 .. 3
 
 	// -2 and -1 share an arm; -3, 0 and 2 are holes and go where falling out of
 	// the match goes; the second LOWEST is unreachable, as in the compare chain.
-	assert(switch_target(sw, -2) == switch_target(sw, -1));
-	assert(switch_target(sw, -3) == switch_target(sw, 0));
-	assert(switch_target(sw, 0) == switch_target(sw, 2));
-	assert(switch_target(sw, -4) != switch_target(sw, -3));
-	assert(switch_target(sw, -4) != switch_target(sw, 3));
-	assert(switch_target(sw, 4) == IRStringTable::INVALID_ID); // past the end of the table
+	REQUIRE(switch_target(sw, -2) == switch_target(sw, -1));
+	REQUIRE(switch_target(sw, -3) == switch_target(sw, 0));
+	REQUIRE(switch_target(sw, 0) == switch_target(sw, 2));
+	REQUIRE(switch_target(sw, -4) != switch_target(sw, -3));
+	REQUIRE(switch_target(sw, -4) != switch_target(sw, 3));
+	REQUIRE(switch_target(sw, 4) == IRStringTable::INVALID_ID); // past the end of the table
 
 	IRProgram optimized = compile_to_ir(source, /*optimize=*/true);
 	for (int64_t v = -6; v < 6; v++) {
 		const int64_t expected =
-			(v == -4) ? 1 : (v == -2 || v == -1) ? 2 : (v == 1) ? 3 : (v == 3) ? 4 : 0;
+				(v == -4) ? 1 : (v == -2 || v == -1) ? 2
+				: (v == 1)							 ? 3
+				: (v == 3)							 ? 4
+													 : 0;
 		// A match with no wildcard and no arm for `v` falls out and runs what
 		// follows, leaving `out` unchanged.
-		assert(call_int(optimized, "classify", { v }) == expected);
+		REQUIRE(call_int(optimized, "classify", { v }) == expected);
 	}
-
-	std::cout << "  ✓ Holes fall out of the match and the first arm wins" << std::endl;
 }
 
-static void test_a_wildcard_is_not_a_table_entry() {
-	std::cout << "Testing that the wildcard body is where holes go..." << std::endl;
-
+TEST_CASE("a wildcard is not a table entry") {
 	const std::string source = R"(
 func pick(n : int) -> int:
 	match n:
@@ -510,26 +471,22 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRInstruction& sw = only_switch(find_function(ir, "pick"));
-	assert(sw.operands.at(2).immediate() == 5); // 0 .. 4
+	const IRInstruction &sw = only_switch(find_function(ir, "pick"));
+	REQUIRE(sw.operands.at(2).immediate() == 5); // 0 .. 4
 
 	// The hole at 2 targets the wildcard's body, not an arm of its own.
 	const uint32_t hole = switch_target(sw, 2);
-	assert(hole != IRStringTable::INVALID_ID);
-	assert(hole != switch_target(sw, 0));
-	assert(hole != switch_target(sw, 4));
+	REQUIRE(hole != IRStringTable::INVALID_ID);
+	REQUIRE(hole != switch_target(sw, 0));
+	REQUIRE(hole != switch_target(sw, 4));
 
 	const IRProgram optimized = compile_to_ir(source, /*optimize=*/true);
-	assert(call_int(optimized, "pick", { int64_t(2) }) == 99);
-	assert(call_int(optimized, "pick", { int64_t(9) }) == 99);
-	assert(call_int(optimized, "pick", { int64_t(-1) }) == 99);
-
-	std::cout << "  ✓ A hole and an out-of-range subject both reach the wildcard" << std::endl;
+	REQUIRE(call_int(optimized, "pick", { int64_t(2) }) == 99);
+	REQUIRE(call_int(optimized, "pick", { int64_t(9) }) == 99);
+	REQUIRE(call_int(optimized, "pick", { int64_t(-1) }) == 99);
 }
 
-static void test_break_and_return_inside_an_arm() {
-	std::cout << "Testing control flow out of a table arm..." << std::endl;
-
+TEST_CASE("break and return inside an arm") {
 	// The arms are emitted after the table rather than between the compares, so
 	// `break` and `continue` in an arm must still refer to the enclosing loop.
 	const std::string source = R"(
@@ -555,23 +512,19 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source, /*optimize=*/true);
-	assert(count_opcode(find_function(ir, "test"), IROpcode::SWITCH) == 1);
-	assert(call_int(ir, "test") == 11015);
+	REQUIRE(count_opcode(find_function(ir, "test"), IROpcode::SWITCH) == 1);
+	REQUIRE(call_int(ir, "test") == 11015);
 
 	verify_through_the_pipeline(source);
-
-	std::cout << "  ✓ break and continue still mean the loop" << std::endl;
 }
 
 // -= The backend =-
 
-static void test_the_table_reaches_riscv() {
-	std::cout << "Testing that the machine compiles to RISC-V..." << std::endl;
-
+TEST_CASE("the table reaches riscv") {
 	IRProgram ir = compile_to_ir(OPCODE_MACHINE, /*optimize=*/true);
 	RISCVCodeGen codegen;
 	const std::vector<uint8_t> code = codegen.generate(ir);
-	assert(!code.empty());
+	REQUIRE(!code.empty());
 
 	// The table is `count` consecutive jumps in the instruction stream, so the
 	// dispatch must end in an indirect jump followed by sixteen JALs. Checking
@@ -603,22 +556,18 @@ static void test_the_table_reaches_riscv() {
 			break;
 		}
 	}
-	assert(found && "no jump table in the generated code");
+	REQUIRE((found && "no jump table in the generated code"));
 
 	// Immediately before the indirect jump: sh2add, scaling the index by the 4
 	// bytes per table entry. A wrong scale lands in the middle of the table.
 	uint32_t sh2add = 0;
 	std::memcpy(&sh2add, &code[jalr_at - 4], 4);
-	assert((sh2add & 0x7F) == 0x33);          // OP
-	assert(((sh2add >> 12) & 0x7) == 4);      // funct3
-	assert(((sh2add >> 25) & 0x7F) == 0x10);  // funct7: Zba
-
-	std::cout << "  ✓ The table is sixteen jumps behind an indirect branch" << std::endl;
+	REQUIRE((sh2add & 0x7F) == 0x33); // OP
+	REQUIRE(((sh2add >> 12) & 0x7) == 4); // funct3
+	REQUIRE(((sh2add >> 25) & 0x7F) == 0x10); // funct7: Zba
 }
 
-static void test_a_huge_range_is_refused() {
-	std::cout << "Testing that a spread-out match cannot ask for a huge table..." << std::endl;
-
+TEST_CASE("a huge range is refused") {
 	// Six arms hundreds of thousands apart: a table covering them would be most
 	// of a megabyte of jumps for six destinations.
 	const std::string source = R"(
@@ -644,10 +593,8 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	assert(count_opcode(find_function(ir, "pick"), IROpcode::SWITCH) == 0);
-	assert(call_int(ir, "test") == 5);
-
-	std::cout << "  ✓ No table, and no megabyte of jumps" << std::endl;
+	REQUIRE(count_opcode(find_function(ir, "pick"), IROpcode::SWITCH) == 0);
+	REQUIRE(call_int(ir, "test") == 5);
 }
 
 // -= switch =-
@@ -656,58 +603,52 @@ func test():
 // rejects, match still accepts.
 
 // Returns CompilerException message, or "" on success.
-static std::string compile_error(const std::string& source) {
+static std::string compile_error(const std::string &source) {
 	try {
 		compile_to_ir(source);
-	} catch (const CompilerException& e) {
+	} catch (const CompilerException &e) {
 		return e.what();
 	}
 	return "";
 }
 
-static bool mentions(const std::string& haystack, const std::string& needle) {
+static bool mentions(const std::string &haystack, const std::string &needle) {
 	return haystack.find(needle) != std::string::npos;
 }
 
 // 16-arm int dispatch, parameterised by keyword.
-static std::string dispatch_source(const std::string& keyword) {
+static std::string dispatch_source(const std::string &keyword) {
 	std::string source = "func pick(op : int) -> int:\n\t" + keyword + " op:\n";
 	for (int i = 0; i < 16; i++) {
 		source += "\t\t" + std::to_string(i) + ":\n\t\t\treturn " +
-			std::to_string(100 + i) + "\n";
+				std::to_string(100 + i) + "\n";
 	}
 	source += "\t\t_:\n\t\t\treturn -1\n";
 	source += "\nfunc test():\n\treturn pick(0) + pick(15) + pick(99)\n";
 	return source;
 }
 
-static void test_switch_is_dispatch_and_nothing_else() {
-	std::cout << "Testing that a switch is a table and no compares..." << std::endl;
-
+TEST_CASE("switch is dispatch and nothing else") {
 	const std::string source = dispatch_source("switch");
 	const IRProgram ir = compile_to_ir(source);
-	const IRFunction& pick = find_function(ir, "pick");
+	const IRFunction &pick = find_function(ir, "pick");
 
-	const IRInstruction& sw = only_switch(pick);
-	assert(sw.type_hint == Variant::INT);  // no type test emitted
+	const IRInstruction &sw = only_switch(pick);
+	REQUIRE(sw.type_hint == Variant::INT); // no type test emitted
 	// No CMP_EQ: every arm is a table entry, none becomes a VEVAL.
-	assert(count_opcode(pick, IROpcode::CMP_EQ) == 0);
+	REQUIRE(count_opcode(pick, IROpcode::CMP_EQ) == 0);
 
-	assert(switch_target(sw, 0) != switch_target(sw, 15));
-	assert(switch_target(sw, 16) == IRStringTable::INVALID_ID);  // out-of-range -> wildcard
+	REQUIRE(switch_target(sw, 0) != switch_target(sw, 15));
+	REQUIRE(switch_target(sw, 16) == IRStringTable::INVALID_ID); // out-of-range -> wildcard
 
-	assert(call_int(ir, "test") == 100 + 115 - 1);
+	REQUIRE(call_int(ir, "test") == 100 + 115 - 1);
 	verify_through_the_pipeline(source);
-
-	std::cout << "  ✓ One table, zero compares" << std::endl;
 }
 
-static void test_switch_and_a_typed_match_are_the_same_machine_code() {
-	std::cout << "Testing that switch is exactly the typed match lowering..." << std::endl;
-
+TEST_CASE("switch and a typed match are the same machine code") {
 	// Typed match already emits SWITCH; switch adds only the compile-time
 	// guarantee. Byte-identical ELF confirms zero overhead.
-	auto machine_code = [](const std::string& keyword) {
+	auto machine_code = [](const std::string &keyword) {
 		IRProgram ir = compile_to_ir(dispatch_source(keyword), /*optimize=*/true);
 		RISCVCodeGen codegen;
 		return codegen.generate(ir);
@@ -715,15 +656,11 @@ static void test_switch_and_a_typed_match_are_the_same_machine_code() {
 
 	const std::vector<uint8_t> from_switch = machine_code("switch");
 	const std::vector<uint8_t> from_match = machine_code("match");
-	assert(!from_switch.empty());
-	assert(from_switch == from_match);
-
-	std::cout << "  ✓ Identical RISC-V, so switch costs nothing extra" << std::endl;
+	REQUIRE(!from_switch.empty());
+	REQUIRE(from_switch == from_match);
 }
 
-static void test_switch_takes_the_table_below_the_match_floor() {
-	std::cout << "Testing that a small switch still gets its table..." << std::endl;
-
+TEST_CASE("switch takes the table below the match floor") {
 	// MIN_SWITCH_CASES blocks match below the threshold; switch bypasses the floor.
 	const std::string arms = R"( op:
 		0:
@@ -740,90 +677,82 @@ func test():
 	const IRProgram from_switch = compile_to_ir("func pick(op : int) -> int:\n\tswitch" + arms);
 	const IRProgram from_match = compile_to_ir("func pick(op : int) -> int:\n\tmatch" + arms);
 
-	assert(count_opcode(find_function(from_switch, "pick"), IROpcode::SWITCH) == 1);
-	assert(count_opcode(find_function(from_match, "pick"), IROpcode::SWITCH) == 0);
+	REQUIRE(count_opcode(find_function(from_switch, "pick"), IROpcode::SWITCH) == 1);
+	REQUIRE(count_opcode(find_function(from_match, "pick"), IROpcode::SWITCH) == 0);
 
 	// Same result; only dispatch shape differs.
-	assert(call_int(from_switch, "test") == 1200 - 1);
-	assert(call_int(from_match, "test") == 1200 - 1);
-
-	std::cout << "  ✓ Two arms are enough when the table was asked for" << std::endl;
+	REQUIRE(call_int(from_switch, "test") == 1200 - 1);
+	REQUIRE(call_int(from_match, "test") == 1200 - 1);
 }
 
-static void test_switch_refuses_what_a_table_cannot_do() {
-	std::cout << "Testing that every non-dispatch switch is a compile error..." << std::endl;
-
+TEST_CASE("switch refuses what a table cannot do") {
 	// Each case: a switch the table rejects, with expected diagnostic substring.
 	// Same source under match must still compile.
 	const struct {
-		const char* what;
-		const char* body;
-		const char* expected;
+		const char *what;
+		const char *body;
+		const char *expected;
 	} cases[] = {
-		{"an untyped subject",
-		 "func pick(op):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t1:\n\t\t\treturn 2\n",
-		 "has to be a known integer"},
-		{"a float subject",
-		 "func pick(op : float):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t1:\n\t\t\treturn 2\n",
-		 "but this is a FLOAT"},
-		{"a guard",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t0 when op > 1:\n\t\t\treturn 1\n\t\t1:\n\t\t\treturn 2\n",
-		 "cannot have a 'when' guard"},
-		{"a binding",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\tvar v:\n\t\t\treturn v\n",
-		 "this is a binding"},
-		{"an array pattern",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t[1, 2]:\n\t\t\treturn 2\n",
-		 "this is an array pattern"},
-		{"a dictionary pattern",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t{\"k\": 1}:\n\t\t\treturn 2\n",
-		 "this is a dictionary pattern"},
-		{"a wildcard sharing an arm",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t0, _:\n\t\t\treturn 1\n",
-		 "this is a wildcard"},
-		{"a non-integer constant",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t\"x\":\n\t\t\treturn 2\n",
-		 "has to be an integer constant"},
-		{"a pattern that does not fold",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\top:\n\t\t\treturn 2\n",
-		 "the compiler can fold"},
-		{"no integer pattern at all",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t_:\n\t\t\treturn 1\n",
-		 "needs at least one integer pattern"},
-		{"a duplicate",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t1, 0:\n\t\t\treturn 2\n",
-		 "Duplicate 'switch' pattern 0"},
-		{"a spread too wide to index",
-		 "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t100000:\n\t\t\treturn 2\n",
-		 "too sparse for a jump table"},
+		{ "an untyped subject",
+		  "func pick(op):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t1:\n\t\t\treturn 2\n",
+		  "has to be a known integer" },
+		{ "a float subject",
+		  "func pick(op : float):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t1:\n\t\t\treturn 2\n",
+		  "but this is a FLOAT" },
+		{ "a guard",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t0 when op > 1:\n\t\t\treturn 1\n\t\t1:\n\t\t\treturn 2\n",
+		  "cannot have a 'when' guard" },
+		{ "a binding",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\tvar v:\n\t\t\treturn v\n",
+		  "this is a binding" },
+		{ "an array pattern",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t[1, 2]:\n\t\t\treturn 2\n",
+		  "this is an array pattern" },
+		{ "a dictionary pattern",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t{\"k\": 1}:\n\t\t\treturn 2\n",
+		  "this is a dictionary pattern" },
+		{ "a wildcard sharing an arm",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t0, _:\n\t\t\treturn 1\n",
+		  "this is a wildcard" },
+		{ "a non-integer constant",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t\"x\":\n\t\t\treturn 2\n",
+		  "has to be an integer constant" },
+		{ "a pattern that does not fold",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\top:\n\t\t\treturn 2\n",
+		  "the compiler can fold" },
+		{ "no integer pattern at all",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t_:\n\t\t\treturn 1\n",
+		  "needs at least one integer pattern" },
+		{ "a duplicate",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t1, 0:\n\t\t\treturn 2\n",
+		  "Duplicate 'switch' pattern 0" },
+		{ "a spread too wide to index",
+		  "func pick(op : int):\n\tKEYWORD op:\n\t\t0:\n\t\t\treturn 1\n\t\t100000:\n\t\t\treturn 2\n",
+		  "too sparse for a jump table" },
 	};
 
-	for (const auto& entry : cases) {
+	for (const auto &entry : cases) {
 		std::string source = entry.body;
 		const std::string with_switch =
-			source.replace(source.find("KEYWORD"), 7, "switch");
+				source.replace(source.find("KEYWORD"), 7, "switch");
 		const std::string error = compile_error(with_switch);
-		assert(!error.empty() && "a switch that cannot be a table has to be refused");
+		REQUIRE((!error.empty() && "a switch that cannot be a table has to be refused"));
 		if (!mentions(error, entry.expected)) {
 			std::cerr << "  " << entry.what << ": expected \"" << entry.expected
-			          << "\" in:\n    " << error << std::endl;
-			assert(false && "wrong diagnostic");
+					  << "\" in:\n    " << error << std::endl;
+			FAIL("wrong diagnostic");
 		}
 
 		// Same source under match must compile.
 		source = entry.body;
 		const std::string with_match =
-			source.replace(source.find("KEYWORD"), 7, "match");
-		assert(compile_error(with_match).empty() &&
-			"switch must not make anything illegal that match accepts");
-
-		std::cout << "  ✓ " << entry.what << std::endl;
+				source.replace(source.find("KEYWORD"), 7, "match");
+		REQUIRE((compile_error(with_match).empty() &&
+				 "switch must not make anything illegal that match accepts"));
 	}
 }
 
-static void test_switch_dispatches_a_real_loop() {
-	std::cout << "Testing a fetch-decode-execute loop built on switch..." << std::endl;
-
+TEST_CASE("switch dispatches a real loop") {
 	// Inferred int subject from bitwise extraction; table still holds.
 	const std::string source = R"(
 func step(word : int, acc : int) -> int:
@@ -855,45 +784,12 @@ func test():
 )";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRFunction& step = find_function(ir, "step");
-	assert(only_switch(step).type_hint == Variant::INT);
-	assert(count_opcode(step, IROpcode::CMP_EQ) == 0);
+	const IRFunction &step = find_function(ir, "step");
+	REQUIRE(only_switch(step).type_hint == Variant::INT);
+	REQUIRE(count_opcode(step, IROpcode::CMP_EQ) == 0);
 
 	// (((0+3)-3)*2)<<3 == 0; unmapped opcode is identity.
-	assert(call_int(ir, "test") == call_int(compile_to_ir(source, true), "test"));
+	REQUIRE(call_int(ir, "test") == call_int(compile_to_ir(source, true), "test"));
 
 	verify_through_the_pipeline(source);
-
-	std::cout << "  ✓ An inferred int subject keeps the table" << std::endl;
-}
-
-int main() {
-	std::cout << "=== Dispatch Tests ===" << std::endl << std::endl;
-
-	test_const_global_folds_to_an_immediate();
-	test_const_container_stays_a_global();
-	test_a_local_shadows_a_const();
-
-	test_dense_match_becomes_a_jump_table();
-	test_the_machine_still_computes_the_same_answers();
-	test_a_short_match_keeps_the_compares();
-	test_a_sparse_match_keeps_the_compares();
-	test_a_non_constant_pattern_forbids_the_table();
-
-	test_an_untyped_subject_keeps_the_chain_behind_the_table();
-	test_holes_and_duplicates();
-	test_a_wildcard_is_not_a_table_entry();
-	test_break_and_return_inside_an_arm();
-
-	test_the_table_reaches_riscv();
-	test_a_huge_range_is_refused();
-
-	test_switch_is_dispatch_and_nothing_else();
-	test_switch_and_a_typed_match_are_the_same_machine_code();
-	test_switch_takes_the_table_below_the_match_floor();
-	test_switch_refuses_what_a_table_cannot_do();
-	test_switch_dispatches_a_real_loop();
-
-	std::cout << std::endl << "All dispatch tests passed!" << std::endl;
-	return 0;
 }

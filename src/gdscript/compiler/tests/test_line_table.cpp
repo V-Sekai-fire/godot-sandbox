@@ -7,6 +7,7 @@
 #include "../line_table.h"
 #include "../parser.h"
 #include "../riscv_codegen.h"
+#include "witness/doctest.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -15,21 +16,16 @@ using namespace gdscript;
 
 namespace {
 
-int failures = 0;
-
-void check(bool condition, const std::string& what) {
+void check(bool condition, const std::string &what) {
 	if (!condition) {
-		std::cerr << "FAILED: " << what << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: ", what);
 	}
 }
 
 template <typename T>
-void check_eq(T actual, T expected, const std::string& what) {
+void check_eq(T actual, T expected, const std::string &what) {
 	if (actual != expected) {
-		std::cerr << "FAILED: " << what << ": expected " << expected
-			<< ", got " << actual << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: ", what, ": expected ", expected, ", got ", actual);
 	}
 }
 
@@ -40,7 +36,7 @@ struct Generated {
 	bool ok = false;
 };
 
-Generated generate(const std::string& source, bool optimize = true) {
+Generated generate(const std::string &source, bool optimize = true) {
 	Generated out;
 	try {
 		Lexer lexer(source);
@@ -60,23 +56,22 @@ Generated generate(const std::string& source, bool optimize = true) {
 		out.table = backend.get_line_table();
 		out.functions = backend.get_function_offsets();
 		out.ok = true;
-	} catch (const std::exception& e) {
-		std::cerr << "FAILED to compile: " << e.what() << std::endl;
-		failures++;
+	} catch (const std::exception &e) {
+		FAIL_CHECK("FAILED to compile: ", e.what());
 	}
 	return out;
 }
 
 // -= The table the backend produces =-
 
-void test_ordering_and_shape() {
+TEST_CASE("ordering and shape") {
 	const std::string source =
-		"func first():\n" // 1
-		"\tvar a = 1\n" // 2
-		"\tvar b = 2\n" // 3
-		"\treturn a + b\n" // 4
-		"func second():\n" // 5
-		"\treturn 7\n"; // 6
+			"func first():\n" // 1
+			"\tvar a = 1\n" // 2
+			"\tvar b = 2\n" // 3
+			"\treturn a + b\n" // 4
+			"func second():\n" // 5
+			"\treturn 7\n"; // 6
 
 	for (bool optimize : { false, true }) {
 		const Generated gen = generate(source, optimize);
@@ -87,25 +82,25 @@ void test_ordering_and_shape() {
 
 		check(!gen.table.entries.empty(), "the table has rows" + when);
 		check(gen.table.is_normalized(),
-			"rows ascend by address and never repeat a line" + when);
+			  "rows ascend by address and never repeat a line" + when);
 
-		for (const LineTableEntry& entry : gen.table.entries) {
+		for (const LineTableEntry &entry : gen.table.entries) {
 			check(entry.line <= 6, "no row names a line past the source" + when);
 		}
 	}
 }
 
-void test_function_entry_breaks_the_run() {
+TEST_CASE("function entry breaks the run") {
 	// Forced entry row prevents the previous function's last line from
 	// covering the next prologue. Empty prologues get replaced by the first
 	// statement's row at the same address.
 	const std::string source =
-		"func first():\n" // 1
-		"\tvar a = 1\n" // 2
-		"\tvar b = 2\n" // 3
-		"\treturn a + b\n" // 4
-		"func second():\n" // 5
-		"\treturn 7\n"; // 6
+			"func first():\n" // 1
+			"\tvar a = 1\n" // 2
+			"\tvar b = 2\n" // 3
+			"\treturn a + b\n" // 4
+			"func second():\n" // 5
+			"\treturn 7\n"; // 6
 
 	const Generated gen = generate(source);
 	if (!gen.ok) {
@@ -115,30 +110,32 @@ void test_function_entry_breaks_the_run() {
 	const auto first = gen.functions.find("first");
 	const auto second = gen.functions.find("second");
 	check(first != gen.functions.end() && second != gen.functions.end(),
-		"both functions are in the offset map");
+		  "both functions are in the offset map");
 	if (first == gen.functions.end() || second == gen.functions.end()) {
 		return;
 	}
 
 	check_eq(gen.table.line_for_address(uint32_t(first->second)), uint32_t(1),
-		"a prologue that emits code reports the declaration line");
+			 "a prologue that emits code reports the declaration line");
 
 	const uint32_t entry_line = gen.table.line_for_address(uint32_t(second->second));
 	check(entry_line >= 5, "second()'s entry never reports a line from first(),"
-		" got " + std::to_string(entry_line));
+						   " got " +
+				  std::to_string(entry_line));
 	check(entry_line <= 6, "second()'s entry reports one of its own lines,"
-		" got " + std::to_string(entry_line));
+						   " got " +
+				  std::to_string(entry_line));
 }
 
-void test_statements_are_reachable() {
+TEST_CASE("statements are reachable") {
 	// Every statement that survives the optimizer owns a row.
 	const std::string source =
-		"func test(n):\n" // 1
-		"\tvar total = 0\n" // 2
-		"\twhile n > 0:\n" // 3
-		"\t\ttotal = total + n\n" // 4
-		"\t\tn = n - 1\n" // 5
-		"\treturn total\n"; // 6
+			"func test(n):\n" // 1
+			"\tvar total = 0\n" // 2
+			"\twhile n > 0:\n" // 3
+			"\t\ttotal = total + n\n" // 4
+			"\t\tn = n - 1\n" // 5
+			"\treturn total\n"; // 6
 
 	const Generated gen = generate(source);
 	if (!gen.ok) {
@@ -147,16 +144,16 @@ void test_statements_are_reachable() {
 
 	for (uint32_t line : { 2u, 3u, 4u, 5u, 6u }) {
 		check(gen.table.address_for_line(line) != 0,
-			"line " + std::to_string(line) + " has an address");
+			  "line " + std::to_string(line) + " has an address");
 	}
 }
 
-void test_branch_relaxation_keeps_addresses() {
+TEST_CASE("branch relaxation keeps addresses") {
 	// relax_branches() inserts instructions; rows after the insertion must shift.
 	std::string source =
-		"func test(n):\n"
-		"\tvar total = 0\n"
-		"\twhile n > 0:\n";
+			"func test(n):\n"
+			"\tvar total = 0\n"
+			"\twhile n > 0:\n";
 	for (int i = 0; i < 700; i++) {
 		source += "\t\ttotal = total + " + std::to_string(i) + "\n";
 	}
@@ -175,13 +172,13 @@ void test_branch_relaxation_keeps_addresses() {
 		return;
 	}
 	check_eq(gen.table.line_for_address(uint32_t(test_fn->second)), uint32_t(1),
-		"test()'s entry still reports its declaration line after relaxation");
+			 "test()'s entry still reports its declaration line after relaxation");
 }
 
-void test_addresses_are_rebased_by_the_elf() {
+TEST_CASE("addresses are rebased by the elf") {
 	const std::string source =
-		"func test():\n"
-		"\treturn 1\n";
+			"func test():\n"
+			"\treturn 1\n";
 
 	Compiler compiler;
 	CompilerOptions options;
@@ -191,17 +188,17 @@ void test_addresses_are_rebased_by_the_elf() {
 		return;
 	}
 
-	const LineTable& table = compiler.get_line_table();
+	const LineTable &table = compiler.get_line_table();
 	check(!table.entries.empty(), "a plain compile still publishes a line table");
-	for (const LineTableEntry& entry : table.entries) {
+	for (const LineTableEntry &entry : table.entries) {
 		check(entry.address >= 0x10000,
-			"published addresses are the ELF's, not text offsets");
+			  "published addresses are the ELF's, not text offsets");
 	}
 }
 
 // -= Lookup =-
 
-void test_lookup() {
+TEST_CASE("lookup") {
 	LineTable table;
 	table.entries = { { 100, 5 }, { 140, 6 }, { 200, 9 } };
 
@@ -222,12 +219,12 @@ void test_lookup() {
 	LineTable duplicated;
 	duplicated.entries = { { 100, 5 }, { 140, 6 }, { 200, 5 } };
 	check_eq(duplicated.address_for_line(5), uint32_t(100),
-		"a line emitted twice reports its first address");
+			 "a line emitted twice reports its first address");
 }
 
 // -= The blob =-
 
-void test_roundtrip() {
+TEST_CASE("roundtrip") {
 	LineTable table;
 	table.entries = { { 0x10000, 1 }, { 0x10024, 2 }, { 0x100f0, 17 } };
 
@@ -243,11 +240,11 @@ void test_roundtrip() {
 	LineTable empty_decoded;
 	const std::vector<uint8_t> empty_blob = encode_line_table(LineTable{});
 	check(decode_line_table(empty_blob.data(), empty_blob.size(), empty_decoded),
-		"an empty table roundtrips");
+		  "an empty table roundtrips");
 	check(empty_decoded.entries.empty(), "and decodes to no rows");
 }
 
-void test_decode_rejects_bad_input() {
+TEST_CASE("decode rejects bad input") {
 	LineTable table;
 	table.entries = { { 0x10000, 1 }, { 0x10024, 2 } };
 	const std::vector<uint8_t> blob = encode_line_table(table);
@@ -256,17 +253,17 @@ void test_decode_rejects_bad_input() {
 	check(!decode_line_table(nullptr, 0, out), "a null blob is refused");
 	check(!decode_line_table(blob.data(), 4, out), "a blob shorter than the header is refused");
 	check(!decode_line_table(blob.data(), blob.size() - 1, out),
-		"a truncated row is refused");
+		  "a truncated row is refused");
 
 	std::vector<uint8_t> bad_magic = blob;
 	bad_magic[0] ^= 0xFF;
 	check(!decode_line_table(bad_magic.data(), bad_magic.size(), out),
-		"a blob with the wrong magic is refused");
+		  "a blob with the wrong magic is refused");
 
 	std::vector<uint8_t> bad_version = blob;
 	bad_version[4] = 99;
 	check(!decode_line_table(bad_version.data(), bad_version.size(), out),
-		"a blob from another version is refused");
+		  "a blob from another version is refused");
 
 	// Row 1 rewritten to an address below row 0.
 	std::vector<uint8_t> misordered = blob;
@@ -275,26 +272,8 @@ void test_decode_rejects_bad_input() {
 	misordered[22] = 0;
 	misordered[23] = 0;
 	check(!decode_line_table(misordered.data(), misordered.size(), out),
-		"a misordered blob is refused");
+		  "a misordered blob is refused");
 	check(out.entries.empty(), "and leaves the output empty");
 }
 
 } // namespace
-
-int main() {
-	test_ordering_and_shape();
-	test_function_entry_breaks_the_run();
-	test_statements_are_reachable();
-	test_branch_relaxation_keeps_addresses();
-	test_addresses_are_rebased_by_the_elf();
-	test_lookup();
-	test_roundtrip();
-	test_decode_rejects_bad_input();
-
-	if (failures > 0) {
-		std::cerr << failures << " line table test(s) failed" << std::endl;
-		return 1;
-	}
-	std::cout << "All line table tests passed" << std::endl;
-	return 0;
-}

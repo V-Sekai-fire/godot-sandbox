@@ -12,14 +12,14 @@
 // the exact encoding of any one instruction, so an unrelated change to how a
 // Variant is copied does not fail them -- but a prologue that starts saving
 // registers a function does not use does.
+#include "../codegen.h"
+#include "../compiler_exception.h"
+#include "../ir_optimizer.h"
 #include "../lexer.h"
 #include "../parser.h"
-#include "../codegen.h"
 #include "../riscv_codegen.h"
-#include "../ir_optimizer.h"
-#include "../compiler_exception.h"
 #include "../variant_layout.h"
-#include <cassert>
+#include "witness/doctest.h"
 #include <iostream>
 #include <vector>
 
@@ -42,7 +42,7 @@ struct Compiled {
 	std::unordered_map<std::string, size_t> offsets;
 };
 
-Compiled compile(const std::string& source) {
+Compiled compile(const std::string &source) {
 	Lexer lexer(source);
 	Parser parser(lexer.tokenize());
 	Program program = parser.parse();
@@ -52,7 +52,7 @@ Compiled compile(const std::string& source) {
 	IROptimizer optimizer;
 	optimizer.optimize(ir);
 
-	RISCVCodeGen riscv { VariantLayout(false) };
+	RISCVCodeGen riscv{ VariantLayout(false) };
 	Compiled out;
 	out.code = riscv.generate(ir);
 	out.offsets = riscv.get_function_offsets();
@@ -61,30 +61,30 @@ Compiled compile(const std::string& source) {
 
 // The words of one function, from its entry point up to and including the first
 // RET. Every function these tests compile has exactly one return.
-std::vector<uint32_t> function_words(const Compiled& compiled, const std::string& name) {
+std::vector<uint32_t> function_words(const Compiled &compiled, const std::string &name) {
 	auto it = compiled.offsets.find(name);
-	assert(it != compiled.offsets.end() && "no such function in the generated code");
+	REQUIRE((it != compiled.offsets.end() && "no such function in the generated code"));
 
 	std::vector<uint32_t> words;
 	for (size_t off = it->second; off + 4 <= compiled.code.size(); off += 4) {
 		const uint32_t word = uint32_t(compiled.code[off]) |
-			(uint32_t(compiled.code[off + 1]) << 8) |
-			(uint32_t(compiled.code[off + 2]) << 16) |
-			(uint32_t(compiled.code[off + 3]) << 24);
+				(uint32_t(compiled.code[off + 1]) << 8) |
+				(uint32_t(compiled.code[off + 2]) << 16) |
+				(uint32_t(compiled.code[off + 3]) << 24);
 		words.push_back(word);
 		if (word == RET) {
 			return words;
 		}
 	}
-	assert(false && "function has no return");
+	FAIL("function has no return");
 	return words;
 }
 
 uint32_t opcode_of(uint32_t w) { return w & 0x7F; }
-uint8_t rd_of(uint32_t w)      { return uint8_t((w >> 7) & 0x1F); }
-uint8_t funct3_of(uint32_t w)  { return uint8_t((w >> 12) & 0x7); }
-uint8_t rs1_of(uint32_t w)     { return uint8_t((w >> 15) & 0x1F); }
-uint8_t rs2_of(uint32_t w)     { return uint8_t((w >> 20) & 0x1F); }
+uint8_t rd_of(uint32_t w) { return uint8_t((w >> 7) & 0x1F); }
+uint8_t funct3_of(uint32_t w) { return uint8_t((w >> 12) & 0x7); }
+uint8_t rs1_of(uint32_t w) { return uint8_t((w >> 15) & 0x1F); }
+uint8_t rs2_of(uint32_t w) { return uint8_t((w >> 20) & 0x1F); }
 
 // addi sp, sp, imm -- the one instruction that opens and closes a frame.
 bool is_stack_adjust(uint32_t w) {
@@ -110,7 +110,7 @@ bool is_store_through_return_pointer(uint32_t w) {
 
 bool is_ecall(uint32_t w) {
 	return gdscript::valid_counted_syscall_encoding(w) ||
-		(opcode_of(w) == 0x73 && funct3_of(w) == 0 && rd_of(w) == REG_ZERO && (w >> 20) == 0);
+			(opcode_of(w) == 0x73 && funct3_of(w) == 0 && rd_of(w) == REG_ZERO && (w >> 20) == 0);
 }
 
 // jal ra, offset -- a call to another function in the program.
@@ -129,14 +129,14 @@ int frame_offset_of(uint32_t w) {
 }
 
 // The frame size the opening instruction reserves, or 0 when there is no frame.
-int frame_size_of(const std::vector<uint32_t>& words) {
+int frame_size_of(const std::vector<uint32_t> &words) {
 	if (words.empty() || !is_stack_adjust(words[0])) {
 		return 0;
 	}
 	return -(int32_t(words[0]) >> 20);
 }
 
-size_t count(const std::vector<uint32_t>& words, bool (*pred)(uint32_t)) {
+size_t count(const std::vector<uint32_t> &words, bool (*pred)(uint32_t)) {
 	size_t n = 0;
 	for (uint32_t w : words) {
 		if (pred(w)) {
@@ -150,93 +150,75 @@ size_t count(const std::vector<uint32_t>& words, bool (*pred)(uint32_t)) {
 
 // A function whose result is a constant needs no memory at all: no frame, no
 // saved registers, and the Variant is built through the caller's pointer.
-void test_constant_getter_has_no_frame() {
-	std::cout << "Testing that a constant getter has no frame..." << std::endl;
-
+TEST_CASE("constant getter has no frame") {
 	const Compiled compiled = compile("func test():\n\treturn 42\n");
 	const std::vector<uint32_t> words = function_words(compiled, "test");
 
-	assert(count(words, is_stack_adjust) == 0);
-	assert(count(words, touches_frame) == 0);
-	assert(is_store_through_return_pointer(words[words.size() - 2]));
+	REQUIRE(count(words, is_stack_adjust) == 0);
+	REQUIRE(count(words, touches_frame) == 0);
+	REQUIRE(is_store_through_return_pointer(words[words.size() - 2]));
 
 	// li type, sw type, li value, sd value, ret. Anything more is ceremony.
-	assert(words.size() <= 5);
-
-	std::cout << "  ✓ Constant getter has no frame" << std::endl;
+	REQUIRE(words.size() <= 5);
 }
 
 // The same for a global: the copy out of the global data area lands directly in
 // the caller's Variant rather than in the return register's slot first.
-void test_global_getter_returns_in_place() {
-	std::cout << "Testing that a global getter writes through a0..." << std::endl;
-
+TEST_CASE("global getter returns in place") {
 	const Compiled compiled = compile("var value = 7\nfunc test():\n\treturn value\n");
 	const std::vector<uint32_t> words = function_words(compiled, "test");
 
-	assert(count(words, is_stack_adjust) == 0);
-	assert(count(words, touches_frame) == 0);
+	REQUIRE(count(words, is_stack_adjust) == 0);
+	REQUIRE(count(words, touches_frame) == 0);
 
 	// A known scalar occupies only its type/header word and payload word.
-	assert(count(words, is_store_through_return_pointer) == 2);
-
-	std::cout << "  ✓ Global getter writes through a0" << std::endl;
+	REQUIRE(count(words, is_store_through_return_pointer) == 2);
 }
 
 // A function that returns a parameter has a frame -- the parameter is copied
 // into it on entry -- but still saves neither ra nor a0, and the copy out goes
 // straight to the caller.
-void test_leaf_function_saves_nothing() {
-	std::cout << "Testing that a leaf function saves no registers..." << std::endl;
-
+TEST_CASE("leaf function saves nothing") {
 	const Compiled compiled = compile("func test(x):\n\treturn x\n");
 	const std::vector<uint32_t> words = function_words(compiled, "test");
 
-	assert(count(words, is_ecall) == 0 && "this function should reach no syscall");
-	assert(count(words, is_call) == 0);
+	REQUIRE((count(words, is_ecall) == 0 && "this function should reach no syscall"));
+	REQUIRE(count(words, is_call) == 0);
 
 	for (uint32_t w : words) {
-		assert(!is_store_to_stack(w, REG_RA) && "leaf function saved the return address");
-		assert(!is_store_to_stack(w, REG_A0) && "no syscall can clobber a0 here");
+		REQUIRE((!is_store_to_stack(w, REG_RA) && "leaf function saved the return address"));
+		REQUIRE((!is_store_to_stack(w, REG_A0) && "no syscall can clobber a0 here"));
 	}
-
-	std::cout << "  ✓ Leaf function saves no registers" << std::endl;
 }
 
 // A function that reaches the host does have to keep the caller's return-value
 // pointer somewhere, because a0 is the first syscall argument register.
-void test_syscall_function_spills_return_pointer() {
-	std::cout << "Testing that a syscall spills the return pointer..." << std::endl;
-
+TEST_CASE("syscall function spills return pointer") {
 	// Untyped addition goes through VEVAL.
 	const Compiled compiled = compile("func test(a, b):\n\treturn a + b\n");
 	const std::vector<uint32_t> words = function_words(compiled, "test");
 
-	assert(count(words, is_ecall) > 0 && "this function should reach a syscall");
+	REQUIRE((count(words, is_ecall) > 0 && "this function should reach a syscall"));
 
 	size_t saved_a0 = 0;
 	for (uint32_t w : words) {
-		assert(!is_store_to_stack(w, REG_RA) && "still a leaf function");
+		REQUIRE((!is_store_to_stack(w, REG_RA) && "still a leaf function"));
 		if (is_store_to_stack(w, REG_A0)) {
 			saved_a0++;
 		}
 	}
-	assert(saved_a0 == 1);
-
-	std::cout << "  ✓ A syscall spills the return pointer" << std::endl;
+	REQUIRE(saved_a0 == 1);
 }
 
 // Only a function that calls another one saves the return address.
-void test_calling_function_saves_return_address() {
-	std::cout << "Testing that a caller saves the return address..." << std::endl;
-
+TEST_CASE("calling function saves return address") {
 	const Compiled compiled = compile(
-		"func callee():\n\treturn 1\n"
-		"func test():\n\treturn callee()\n");
+			"func callee():\n\treturn 1\n"
+			"func test():\n\treturn callee()\n");
 	const std::vector<uint32_t> caller = function_words(compiled, "test");
 	const std::vector<uint32_t> callee = function_words(compiled, "callee");
 
-	assert(count(caller, is_call) == 1);
+	REQUIRE(count(caller, is_call) == 1);
 
 	size_t saved_ra = 0;
 	for (uint32_t w : caller) {
@@ -244,59 +226,49 @@ void test_calling_function_saves_return_address() {
 			saved_ra++;
 		}
 	}
-	assert(saved_ra == 1 && "a function that calls has to save ra");
+	REQUIRE((saved_ra == 1 && "a function that calls has to save ra"));
 
 	for (uint32_t w : callee) {
-		assert(!is_store_to_stack(w, REG_RA) && "the callee calls nothing");
+		REQUIRE((!is_store_to_stack(w, REG_RA) && "the callee calls nothing"));
 	}
-
-	std::cout << "  ✓ Only a caller saves the return address" << std::endl;
 }
 
 // The frame pointer is gone: nothing in the backend reads one, so nothing
 // should be spending three instructions a function setting one up.
-void test_no_frame_pointer_is_set_up() {
-	std::cout << "Testing that no frame pointer is set up..." << std::endl;
-
+TEST_CASE("no frame pointer is set up") {
 	constexpr uint8_t REG_FP = 8;
 	const Compiled compiled = compile(
-		"func test(a, b):\n"
-		"\tvar total = 0\n"
-		"\tfor i in range(a):\n"
-		"\t\ttotal += b\n"
-		"\treturn total\n");
+			"func test(a, b):\n"
+			"\tvar total = 0\n"
+			"\tfor i in range(a):\n"
+			"\t\ttotal += b\n"
+			"\treturn total\n");
 
 	for (uint32_t w : function_words(compiled, "test")) {
-		assert(!is_store_to_stack(w, REG_FP) && "saved a frame pointer nothing reads");
+		REQUIRE((!is_store_to_stack(w, REG_FP) && "saved a frame pointer nothing reads"));
 		const bool sets_fp = opcode_of(w) == 0x13 && funct3_of(w) == 0 &&
-			rd_of(w) == REG_FP && rs1_of(w) == REG_SP;
-		assert(!sets_fp && "set up a frame pointer nothing reads");
+				rd_of(w) == REG_FP && rs1_of(w) == REG_SP;
+		REQUIRE((!sets_fp && "set up a frame pointer nothing reads"));
 	}
-
-	std::cout << "  ✓ No frame pointer is set up" << std::endl;
 }
 
 // Forwarding the return value is only sound when nothing reads the return
 // register afterwards. A loop that assigns the return value and then branches
 // backwards over the assignment has to keep using the slot.
-void test_forwarding_respects_later_reads() {
-	std::cout << "Testing that forwarding respects later reads..." << std::endl;
-
+TEST_CASE("forwarding respects later reads") {
 	// The value returned still has to be the value computed, whatever the
 	// backend does with the slot. The differential and invariance harnesses
 	// cover this over the whole corpus; this is the shape that would break
 	// first, kept here next to the code that decides it.
 	const Compiled compiled = compile(
-		"func test(n):\n"
-		"\tvar result = 0\n"
-		"\twhile n > 0:\n"
-		"\t\tresult = n\n"
-		"\t\tn -= 1\n"
-		"\treturn result\n");
+			"func test(n):\n"
+			"\tvar result = 0\n"
+			"\twhile n > 0:\n"
+			"\t\tresult = n\n"
+			"\t\tn -= 1\n"
+			"\treturn result\n");
 	const std::vector<uint32_t> words = function_words(compiled, "test");
-	assert(!words.empty());
-
-	std::cout << "  ✓ Forwarding respects later reads" << std::endl;
+	REQUIRE(!words.empty());
 }
 
 // A parameter the body never mentions still arrives, and its register still owns
@@ -305,14 +277,12 @@ void test_forwarding_respects_later_reads() {
 // out from under the prologue's copy: `func g(a, b): return a` sized a frame for
 // one Variant and then wrote the second parameter past its end -- which the
 // backend caught, refusing the compile with "max_registers too low".
-void test_unused_parameter_still_has_a_slot() {
-	std::cout << "Testing that an unused parameter keeps its slot..." << std::endl;
-
+TEST_CASE("unused parameter still has a slot") {
 	const Compiled compiled = compile("func g(a, b):\n\treturn a\n");
 	const std::vector<uint32_t> words = function_words(compiled, "g");
 
 	const int frame_size = frame_size_of(words);
-	assert(frame_size > 0);
+	REQUIRE(frame_size > 0);
 
 	size_t frame_stores = 0;
 	for (uint32_t w : words) {
@@ -321,32 +291,28 @@ void test_unused_parameter_still_has_a_slot() {
 		}
 		// Nothing the function does addresses memory the frame does not cover.
 		const int offset = frame_offset_of(w);
-		assert(offset >= 0 && offset < frame_size);
+		REQUIRE((offset >= 0 && offset < frame_size));
 		if (opcode_of(w) == 0x23) {
 			frame_stores++;
 		}
 	}
 	// One store per 8-byte word of the returned parameter, and nothing else:
 	// the second parameter is dead on entry and is not copied in at all.
-	assert(frame_stores == size_t(VariantLayout(false).variant_words()));
-
-	std::cout << "  ✓ An unused parameter keeps its slot" << std::endl;
+	REQUIRE(frame_stores == size_t(VariantLayout(false).variant_words()));
 }
 
 // What a parameter costs when the function does read it: the copy is six memory
 // accesses per parameter, so a prologue that copies what nothing reads is the
 // most expensive part of a function that does nothing.
-void test_ignored_parameters_cost_nothing() {
-	std::cout << "Testing that ignored parameters cost nothing..." << std::endl;
-
+TEST_CASE("ignored parameters cost nothing") {
 	// A callback Godot passes arguments to that the script does not use: the
 	// same shape as a function declared without parameters at all.
 	{
 		const Compiled compiled = compile("func g(a, b):\n\treturn 42\n");
 		const std::vector<uint32_t> words = function_words(compiled, "g");
-		assert(count(words, is_stack_adjust) == 0);
-		assert(count(words, touches_frame) == 0);
-		assert(is_store_through_return_pointer(words[words.size() - 2]));
+		REQUIRE(count(words, is_stack_adjust) == 0);
+		REQUIRE(count(words, touches_frame) == 0);
+		REQUIRE(is_store_through_return_pointer(words[words.size() - 2]));
 	}
 
 	// Overwritten before it is read: the incoming Variant is never observed, so
@@ -354,26 +320,22 @@ void test_ignored_parameters_cost_nothing() {
 	{
 		const Compiled compiled = compile("func f(a):\n\ta = 1\n\treturn a\n");
 		const std::vector<uint32_t> words = function_words(compiled, "f");
-		assert(count(words, is_stack_adjust) == 0);
-		assert(count(words, touches_frame) == 0);
+		REQUIRE(count(words, is_stack_adjust) == 0);
+		REQUIRE(count(words, touches_frame) == 0);
 	}
-
-	std::cout << "  ✓ Ignored parameters cost nothing" << std::endl;
 }
 
 // Liveness, not a scan for the register number. A write that comes first in the
 // instruction stream does not kill the incoming Variant when a path reaches a
 // read without passing it -- here the loop whose body may not run at all.
-void test_loop_carried_parameter_is_copied() {
-	std::cout << "Testing that a loop-carried parameter is copied in..." << std::endl;
-
+TEST_CASE("loop carried parameter is copied") {
 	const Compiled compiled = compile(
-		"func loopy(c, b):\n"
-		"\tvar t = 0\n"
-		"\twhile t < c:\n"
-		"\t\tt += 1\n"
-		"\t\tb = t\n"
-		"\treturn b\n");
+			"func loopy(c, b):\n"
+			"\tvar t = 0\n"
+			"\twhile t < c:\n"
+			"\t\tt += 1\n"
+			"\t\tb = t\n"
+			"\treturn b\n");
 	const std::vector<uint32_t> words = function_words(compiled, "loopy");
 
 	// b is the second ABI argument.  The loop may take zero passes, so its
@@ -384,27 +346,7 @@ void test_loop_carried_parameter_is_copied() {
 			loads_from_b++;
 		}
 	}
-	assert(loads_from_b == size_t(VariantLayout(false).variant_words()));
-
-	std::cout << "  ✓ A loop-carried parameter is copied in" << std::endl;
+	REQUIRE(loads_from_b == size_t(VariantLayout(false).variant_words()));
 }
 
 } // namespace
-
-int main() {
-	std::cout << "=== Function Frame Tests ===" << std::endl << std::endl;
-
-	test_constant_getter_has_no_frame();
-	test_global_getter_returns_in_place();
-	test_leaf_function_saves_nothing();
-	test_syscall_function_spills_return_pointer();
-	test_calling_function_saves_return_address();
-	test_no_frame_pointer_is_set_up();
-	test_forwarding_respects_later_reads();
-	test_unused_parameter_still_has_a_slot();
-	test_ignored_parameters_cost_nothing();
-	test_loop_carried_parameter_is_copied();
-
-	std::cout << std::endl << "All frame tests passed!" << std::endl;
-	return 0;
-}

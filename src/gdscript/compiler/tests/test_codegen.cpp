@@ -1,19 +1,17 @@
+#include "../codegen.h"
+#include "../compiler_exception.h"
+#include "../ir_optimizer.h"
 #include "../lexer.h"
 #include "../parser.h"
-#include "../codegen.h"
 #include "../riscv_codegen.h"
-#include "../ir_optimizer.h"
-#include "../compiler_exception.h"
 #include "../syscall_numbers.h"
-#include <cassert>
-#include <iostream>
+#include "witness/doctest.h"
 #include <algorithm>
+#include <iostream>
 
 using namespace gdscript;
 
-void test_simple_arithmetic() {
-	std::cout << "Testing simple arithmetic..." << std::endl;
-
+TEST_CASE("simple arithmetic") {
 	std::string source = R"(func add(a, b):
 	return a + b
 )";
@@ -25,27 +23,23 @@ void test_simple_arithmetic() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
-	assert(ir.functions[0].name == "add");
-	assert(ir.functions[0].parameters.size() == 2);
-	assert(ir.functions[0].instructions.size() > 0);
+	REQUIRE(ir.functions.size() == 1);
+	REQUIRE(ir.functions[0].name == "add");
+	REQUIRE(ir.functions[0].parameters.size() == 2);
+	REQUIRE(ir.functions[0].instructions.size() > 0);
 
 	// Should have ADD instruction
 	bool has_add = false;
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::ADD) {
 			has_add = true;
 			break;
 		}
 	}
-	assert(has_add);
-
-	std::cout << "  ✓ Simple arithmetic test passed" << std::endl;
+	REQUIRE(has_add);
 }
 
-void test_variable_operations() {
-	std::cout << "Testing variable operations..." << std::endl;
-
+TEST_CASE("variable operations") {
 	std::string source = R"(func test():
 	var x = 10
 	var y = 20
@@ -60,23 +54,19 @@ void test_variable_operations() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions[0].instructions.size() > 0);
+	REQUIRE(ir.functions[0].instructions.size() > 0);
 
 	// Should have LOAD_IMM for constants
 	int load_imm_count = 0;
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::LOAD_IMM) {
 			load_imm_count++;
 		}
 	}
-	assert(load_imm_count >= 2); // At least for 10 and 20
-
-	std::cout << "  ✓ Variable operations test passed" << std::endl;
+	REQUIRE(load_imm_count >= 2); // At least for 10 and 20
 }
 
-void test_control_flow() {
-	std::cout << "Testing control flow..." << std::endl;
-
+TEST_CASE("control flow") {
 	std::string source = R"(func abs(x):
 	if x < 0:
 		return -x
@@ -95,20 +85,18 @@ void test_control_flow() {
 	bool has_label = false;
 	bool has_branch = false;
 
-	for (const auto& instr : ir.functions[0].instructions) {
-		if (instr.opcode == IROpcode::LABEL) has_label = true;
-		if (instr.opcode == IROpcode::BRANCH_ZERO) has_branch = true;
+	for (const auto &instr : ir.functions[0].instructions) {
+		if (instr.opcode == IROpcode::LABEL)
+			has_label = true;
+		if (instr.opcode == IROpcode::BRANCH_ZERO)
+			has_branch = true;
 	}
 
-	assert(has_label);
-	assert(has_branch);
-
-	std::cout << "  ✓ Control flow test passed" << std::endl;
+	REQUIRE(has_label);
+	REQUIRE(has_branch);
 }
 
-void test_loop_generation() {
-	std::cout << "Testing loop generation..." << std::endl;
-
+TEST_CASE("loop generation") {
 	std::string source = R"(func count(n):
 	var i = 0
 	while i < n:
@@ -127,20 +115,18 @@ void test_loop_generation() {
 	bool has_back_branch = false;
 	int label_count = 0;
 
-	for (const auto& instr : ir.functions[0].instructions) {
-		if (instr.opcode == IROpcode::BRANCH_NOT_ZERO) has_back_branch = true;
-		if (instr.opcode == IROpcode::LABEL) label_count++;
+	for (const auto &instr : ir.functions[0].instructions) {
+		if (instr.opcode == IROpcode::BRANCH_NOT_ZERO)
+			has_back_branch = true;
+		if (instr.opcode == IROpcode::LABEL)
+			label_count++;
 	}
 
-	assert(has_back_branch);
-	assert(label_count >= 3); // body, continue and end labels
-
-	std::cout << "  ✓ Loop generation test passed" << std::endl;
+	REQUIRE(has_back_branch);
+	REQUIRE(label_count >= 3); // body, continue and end labels
 }
 
-void test_function_calls() {
-	std::cout << "Testing function calls..." << std::endl;
-
+TEST_CASE("function calls") {
 	std::string source = R"(func helper(x):
 	return x * 2
 
@@ -156,24 +142,20 @@ func main():
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 2);
+	REQUIRE(ir.functions.size() == 2);
 
 	// main() should have a CALL instruction
 	bool has_call = false;
-	for (const auto& instr : ir.functions[1].instructions) {
+	for (const auto &instr : ir.functions[1].instructions) {
 		if (instr.opcode == IROpcode::CALL) {
 			has_call = true;
 			break;
 		}
 	}
-	assert(has_call);
-
-	std::cout << "  ✓ Function calls test passed" << std::endl;
+	REQUIRE(has_call);
 }
 
-void test_comparison_operators() {
-	std::cout << "Testing comparison operators..." << std::endl;
-
+TEST_CASE("comparison operators") {
 	std::string source = R"(func test(a, b):
 	var eq = a == b
 	var ne = a != b
@@ -192,25 +174,21 @@ void test_comparison_operators() {
 
 	// Count different comparison operations
 	int cmp_count = 0;
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::CMP_EQ ||
-		    instr.opcode == IROpcode::CMP_NEQ ||
-		    instr.opcode == IROpcode::CMP_LT ||
-		    instr.opcode == IROpcode::CMP_LTE ||
-		    instr.opcode == IROpcode::CMP_GT ||
-		    instr.opcode == IROpcode::CMP_GTE) {
+			instr.opcode == IROpcode::CMP_NEQ ||
+			instr.opcode == IROpcode::CMP_LT ||
+			instr.opcode == IROpcode::CMP_LTE ||
+			instr.opcode == IROpcode::CMP_GT ||
+			instr.opcode == IROpcode::CMP_GTE) {
 			cmp_count++;
 		}
 	}
 
-	assert(cmp_count == 6);
-
-	std::cout << "  ✓ Comparison operators test passed" << std::endl;
+	REQUIRE(cmp_count == 6);
 }
 
-void test_logical_operators() {
-	std::cout << "Testing logical operators..." << std::endl;
-
+TEST_CASE("logical operators") {
 	std::string source = R"(func test(a, b, c):
 	var result = a and b or not c
 	return result
@@ -228,25 +206,22 @@ void test_logical_operators() {
 	// 'not' has no short circuit and stays a single instruction.
 	bool has_not = false;
 	int branch_count = 0;
-	for (const auto& instr : ir.functions[0].instructions) {
-		assert(instr.opcode != IROpcode::AND);
-		assert(instr.opcode != IROpcode::OR);
-		if (instr.opcode == IROpcode::NOT) has_not = true;
+	for (const auto &instr : ir.functions[0].instructions) {
+		REQUIRE(instr.opcode != IROpcode::AND);
+		REQUIRE(instr.opcode != IROpcode::OR);
+		if (instr.opcode == IROpcode::NOT)
+			has_not = true;
 		if (instr.opcode == IROpcode::BRANCH_ZERO || instr.opcode == IROpcode::BRANCH_NOT_ZERO) {
 			branch_count++;
 		}
 	}
 
-	assert(has_not);
+	REQUIRE(has_not);
 	// Two tests for 'and' (a, b) and two for 'or' (the and-result, 'not c').
-	assert(branch_count == 4);
-
-	std::cout << "  ✓ Logical operators test passed" << std::endl;
+	REQUIRE(branch_count == 4);
 }
 
-void test_complex_expression() {
-	std::cout << "Testing complex expression..." << std::endl;
-
+TEST_CASE("complex expression") {
 	std::string source = R"(func calc(a, b, c):
 	return (a + b) * c - a / b
 )";
@@ -261,24 +236,24 @@ void test_complex_expression() {
 	// Should have multiple arithmetic operations
 	int add_count = 0, mul_count = 0, sub_count = 0, div_count = 0;
 
-	for (const auto& instr : ir.functions[0].instructions) {
-		if (instr.opcode == IROpcode::ADD) add_count++;
-		if (instr.opcode == IROpcode::MUL) mul_count++;
-		if (instr.opcode == IROpcode::SUB) sub_count++;
-		if (instr.opcode == IROpcode::DIV) div_count++;
+	for (const auto &instr : ir.functions[0].instructions) {
+		if (instr.opcode == IROpcode::ADD)
+			add_count++;
+		if (instr.opcode == IROpcode::MUL)
+			mul_count++;
+		if (instr.opcode == IROpcode::SUB)
+			sub_count++;
+		if (instr.opcode == IROpcode::DIV)
+			div_count++;
 	}
 
-	assert(add_count > 0);
-	assert(mul_count > 0);
-	assert(sub_count > 0);
-	assert(div_count > 0);
-
-	std::cout << "  ✓ Complex expression test passed" << std::endl;
+	REQUIRE(add_count > 0);
+	REQUIRE(mul_count > 0);
+	REQUIRE(sub_count > 0);
+	REQUIRE(div_count > 0);
 }
 
-void test_string_constants() {
-	std::cout << "Testing string constants..." << std::endl;
-
+TEST_CASE("string constants") {
 	std::string source = R"(func greet():
 	var msg = "Hello, World!"
 	return msg
@@ -292,15 +267,11 @@ void test_string_constants() {
 	IRProgram ir = codegen.generate(program);
 
 	// Should have at least one string constant
-	assert(ir.string_constants.size() == 1);
-	assert(ir.string_constants[0] == "Hello, World!");
-
-	std::cout << "  ✓ String constants test passed" << std::endl;
+	REQUIRE(ir.string_constants.size() == 1);
+	REQUIRE(ir.string_constants[0] == "Hello, World!");
 }
 
-void test_subscript_operations() {
-	std::cout << "Testing subscript operations..." << std::endl;
-
+TEST_CASE("subscript operations") {
 	// Test array/dict indexing for reading
 	std::string source_read = R"(func get_item(arr, idx):
 	var item = arr[idx]
@@ -316,14 +287,14 @@ void test_subscript_operations() {
 
 	// An untyped subscript is a Variant get, not a call to a method named "get".
 	bool has_variant_get = false;
-	for (const auto& instr : ir_read.functions[0].instructions) {
+	for (const auto &instr : ir_read.functions[0].instructions) {
 		if (instr.opcode == IROpcode::CALL_SYSCALL && instr.operands.size() >= 2 &&
 			instr.operands[1].immediate() == ECALL_VARIANT_GET) {
 			has_variant_get = true;
 			break;
 		}
 	}
-	assert(has_variant_get);
+	REQUIRE(has_variant_get);
 
 	// Test array/dict indexing for writing
 	std::string source_write = R"(func set_item(arr, idx, value):
@@ -341,20 +312,16 @@ void test_subscript_operations() {
 	// An unknown container writes with the indexed Variant operation, the mirror of
 	// the read above: only Object and the packed arrays have a set() method.
 	bool has_variant_set = false;
-	for (const auto& instr : ir_write.functions[0].instructions) {
+	for (const auto &instr : ir_write.functions[0].instructions) {
 		if (instr.opcode == IROpcode::VARIANT_SET) {
 			has_variant_set = true;
 			break;
 		}
 	}
-	assert(has_variant_set);
-
-	std::cout << "  ✓ Subscript operations test passed" << std::endl;
+	REQUIRE(has_variant_set);
 }
 
-void test_global_print() {
-	std::cout << "Testing global print() lowering..." << std::endl;
-
+TEST_CASE("global print") {
 	// print() is a GDScript global, not a method on the owner node. Lowering it
 	// to a self-call produces a VCALL that Godot accepts and silently drops, so
 	// the shape of this IR is the whole point of the test.
@@ -370,24 +337,24 @@ func say():
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	const IRFunction& fn = ir.functions[0];
+	const IRFunction &fn = ir.functions[0];
 
 	bool has_print = false;
-	for (const auto& instr : fn.instructions) {
+	for (const auto &instr : fn.instructions) {
 		// No VCALL should survive: that is the bug being prevented.
-		assert(instr.opcode != IROpcode::VCALL);
+		REQUIRE(instr.opcode != IROpcode::VCALL);
 		if (instr.opcode == IROpcode::PRINT) {
 			has_print = true;
 			// PRINT dst, channel, count, arg...
-			assert(instr.operands.size() == 5);
-			assert(instr.operands[0].type == IRValue::Type::REGISTER);
-			assert(instr.operands[1].immediate() == int64_t(Print_Channel::PRINT));
-			assert(instr.operands[2].immediate() == 2);
-			assert(instr.operands[3].type == IRValue::Type::REGISTER);
-			assert(instr.operands[4].type == IRValue::Type::REGISTER);
+			REQUIRE(instr.operands.size() == 5);
+			REQUIRE(instr.operands[0].type == IRValue::Type::REGISTER);
+			REQUIRE(instr.operands[1].immediate() == int64_t(Print_Channel::PRINT));
+			REQUIRE(instr.operands[2].immediate() == 2);
+			REQUIRE(instr.operands[3].type == IRValue::Type::REGISTER);
+			REQUIRE(instr.operands[4].type == IRValue::Type::REGISTER);
 		}
 	}
-	assert(has_print);
+	REQUIRE(has_print);
 
 	// Zero arguments is legal and still prints a blank line.
 	std::string source_empty = R"(
@@ -403,15 +370,15 @@ func say():
 	IRProgram ir_empty = codegen_empty.generate(program_empty);
 
 	bool has_empty_print = false;
-	for (const auto& instr : ir_empty.functions[0].instructions) {
+	for (const auto &instr : ir_empty.functions[0].instructions) {
 		if (instr.opcode == IROpcode::PRINT) {
 			has_empty_print = true;
-			assert(instr.operands.size() == 3);
-			assert(instr.operands[1].immediate() == int64_t(Print_Channel::PRINT));
-			assert(instr.operands[2].immediate() == 0);
+			REQUIRE(instr.operands.size() == 3);
+			REQUIRE(instr.operands[1].immediate() == int64_t(Print_Channel::PRINT));
+			REQUIRE(instr.operands[2].immediate() == 0);
 		}
 	}
-	assert(has_empty_print);
+	REQUIRE(has_empty_print);
 
 	// A script that declares its own print() keeps calling its own, the way a
 	// GDScript method shadows a global.
@@ -430,30 +397,26 @@ func say():
 	CodeGenerator codegen_shadow;
 	IRProgram ir_shadow = codegen_shadow.generate(program_shadow);
 
-	const IRFunction* say = nullptr;
-	for (const auto& f : ir_shadow.functions) {
+	const IRFunction *say = nullptr;
+	for (const auto &f : ir_shadow.functions) {
 		if (f.name == "say") {
 			say = &f;
 		}
 	}
-	assert(say != nullptr);
+	REQUIRE(say != nullptr);
 
 	bool has_local_call = false;
-	for (const auto& instr : say->instructions) {
-		assert(instr.opcode != IROpcode::PRINT);
+	for (const auto &instr : say->instructions) {
+		REQUIRE(instr.opcode != IROpcode::PRINT);
 		if (instr.opcode == IROpcode::CALL &&
 			ir_shadow.strings[instr.operands[0].string_id] == "print") {
 			has_local_call = true;
 		}
 	}
-	assert(has_local_call);
-
-	std::cout << "  ✓ Global print() test passed" << std::endl;
+	REQUIRE(has_local_call);
 }
 
-void test_array_dictionary_constructors() {
-	std::cout << "Testing Array and Dictionary constructor generation..." << std::endl;
-
+TEST_CASE("array dictionary constructors") {
 	// Test empty Array constructor
 	std::string source_array = R"(
 func make_array():
@@ -469,18 +432,18 @@ func make_array():
 
 	// Should have MAKE_ARRAY instruction
 	bool has_make_array = false;
-	for (const auto& instr : ir_array.functions[0].instructions) {
+	for (const auto &instr : ir_array.functions[0].instructions) {
 		if (instr.opcode == IROpcode::MAKE_ARRAY) {
 			has_make_array = true;
 			// Check that element count is 0
 			if (instr.operands.size() >= 2) {
 				int count = static_cast<int>(instr.operands[1].immediate());
-				assert(count == 0);
+				REQUIRE(count == 0);
 			}
 			break;
 		}
 	}
-	assert(has_make_array);
+	REQUIRE(has_make_array);
 
 	// Test empty Dictionary constructor
 	std::string source_dict = R"(
@@ -497,20 +460,16 @@ func make_dict():
 
 	// Should have MAKE_DICTIONARY instruction
 	bool has_make_dict = false;
-	for (const auto& instr : ir_dict.functions[0].instructions) {
+	for (const auto &instr : ir_dict.functions[0].instructions) {
 		if (instr.opcode == IROpcode::MAKE_DICTIONARY) {
 			has_make_dict = true;
 			break;
 		}
 	}
-	assert(has_make_dict);
-
-	std::cout << "  ✓ Array and Dictionary constructor test passed" << std::endl;
+	REQUIRE(has_make_dict);
 }
 
-void test_float_arithmetic() {
-	std::cout << "Testing float arithmetic..." << std::endl;
-
+TEST_CASE("float arithmetic") {
 	std::string source = R"(func float_ops():
 	var a = 1.5
 	var b = 2.5
@@ -528,7 +487,7 @@ void test_float_arithmetic() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
+	REQUIRE(ir.functions.size() == 1);
 
 	// Should have LOAD_FLOAT_IMM and arithmetic operations
 	int float_imm_count = 0;
@@ -537,28 +496,28 @@ void test_float_arithmetic() {
 	int mul_count = 0;
 	int div_count = 0;
 
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::LOAD_FLOAT_IMM) {
 			float_imm_count++;
 		}
-		if (instr.opcode == IROpcode::ADD) add_count++;
-		if (instr.opcode == IROpcode::SUB) sub_count++;
-		if (instr.opcode == IROpcode::MUL) mul_count++;
-		if (instr.opcode == IROpcode::DIV) div_count++;
+		if (instr.opcode == IROpcode::ADD)
+			add_count++;
+		if (instr.opcode == IROpcode::SUB)
+			sub_count++;
+		if (instr.opcode == IROpcode::MUL)
+			mul_count++;
+		if (instr.opcode == IROpcode::DIV)
+			div_count++;
 	}
 
-	assert(float_imm_count >= 2); // At least 1.5 and 2.5
-	assert(add_count >= 1);
-	assert(sub_count >= 1);
-	assert(mul_count >= 1);
-	assert(div_count >= 1);
-
-	std::cout << "  ✓ Float arithmetic test passed" << std::endl;
+	REQUIRE(float_imm_count >= 2); // At least 1.5 and 2.5
+	REQUIRE(add_count >= 1);
+	REQUIRE(sub_count >= 1);
+	REQUIRE(mul_count >= 1);
+	REQUIRE(div_count >= 1);
 }
 
-void test_vector_float_operations() {
-	std::cout << "Testing vector float operations..." << std::endl;
-
+TEST_CASE("vector float operations") {
 	std::string source = R"(func vector_ops():
 	var v1 = Vector2(1.5, 2.5)
 	var v2 = Vector2(3.0, 4.0)
@@ -574,13 +533,13 @@ void test_vector_float_operations() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
+	REQUIRE(ir.functions.size() == 1);
 
 	// Should have MAKE_VECTOR2 and VGET_INLINE
 	int make_vector2_count = 0;
 	int vget_inline_count = 0;
 
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::MAKE_VECTOR2) {
 			make_vector2_count++;
 		}
@@ -589,15 +548,11 @@ void test_vector_float_operations() {
 		}
 	}
 
-	assert(make_vector2_count >= 2);
-	assert(vget_inline_count >= 2); // v1.x, v1.y or v2.x, v2.y
-
-	std::cout << "  ✓ Vector float operations test passed" << std::endl;
+	REQUIRE(make_vector2_count >= 2);
+	REQUIRE(vget_inline_count >= 2); // v1.x, v1.y or v2.x, v2.y
 }
 
-void test_mixed_float_int_arithmetic() {
-	std::cout << "Testing mixed float/int arithmetic..." << std::endl;
-
+TEST_CASE("mixed float int arithmetic") {
 	std::string source = R"(func mixed_ops():
 	var f = 3.14
 	var i = 2
@@ -612,14 +567,14 @@ void test_mixed_float_int_arithmetic() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
+	REQUIRE(ir.functions.size() == 1);
 
 	// Should have both LOAD_FLOAT_IMM and LOAD_IMM
 	int float_imm_count = 0;
 	int int_imm_count = 0;
 	int add_count = 0;
 
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::LOAD_FLOAT_IMM) {
 			float_imm_count++;
 		}
@@ -631,16 +586,12 @@ void test_mixed_float_int_arithmetic() {
 		}
 	}
 
-	assert(float_imm_count >= 1);
-	assert(int_imm_count >= 1);
-	assert(add_count >= 1);
-
-	std::cout << "  ✓ Mixed float/int arithmetic test passed" << std::endl;
+	REQUIRE(float_imm_count >= 1);
+	REQUIRE(int_imm_count >= 1);
+	REQUIRE(add_count >= 1);
 }
 
-void test_many_float_constants() {
-	std::cout << "Testing many float constants (FP register exhaustion)..." << std::endl;
-
+TEST_CASE("many float constants") {
 	// Create more float constants than available FP registers (12 temp FP regs: f8-f19)
 	std::string source = R"(func many_floats():
 	var f1 = 1.0
@@ -668,36 +619,32 @@ void test_many_float_constants() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
+	REQUIRE(ir.functions.size() == 1);
 
 	// Count float immediate loads
 	int float_imm_count = 0;
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::LOAD_FLOAT_IMM) {
 			float_imm_count++;
 		}
 	}
 
 	// Should have 15 float constants
-	assert(float_imm_count == 15);
+	REQUIRE(float_imm_count == 15);
 
 	// Test code generation to make sure it doesn't crash
 	RISCVCodeGen codegen_obj;
 	try {
 		std::vector<uint8_t> code = codegen_obj.generate(ir);
 		// Should generate code successfully even with FP register exhaustion
-		assert(code.size() > 0);
-	} catch (const CompilerException& e) {
+		REQUIRE(code.size() > 0);
+	} catch (const CompilerException &e) {
 		// If it fails, it should be a known issue
 		std::cerr << "    Note: Code generation issue with many floats: " << e.what() << std::endl;
 	}
-
-	std::cout << "  ✓ Many float constants test passed" << std::endl;
 }
 
-void test_complex_float_expressions() {
-	std::cout << "Testing complex float expressions..." << std::endl;
-
+TEST_CASE("complex float expressions") {
 	std::string source = R"(func complex_float():
 	var a = 1.5
 	var b = 2.5
@@ -713,7 +660,7 @@ void test_complex_float_expressions() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
+	REQUIRE(ir.functions.size() == 1);
 
 	// Should have multiple arithmetic operations
 	int add_count = 0;
@@ -721,25 +668,25 @@ void test_complex_float_expressions() {
 	int mul_count = 0;
 	int div_count = 0;
 
-	for (const auto& instr : ir.functions[0].instructions) {
-		if (instr.opcode == IROpcode::ADD) add_count++;
-		if (instr.opcode == IROpcode::SUB) sub_count++;
-		if (instr.opcode == IROpcode::MUL) mul_count++;
-		if (instr.opcode == IROpcode::DIV) div_count++;
+	for (const auto &instr : ir.functions[0].instructions) {
+		if (instr.opcode == IROpcode::ADD)
+			add_count++;
+		if (instr.opcode == IROpcode::SUB)
+			sub_count++;
+		if (instr.opcode == IROpcode::MUL)
+			mul_count++;
+		if (instr.opcode == IROpcode::DIV)
+			div_count++;
 	}
 
 	// (a + b), * c, - (a / b) means at least 1 ADD, 1 SUB, 1 MUL, 1 DIV
-	assert(add_count >= 1);
-	assert(sub_count >= 1);
-	assert(mul_count >= 1);
-	assert(div_count >= 1);
-
-	std::cout << "  ✓ Complex float expressions test passed" << std::endl;
+	REQUIRE(add_count >= 1);
+	REQUIRE(sub_count >= 1);
+	REQUIRE(mul_count >= 1);
+	REQUIRE(div_count >= 1);
 }
 
-void test_vector3_operations() {
-	std::cout << "Testing Vector3 operations..." << std::endl;
-
+TEST_CASE("vector3 operations") {
 	std::string source = R"(func vector3_ops():
 	var v = Vector3(1.0, 2.0, 3.0)
 	var x = v.x
@@ -756,13 +703,13 @@ void test_vector3_operations() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
+	REQUIRE(ir.functions.size() == 1);
 
 	// Should have MAKE_VECTOR3 and VGET_INLINE
 	int make_vector3_count = 0;
 	int vget_inline_count = 0;
 
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::MAKE_VECTOR3) {
 			make_vector3_count++;
 		}
@@ -771,15 +718,11 @@ void test_vector3_operations() {
 		}
 	}
 
-	assert(make_vector3_count == 1);
-	assert(vget_inline_count == 3); // x, y, z
-
-	std::cout << "  ✓ Vector3 operations test passed" << std::endl;
+	REQUIRE(make_vector3_count == 1);
+	REQUIRE(vget_inline_count == 3); // x, y, z
 }
 
-void test_vector4_operations() {
-	std::cout << "Testing Vector4 operations..." << std::endl;
-
+TEST_CASE("vector4 operations") {
 	std::string source = R"(func vector4_ops():
 	var v = Vector4(1.0, 2.0, 3.0, 4.0)
 	var x = v.x
@@ -796,13 +739,13 @@ void test_vector4_operations() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
+	REQUIRE(ir.functions.size() == 1);
 
 	// Should have MAKE_VECTOR4 and VGET_INLINE
 	int make_vector4_count = 0;
 	int vget_inline_count = 0;
 
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::MAKE_VECTOR4) {
 			make_vector4_count++;
 		}
@@ -811,10 +754,8 @@ void test_vector4_operations() {
 		}
 	}
 
-	assert(make_vector4_count == 1);
-	assert(vget_inline_count == 4); // x, y, z, w
-
-	std::cout << "  ✓ Vector4 operations test passed" << std::endl;
+	REQUIRE(make_vector4_count == 1);
+	REQUIRE(vget_inline_count == 4); // x, y, z, w
 }
 
 // Walks the machine code of one function and verifies that every sp-relative access
@@ -823,8 +764,8 @@ void test_vector4_operations() {
 // offset only shows up as corrupted locals much later. Returns false if the function
 // adjusts sp in a way this simple linear walk cannot follow, in which case the caller
 // skips the check rather than reporting a bogus failure.
-static bool check_stack_accesses_in_frame(const std::vector<uint8_t>& code, size_t begin, size_t end,
-		const std::string& what, const VariantLayout& layout) {
+static bool check_stack_accesses_in_frame(const std::vector<uint8_t> &code, size_t begin, size_t end,
+										  const std::string &what, const VariantLayout &layout) {
 	const int variant_size = layout.variant_size();
 	static constexpr uint32_t REG_SP = 2;
 	static constexpr uint32_t REG_FP = 8;
@@ -842,7 +783,7 @@ static bool check_stack_accesses_in_frame(const std::vector<uint8_t>& code, size
 	// Prologue: addi sp, sp, -frame_size
 	const uint32_t first = word_at(begin);
 	if ((first & 0x7F) != 0x13 || ((first >> 12) & 7) != 0 ||
-			((first >> 7) & 0x1F) != REG_SP || ((first >> 15) & 0x1F) != REG_SP) {
+		((first >> 7) & 0x1F) != REG_SP || ((first >> 15) & 0x1F) != REG_SP) {
 		return false; // No recognizable frame (large frames use li + add)
 	}
 	const int32_t frame_size = -(int32_t(first) >> 20);
@@ -914,8 +855,8 @@ static bool check_stack_accesses_in_frame(const std::vector<uint8_t>& code, size
 
 // Compiles the source with the full pipeline and asserts no function writes outside
 // its own stack frame.
-static void assert_stack_frames_contain_all_slots(const std::string& source, const char* what,
-		const VariantLayout& layout = VariantLayout()) {
+static void assert_stack_frames_contain_all_slots(const std::string &source, const char *what,
+												  const VariantLayout &layout = VariantLayout()) {
 	Lexer lexer(source);
 	Parser parser(lexer.tokenize());
 	Program program = parser.parse();
@@ -927,14 +868,14 @@ static void assert_stack_frames_contain_all_slots(const std::string& source, con
 
 	RISCVCodeGen riscv(layout);
 	std::vector<uint8_t> code = riscv.generate(ir);
-	assert(code.size() > 0);
+	REQUIRE(code.size() > 0);
 
 	// Function bodies run from one offset to the next; sort them to find the ends.
 	std::vector<std::pair<size_t, std::string>> funcs;
-	for (const auto& [name, offset] : riscv.get_function_offsets()) {
+	for (const auto &[name, offset] : riscv.get_function_offsets()) {
 		funcs.emplace_back(offset, name);
 	}
-	assert(!funcs.empty());
+	REQUIRE(!funcs.empty());
 	std::sort(funcs.begin(), funcs.end());
 
 	bool escaped = false;
@@ -943,12 +884,12 @@ static void assert_stack_frames_contain_all_slots(const std::string& source, con
 		const size_t end = (i + 1 < funcs.size()) ? funcs[i + 1].first : code.size();
 		escaped |= check_stack_accesses_in_frame(code, begin, end, std::string(what) + "/" + funcs[i].second, layout);
 	}
-	assert(!escaped);
+	REQUIRE(!escaped);
 }
 
 // The frame has to hold whole Variants, so its sizing is layout-dependent: run the
 // whole set against both the 24-byte and the 40-byte (double-precision) Variant.
-static void check_stack_slots_stay_within_frame(const VariantLayout& layout) {
+static void check_stack_slots_stay_within_frame(const VariantLayout &layout) {
 	// Untyped comparison: the fused compare-and-branch cannot use the native integer
 	// path, so it has to materialize the comparison result as a Variant. That scratch
 	// Variant used to be allocated after the frame had already been sized, which put
@@ -958,7 +899,7 @@ static void check_stack_slots_stay_within_frame(const VariantLayout& layout) {
 		return n
 	return untyped_fibonacci(n - 1) + untyped_fibonacci(n - 2)
 )",
-			"untyped fibonacci", layout);
+										  "untyped fibonacci", layout);
 
 	// Untyped comparisons and arithmetic against immediates both need a scratch Variant
 	// for the immediate operand.
@@ -971,13 +912,13 @@ static void check_stack_slots_stay_within_frame(const VariantLayout& layout) {
 		a = a + 1
 	return [c, d, e, f, a]
 )",
-			"untyped ops", layout);
+										  "untyped ops", layout);
 
 	// Negation builds a zero Variant to subtract from.
 	assert_stack_frames_contain_all_slots(R"(func negate(a):
 	return -a
 )",
-			"negation", layout);
+										  "negation", layout);
 
 	// Calls shuffle arguments through extra stack space below the frame.
 	assert_stack_frames_contain_all_slots(R"(func callee(a, b, c):
@@ -988,21 +929,15 @@ static void check_stack_slots_stay_within_frame(const VariantLayout& layout) {
 func caller(x):
 	return callee(x, x - 1, x + 1)
 )",
-			"calls", layout);
+										  "calls", layout);
 }
 
-void test_stack_slots_stay_within_frame() {
-	std::cout << "Testing that Variant stack slots stay within the frame..." << std::endl;
-
+TEST_CASE("stack slots stay within frame") {
 	check_stack_slots_stay_within_frame(VariantLayout(false));
 	check_stack_slots_stay_within_frame(VariantLayout(true));
-
-	std::cout << "  ✓ Stack slots stay within frame test passed" << std::endl;
 }
 
-void test_auipc_addi_patching() {
-	std::cout << "Testing AUIPC+ADDI label patching (many constants)..." << std::endl;
-
+TEST_CASE("auipc addi patching") {
 	// Create multiple large float constants to force AUIPC+ADDI usage
 	std::string source = R"(func large_constants():
 	var f1 = 123456789.123
@@ -1020,27 +955,23 @@ void test_auipc_addi_patching() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
+	REQUIRE(ir.functions.size() == 1);
 
 	// Test code generation - should handle AUIPC+ADDI patching correctly
 	RISCVCodeGen codegen_obj;
 	try {
 		std::vector<uint8_t> code = codegen_obj.generate(ir);
-		assert(code.size() > 0);
+		REQUIRE(code.size() > 0);
 
 		// Whether an AUIPC appears depends on the constants, so there is
 		// nothing to assert about it; what this test pins down is that the
 		// AUIPC+ADDI pair is patched without generate() throwing.
-	} catch (const CompilerException& e) {
+	} catch (const CompilerException &e) {
 		std::cerr << "    Note: AUIPC+ADDI test encountered issue: " << e.what() << std::endl;
 	}
-
-	std::cout << "  ✓ AUIPC+ADDI patching test passed" << std::endl;
 }
 
-void test_float_negation() {
-	std::cout << "Testing float negation..." << std::endl;
-
+TEST_CASE("float negation") {
 	std::string source = R"(func float_neg():
 	var f = 3.14
 	var neg = -f
@@ -1054,13 +985,13 @@ void test_float_negation() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
+	REQUIRE(ir.functions.size() == 1);
 
 	// Should have LOAD_FLOAT_IMM and NEG
 	int float_imm_count = 0;
 	int neg_count = 0;
 
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::LOAD_FLOAT_IMM) {
 			float_imm_count++;
 		}
@@ -1069,15 +1000,11 @@ void test_float_negation() {
 		}
 	}
 
-	assert(float_imm_count >= 1);
-	assert(neg_count >= 1);
-
-	std::cout << "  ✓ Float negation test passed" << std::endl;
+	REQUIRE(float_imm_count >= 1);
+	REQUIRE(neg_count >= 1);
 }
 
-void test_constant_fold_comparison_in_if() {
-	std::cout << "Testing constant folding of comparisons in if statements..." << std::endl;
-
+TEST_CASE("constant fold comparison in if") {
 	std::string source = R"(func test():
 	var x = 10
 	if x > 5:
@@ -1095,12 +1022,12 @@ void test_constant_fold_comparison_in_if() {
 
 	// Before optimization, we should have a comparison
 	int cmp_count_before = 0;
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::CMP_GT) {
 			cmp_count_before++;
 		}
 	}
-	assert(cmp_count_before > 0);
+	REQUIRE(cmp_count_before > 0);
 
 	// Apply optimization
 	IROptimizer optimizer;
@@ -1113,7 +1040,7 @@ void test_constant_fold_comparison_in_if() {
 	int branch_zero_count = 0;
 	bool loads_100 = false;
 	bool loads_50 = false;
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::LOAD_BOOL) {
 			load_bool_count++;
 		}
@@ -1127,17 +1054,13 @@ void test_constant_fold_comparison_in_if() {
 		}
 	}
 
-	assert(load_bool_count == 0);
-	assert(branch_zero_count == 0);
-	assert(loads_100);
-	assert(!loads_50);
-
-	std::cout << "  ✓ Constant fold comparison in if test passed" << std::endl;
+	REQUIRE(load_bool_count == 0);
+	REQUIRE(branch_zero_count == 0);
+	REQUIRE(loads_100);
+	REQUIRE(!loads_50);
 }
 
 void test_copy_propagation_optimization() {
-	std::cout << "Testing copy propagation optimization..." << std::endl;
-
 	// This test verifies that the copy propagation optimization eliminates
 	// redundant MOVE instructions after constant loads
 	std::string source = R"(func test():
@@ -1157,7 +1080,7 @@ void test_copy_propagation_optimization() {
 	// Before optimization, we expect LOAD_IMM and two MOVEs
 	int load_imm_count_before = 0;
 	int move_count_before = 0;
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::LOAD_IMM) {
 			load_imm_count_before++;
 		}
@@ -1174,7 +1097,7 @@ void test_copy_propagation_optimization() {
 	// We expect LOAD_IMM and fewer MOVEs (ideally 0 if all can be propagated)
 	int load_imm_count_after = 0;
 	int move_count_after = 0;
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::LOAD_IMM) {
 			load_imm_count_after++;
 		}
@@ -1186,16 +1109,16 @@ void test_copy_propagation_optimization() {
 	// We should have at least 1 LOAD_IMM, and copy propagation rewrites the
 	// readers of a MOVE rather than the constant that fed it, so it neither
 	// drops one nor introduces one.
-	assert(load_imm_count_after >= 1);
-	assert(load_imm_count_after == load_imm_count_before);
+	REQUIRE(load_imm_count_after >= 1);
+	REQUIRE(load_imm_count_after == load_imm_count_before);
 
 	// The number of MOVEs should be reduced after optimization
 	// (The exact number depends on what the optimizer can eliminate)
-	assert(move_count_after <= move_count_before);
+	REQUIRE(move_count_after <= move_count_before);
 
 	// At minimum, we should have fewer MOVEs than before or the same
 	// (Copy propagation should not increase instruction count)
-	assert(move_count_after < move_count_before || move_count_after == 0);
+	REQUIRE((move_count_after < move_count_before || move_count_after == 0));
 
 	// Also test with float constants
 	std::string float_source = R"(func test_float():
@@ -1214,20 +1137,16 @@ void test_copy_propagation_optimization() {
 	optimizer.optimize(ir_float);
 
 	int float_load_count = 0;
-	for (const auto& instr : ir_float.functions[0].instructions) {
+	for (const auto &instr : ir_float.functions[0].instructions) {
 		if (instr.opcode == IROpcode::LOAD_FLOAT_IMM) {
 			float_load_count++;
 		}
 	}
 
-	assert(float_load_count >= 1);
-
-	std::cout << "  ✓ Copy propagation optimization test passed" << std::endl;
+	REQUIRE(float_load_count >= 1);
 }
 
-void test_const_declarations() {
-	std::cout << "Testing const declarations..." << std::endl;
-
+TEST_CASE("const declarations") {
 	// Test basic const declaration
 	std::string source = R"(func test():
 	const x = 10
@@ -1243,16 +1162,12 @@ void test_const_declarations() {
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
 
-	assert(ir.functions.size() == 1);
-	assert(ir.functions[0].name == "test");
-	assert(ir.functions[0].instructions.size() > 0);
-
-	std::cout << "  ✓ Const declarations test passed" << std::endl;
+	REQUIRE(ir.functions.size() == 1);
+	REQUIRE(ir.functions[0].name == "test");
+	REQUIRE(ir.functions[0].instructions.size() > 0);
 }
 
-void test_const_assignment_prevention() {
-	std::cout << "Testing const assignment prevention..." << std::endl;
-
+TEST_CASE("const assignment prevention") {
 	// Test that assignment to const variables is prevented
 	std::string source = R"(func test():
 	const x = 10
@@ -1268,21 +1183,17 @@ void test_const_assignment_prevention() {
 	bool caught_error = false;
 	try {
 		IRProgram ir = codegen.generate(program);
-	} catch (const CompilerException& e) {
+	} catch (const CompilerException &e) {
 		caught_error = true;
 		std::string error_msg(e.what());
-		assert(error_msg.find("const") != std::string::npos ||
-		       error_msg.find("Cannot assign") != std::string::npos);
+		REQUIRE((error_msg.find("const") != std::string::npos ||
+				 error_msg.find("Cannot assign") != std::string::npos));
 	}
 
-	assert(caught_error);
-
-	std::cout << "  ✓ Const assignment prevention test passed" << std::endl;
+	REQUIRE(caught_error);
 }
 
-void test_untyped_global_defaults_to_null() {
-	std::cout << "Testing untyped global default..." << std::endl;
-
+TEST_CASE("untyped global defaults to null") {
 	std::string source = R"(var bad_global
 
 func test():
@@ -1295,15 +1206,12 @@ func test():
 
 	CodeGenerator codegen;
 	IRProgram ir = codegen.generate(program);
-	assert(ir.globals.size() == 1);
-	assert(ir.globals[0].init_type == IRGlobalVar::InitType::NULL_VAL);
-	assert(ir.globals[0].value_type == IRInstruction::TypeHint_NONE);
-	std::cout << "  ✓ Untyped global defaults to null" << std::endl;
+	REQUIRE(ir.globals.size() == 1);
+	REQUIRE(ir.globals[0].init_type == IRGlobalVar::InitType::NULL_VAL);
+	REQUIRE(ir.globals[0].value_type == IRInstruction::TypeHint_NONE);
 }
 
-void test_valid_global_declarations() {
-	std::cout << "Testing valid global variable declarations..." << std::endl;
-
+TEST_CASE("valid global declarations") {
 	// Test that all valid forms work
 	std::string source = R"(var typed_global: Array = []
 var inferred_global = []
@@ -1327,26 +1235,22 @@ func test():
 	IRProgram ir = codegen.generate(program);
 
 	// Should have 5 global variables
-	assert(ir.globals.size() == 5);
-	assert(ir.globals[0].name == "typed_global");
-	assert(ir.globals[1].name == "inferred_global");
-	assert(ir.globals[2].name == "typed_int");
-	assert(ir.globals[3].name == "inferred_int");
-	assert(ir.globals[4].name == "typed_string");
+	REQUIRE(ir.globals.size() == 5);
+	REQUIRE(ir.globals[0].name == "typed_global");
+	REQUIRE(ir.globals[1].name == "inferred_global");
+	REQUIRE(ir.globals[2].name == "typed_int");
+	REQUIRE(ir.globals[3].name == "inferred_int");
+	REQUIRE(ir.globals[4].name == "typed_string");
 
 	// Check type hints where applicable
-	assert(ir.globals[0].type_hint == Variant::ARRAY);  // : Array
-	assert(ir.globals[1].init_type == IRGlobalVar::InitType::EMPTY_ARRAY);  // = []
-	assert(ir.globals[2].type_hint == Variant::INT);  // : int
-	assert(ir.globals[3].init_type == IRGlobalVar::InitType::INT);  // = 42
-	assert(ir.globals[4].type_hint == Variant::STRING);  // : String
-
-	std::cout << "  ✓ Valid global declarations test passed" << std::endl;
+	REQUIRE(ir.globals[0].type_hint == Variant::ARRAY); // : Array
+	REQUIRE(ir.globals[1].init_type == IRGlobalVar::InitType::EMPTY_ARRAY); // = []
+	REQUIRE(ir.globals[2].type_hint == Variant::INT); // : int
+	REQUIRE(ir.globals[3].init_type == IRGlobalVar::InitType::INT); // = 42
+	REQUIRE(ir.globals[4].type_hint == Variant::STRING); // : String
 }
 
-void test_dictionary_literals() {
-	std::cout << "Testing dictionary literal generation..." << std::endl;
-
+TEST_CASE("dictionary literals") {
 	// Test empty dictionary literal
 	std::string source_empty = R"(
 func make_empty_dict():
@@ -1362,17 +1266,17 @@ func make_empty_dict():
 
 	// Should have MAKE_DICTIONARY instruction with 0 pairs
 	bool has_make_dict_empty = false;
-	for (const auto& instr : ir_empty.functions[0].instructions) {
+	for (const auto &instr : ir_empty.functions[0].instructions) {
 		if (instr.opcode == IROpcode::MAKE_DICTIONARY) {
 			has_make_dict_empty = true;
 			if (instr.operands.size() >= 2) {
 				int pair_count = static_cast<int>(instr.operands[1].immediate());
-				assert(pair_count == 0);
+				REQUIRE(pair_count == 0);
 			}
 			break;
 		}
 	}
-	assert(has_make_dict_empty);
+	REQUIRE(has_make_dict_empty);
 
 	// Test dictionary literal with key-value pairs
 	std::string source = R"(
@@ -1390,20 +1294,20 @@ func make_dict():
 
 	// Should have MAKE_DICTIONARY instruction with 3 pairs
 	bool has_make_dict = false;
-	for (const auto& instr : ir.functions[0].instructions) {
+	for (const auto &instr : ir.functions[0].instructions) {
 		if (instr.opcode == IROpcode::MAKE_DICTIONARY) {
 			has_make_dict = true;
 			// Check pair count
 			if (instr.operands.size() >= 2) {
 				int pair_count = static_cast<int>(instr.operands[1].immediate());
-				assert(pair_count == 3);
+				REQUIRE(pair_count == 3);
 				// Should have 6 more operands (3 key-value pairs = 6 variants)
-				assert(instr.operands.size() == 2 + 6);
+				REQUIRE(instr.operands.size() == 2 + 6);
 			}
 			break;
 		}
 	}
-	assert(has_make_dict);
+	REQUIRE(has_make_dict);
 
 	// Test dictionary with nested array
 	std::string source_nested = R"(
@@ -1422,7 +1326,7 @@ func make_nested_dict():
 	// Should have both MAKE_ARRAY and MAKE_DICTIONARY
 	bool has_make_array = false;
 	bool has_make_dict_nested = false;
-	for (const auto& instr : ir_nested.functions[0].instructions) {
+	for (const auto &instr : ir_nested.functions[0].instructions) {
 		if (instr.opcode == IROpcode::MAKE_ARRAY) {
 			has_make_array = true;
 		}
@@ -1430,63 +1334,10 @@ func make_nested_dict():
 			has_make_dict_nested = true;
 			if (instr.operands.size() >= 2) {
 				int pair_count = static_cast<int>(instr.operands[1].immediate());
-				assert(pair_count == 3); // 3 key-value pairs
+				REQUIRE(pair_count == 3); // 3 key-value pairs
 			}
 		}
 	}
-	assert(has_make_array);
-	assert(has_make_dict_nested);
-
-	std::cout << "  ✓ Dictionary literal test passed" << std::endl;
-}
-
-int main() {
-	std::cout << "\n=== Running Code Generation Tests ===" << std::endl;
-
-	try {
-		test_simple_arithmetic();
-		test_variable_operations();
-		test_control_flow();
-		test_loop_generation();
-		test_function_calls();
-		test_comparison_operators();
-		test_logical_operators();
-		test_complex_expression();
-		test_string_constants();
-		test_subscript_operations();
-		test_global_print();
-		test_array_dictionary_constructors();
-		test_dictionary_literals();
-
-		// New FP arithmetic tests
-		test_float_arithmetic();
-		test_vector_float_operations();
-		test_mixed_float_int_arithmetic();
-		test_many_float_constants();
-		test_complex_float_expressions();
-		test_vector3_operations();
-		test_vector4_operations();
-		test_auipc_addi_patching();
-		test_stack_slots_stay_within_frame();
-		test_float_negation();
-
-		// Optimization tests
-		test_constant_fold_comparison_in_if();
-		// Copy propagation is temporarily disabled
-		// test_copy_propagation_optimization();
-
-		// Const support tests
-		test_const_declarations();
-		test_const_assignment_prevention();
-
-		// Global variable tests
-		test_untyped_global_defaults_to_null();
-		test_valid_global_declarations();
-
-		std::cout << "\n✅ All code generation tests passed!" << std::endl;
-		return 0;
-	} catch (const CompilerException& e) {
-		std::cerr << "\n❌ Test failed: " << e.what() << std::endl;
-		return 1;
-	}
+	REQUIRE(has_make_array);
+	REQUIRE(has_make_dict_nested);
 }

@@ -14,6 +14,7 @@ public:
 	explicit Lexer(std::string source);
 
 	void set_diagnostics(DiagnosticSink* sink) { m_diagnostics = sink; }
+	void set_extensions(bool enabled) { m_extensions = enabled; }
 
 	std::vector<Token> tokenize();
 
@@ -72,6 +73,7 @@ private:
 	// a class/struct head, and an ordinary identifier everywhere else.
 	bool m_statement_start = true;
 	bool m_type_header = false;
+	bool m_extensions = true;
 	// Unclosed brackets; while non-empty, newlines are swallowed.
 	struct OpenBracket {
 		char closer;

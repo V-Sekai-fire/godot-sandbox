@@ -79,6 +79,10 @@ static void print_usage(const char* program) {
 		"      --trait Name=path  Make a trait from `path` available. Repeatable\n"
 		"      --double-precision Compile for a real_t = double host\n"
 		"      --single-precision Compile for a real_t = float host\n"
+		"      --fast-arrays      Packed array regions (the default)\n"
+		"      --no-fast-arrays   One host call per packed array element\n"
+		"      --no-rewrite       Do not rewrite loops over packed arrays (--check only;\n"
+		"                         the IR dump shows the authored text)\n"
 		"  -h, --help             Show this text\n"
 		"\n"
 		"GDSC_PASSES=<names> selects optimizer passes; GDSC_PASSES=none disables them.\n";
@@ -91,6 +95,9 @@ int main(int argc, char** argv)
 	bool no_optimize = false;
 	bool show_codegen = false;
 	bool check_only = false;
+	bool extensions = false;
+	bool fast_arrays = GDSCRIPT_FAST_ARRAYS_DEFAULT;
+	bool rewrite = GDSCRIPT_REWRITE_DEFAULT;
 	bool double_precision = native_variant_layout().double_precision;
 	std::vector<std::string> autoloads;
 	std::vector<std::pair<std::string, std::string>> global_classes;
@@ -107,6 +114,16 @@ int main(int argc, char** argv)
 			show_codegen = true;
 		} else if (arg == "--check") {
 			check_only = true;
+		} else if (arg == "--fast-arrays") {
+			fast_arrays = true;
+		} else if (arg == "--no-fast-arrays") {
+			fast_arrays = false;
+		} else if (arg == "--no-rewrite") {
+			rewrite = false;
+		} else if (arg == "--rewrite") {
+			rewrite = true;
+		} else if (arg == "--extensions") {
+			extensions = true;
 		} else if (arg == "--help" || arg == "-h") {
 			print_usage(argv[0]);
 			return 0;
@@ -169,6 +186,9 @@ int main(int argc, char** argv)
 	if (check_only) {
 		CompilerOptions options;
 		options.optimize = !no_optimize;
+		options.extensions = extensions;
+		options.fast_arrays = fast_arrays;
+		options.rewrite = rewrite;
 		options.double_precision = double_precision;
 		options.autoloads = autoloads;
 		options.global_script_classes = global_classes;
@@ -177,6 +197,7 @@ int main(int argc, char** argv)
 
 	try {
 		Lexer lexer(source);
+		lexer.set_extensions(extensions);
 		auto tokens = lexer.tokenize();
 
 		if (verbose) {
@@ -188,6 +209,7 @@ int main(int argc, char** argv)
 		}
 
 		Parser parser(tokens);
+		parser.set_extensions(extensions);
 		parser.set_doc_comments(lexer.doc_comments());
 		Program program = parser.parse();
 		for (const auto& spec : trait_specs) {
@@ -199,7 +221,9 @@ int main(int argc, char** argv)
 			const std::string trait_source((std::istreambuf_iterator<char>(in)),
 				std::istreambuf_iterator<char>());
 			Lexer trait_lexer(trait_source);
+			trait_lexer.set_extensions(extensions);
 			Parser trait_parser(trait_lexer.tokenize());
+			trait_parser.set_extensions(extensions);
 			trait_parser.set_doc_comments(trait_lexer.doc_comments());
 			Program host = trait_parser.parse();
 			for (TraitDecl& trait : host.traits) {
@@ -222,7 +246,9 @@ int main(int argc, char** argv)
 				const std::string base_source((std::istreambuf_iterator<char>(in)),
 					std::istreambuf_iterator<char>());
 				Lexer base_lexer(base_source);
+				base_lexer.set_extensions(extensions);
 				Parser base_parser(base_lexer.tokenize());
+				base_parser.set_extensions(extensions);
 				base_parser.set_doc_comments(base_lexer.doc_comments());
 				ChainLink link;
 				link.name = base_specs[i].first;
@@ -257,6 +283,8 @@ int main(int argc, char** argv)
 		if (!program.chain.merged()) apply_traits(program);
 
 		CodeGenerator codegen;
+		codegen.set_extensions(extensions);
+		codegen.set_fast_arrays(fast_arrays);
 		codegen.set_autoloads(autoloads);
 		codegen.set_global_script_classes(global_classes);
 		IRProgram ir = codegen.generate(program);

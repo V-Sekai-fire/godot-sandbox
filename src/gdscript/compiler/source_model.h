@@ -102,7 +102,8 @@ enum AnalysisFlags : uint32_t {
 	ANALYZE_CARET = 1u << 2,
 	ANALYZE_DOCUMENTATION = 1u << 3,
 	ANALYZE_SAFE_LINES = 1u << 4,
-	ANALYZE_ALL = 0x1fu,
+	ANALYZE_EXTENSIONS = 1u << 5,
+	ANALYZE_ALL = 0x3fu,
 };
 
 std::vector<uint8_t> encode_source_model(const SourceModel &model);

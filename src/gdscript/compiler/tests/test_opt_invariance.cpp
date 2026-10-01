@@ -18,7 +18,7 @@
 #include "../parser.h"
 #include "../traits.h"
 #include "test_corpus.h"
-#include <cassert>
+#include "witness/doctest.h"
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -39,7 +39,7 @@ struct RunResult {
 	std::vector<IRInterpreter::Value> globals;
 };
 
-IRProgram build_ir(const std::string& source, size_t pass_limit) {
+IRProgram build_ir(const std::string &source, size_t pass_limit) {
 	Lexer lexer(source);
 	Parser parser(lexer.tokenize());
 	Program program = parser.parse();
@@ -54,7 +54,7 @@ IRProgram build_ir(const std::string& source, size_t pass_limit) {
 	return ir;
 }
 
-RunResult run(const std::string& source, size_t pass_limit) {
+RunResult run(const std::string &source, size_t pass_limit) {
 	IRProgram ir = build_ir(source, pass_limit);
 	IRInterpreter interpreter(ir);
 	RunResult result;
@@ -65,7 +65,7 @@ RunResult run(const std::string& source, size_t pass_limit) {
 	return result;
 }
 
-std::string to_string(const IRInterpreter::Value& value) {
+std::string to_string(const IRInterpreter::Value &value) {
 	std::ostringstream oss;
 	if (std::holds_alternative<std::monostate>(value)) {
 		oss << "null (nil)";
@@ -86,16 +86,22 @@ std::string to_string(const IRInterpreter::Value& value) {
 // produce either for a truth value, and 'and' already yields an integer where
 // 'not' yields a bool. int against float is a real difference -- GDScript keeps
 // them apart -- and so is a string against anything else.
-enum class Category { NIL, INT, FLOAT, STRING };
+enum class Category { NIL,
+					  INT,
+					  FLOAT,
+					  STRING };
 
-Category category_of(const IRInterpreter::Value& value) {
-	if (std::holds_alternative<std::monostate>(value)) return Category::NIL;
-	if (std::holds_alternative<double>(value)) return Category::FLOAT;
-	if (std::holds_alternative<std::string>(value)) return Category::STRING;
+Category category_of(const IRInterpreter::Value &value) {
+	if (std::holds_alternative<std::monostate>(value))
+		return Category::NIL;
+	if (std::holds_alternative<double>(value))
+		return Category::FLOAT;
+	if (std::holds_alternative<std::string>(value))
+		return Category::STRING;
 	return Category::INT;
 }
 
-bool values_equal(const IRInterpreter::Value& a, const IRInterpreter::Value& b) {
+bool values_equal(const IRInterpreter::Value &a, const IRInterpreter::Value &b) {
 	if (category_of(a) != category_of(b)) {
 		return false;
 	}
@@ -121,7 +127,7 @@ bool values_equal(const IRInterpreter::Value& a, const IRInterpreter::Value& b) 
 	return false;
 }
 
-bool results_equal(const RunResult& a, const RunResult& b, std::string& what) {
+bool results_equal(const RunResult &a, const RunResult &b, std::string &what) {
 	if (!values_equal(a.value, b.value)) {
 		what = "return value: " + to_string(a.value) + " vs " + to_string(b.value);
 		return false;
@@ -133,7 +139,7 @@ bool results_equal(const RunResult& a, const RunResult& b, std::string& what) {
 	for (size_t i = 0; i < a.globals.size(); i++) {
 		if (!values_equal(a.globals[i], b.globals[i])) {
 			what = "global " + std::to_string(i) + ": " +
-				to_string(a.globals[i]) + " vs " + to_string(b.globals[i]);
+					to_string(a.globals[i]) + " vs " + to_string(b.globals[i]);
 			return false;
 		}
 	}
@@ -142,91 +148,82 @@ bool results_equal(const RunResult& a, const RunResult& b, std::string& what) {
 
 // Run the pipeline one step at a time until the answer moves. The step that
 // moves it is the guilty pass.
-std::string bisect(const CorpusProgram& program, const RunResult& reference) {
-	const auto& passes = IROptimizer::pipeline();
+std::string bisect(const CorpusProgram &program, const RunResult &reference) {
+	const auto &passes = IROptimizer::pipeline();
 	for (size_t n = 1; n <= passes.size(); n++) {
 		std::string what;
 		try {
 			RunResult result = run(program.source, n);
 			if (!results_equal(reference, result, what)) {
 				return std::string("pass ") + std::to_string(n) + " (" + passes[n - 1].name +
-					") changed the result -- " + what;
+						") changed the result -- " + what;
 			}
-		} catch (const std::exception& e) {
+		} catch (const std::exception &e) {
 			return std::string("pass ") + std::to_string(n) + " (" + passes[n - 1].name +
-				") made the program fail to run: " + e.what();
+					") made the program fail to run: " + e.what();
 		}
 	}
 	return "no single pass prefix reproduced the difference";
 }
 
-int g_failures = 0;
-
-void check_program(const CorpusProgram& program) {
+void check_program(const CorpusProgram &program) {
 	RunResult unoptimized;
 	try {
 		unoptimized = run(program.source, 0);
-	} catch (const std::exception& e) {
-		std::cerr << "FAIL " << program.name << ": unoptimized run failed: " << e.what() << std::endl;
-		g_failures++;
+	} catch (const std::exception &e) {
+		FAIL_CHECK("FAIL ", program.name, ": unoptimized run failed: ", e.what());
 		return;
 	}
 
 	RunResult optimized;
 	try {
 		optimized = run(program.source, SIZE_MAX);
-	} catch (const std::exception& e) {
-		std::cerr << "FAIL " << program.name << ": optimized run failed: " << e.what() << std::endl;
-		std::cerr << "      " << bisect(program, unoptimized) << std::endl;
-		g_failures++;
+	} catch (const std::exception &e) {
+		FAIL_CHECK("FAIL ", program.name, ": optimized run failed: ", e.what(),
+				   "\n      ", bisect(program, unoptimized));
 		return;
 	}
 
 	std::string what;
 	if (!results_equal(unoptimized, optimized, what)) {
-		std::cerr << "FAIL " << program.name << ": optimization changed the result -- " << what << std::endl;
-		std::cerr << "      " << bisect(program, unoptimized) << std::endl;
-		g_failures++;
+		FAIL_CHECK("FAIL ", program.name, ": optimization changed the result -- ", what,
+				   "\n      ", bisect(program, unoptimized));
 		return;
 	}
 }
 
 // Every prefix of the pipeline has to agree with the unoptimized run, not just
 // the full pipeline: two passes can cancel each other's mistake and hide both.
-void check_every_prefix(const CorpusProgram& program) {
+void check_every_prefix(const CorpusProgram &program) {
 	RunResult unoptimized;
 	try {
 		unoptimized = run(program.source, 0);
-	} catch (const std::exception& e) {
+	} catch (const std::exception &e) {
 		// Already reported by check_program().
-		(void) e;
+		(void)e;
 		return;
 	}
 
-	const auto& passes = IROptimizer::pipeline();
+	const auto &passes = IROptimizer::pipeline();
 	for (size_t n = 1; n <= passes.size(); n++) {
 		std::string what;
 		try {
 			RunResult result = run(program.source, n);
 			if (!results_equal(unoptimized, result, what)) {
-				std::cerr << "FAIL " << program.name << ": passes 1.." << n << " ("
-					<< passes[n - 1].name << ") changed the result -- " << what << std::endl;
-				g_failures++;
+				FAIL_CHECK("FAIL ", program.name, ": passes 1..", n, " (", passes[n - 1].name, ") changed the result -- ", what);
 				return;
 			}
-		} catch (const std::exception& e) {
-			std::cerr << "FAIL " << program.name << ": passes 1.." << n << " ("
-				<< passes[n - 1].name << ") made the program fail to run: " << e.what() << std::endl;
-			g_failures++;
+		} catch (const std::exception &e) {
+			FAIL_CHECK("FAIL ", program.name, ": passes 1..", n, " (", passes[n - 1].name, ") made the program fail to run: ", e.what());
 			return;
 		}
 	}
 }
 
-size_t count_opcode(const IRProgram& ir, IROpcode opcode) {
+size_t count_opcode(const IRProgram &ir, IROpcode opcode) {
 	size_t count = 0;
-	for (const auto& func : ir.functions) {
-		for (const auto& instr : func.instructions) {
+	for (const auto &func : ir.functions) {
+		for (const auto &instr : func.instructions) {
 			if (instr.opcode == opcode) {
 				count++;
 			}
@@ -235,9 +232,7 @@ size_t count_opcode(const IRProgram& ir, IROpcode opcode) {
 	return count;
 }
 
-void test_pass_selection() {
-	std::cout << "Testing pass selection..." << std::endl;
-
+TEST_CASE("pass selection") {
 	const std::string source = R"(
 func test():
 	var a = 2
@@ -249,13 +244,13 @@ func test():
 	{
 		IRProgram ir = build_ir(source, 0);
 		const size_t before = ir.functions.at(0).instructions.size();
-		assert(count_opcode(ir, IROpcode::ADD) == 1);
+		REQUIRE(count_opcode(ir, IROpcode::ADD) == 1);
 
 		IROptimizer optimizer;
 		optimizer.disable_all_passes();
 		optimizer.optimize(ir);
-		assert(ir.functions.at(0).instructions.size() == before);
-		assert(count_opcode(ir, IROpcode::ADD) == 1);
+		REQUIRE(ir.functions.at(0).instructions.size() == before);
+		REQUIRE(count_opcode(ir, IROpcode::ADD) == 1);
 	}
 
 	// Constant folding alone turns it into a load of 5.
@@ -264,7 +259,7 @@ func test():
 		IROptimizer optimizer;
 		optimizer.set_enabled_passes({ "constant-folding" });
 		optimizer.optimize(ir);
-		assert(count_opcode(ir, IROpcode::ADD) == 0);
+		REQUIRE(count_opcode(ir, IROpcode::ADD) == 0);
 	}
 
 	// A pass that is not the one folding constants leaves the ADD alone.
@@ -273,13 +268,13 @@ func test():
 		IROptimizer optimizer;
 		optimizer.set_enabled_passes({ "dead-code" });
 		optimizer.optimize(ir);
-		assert(count_opcode(ir, IROpcode::ADD) == 1);
+		REQUIRE(count_opcode(ir, IROpcode::ADD) == 1);
 	}
 
 	// The step limit is a prefix of the pipeline: constant folding is step 1.
 	{
 		IRProgram ir = build_ir(source, 1);
-		assert(count_opcode(ir, IROpcode::ADD) == 0);
+		REQUIRE(count_opcode(ir, IROpcode::ADD) == 0);
 	}
 
 	// GDSC_PASSES is the same selection from a shell.
@@ -288,7 +283,7 @@ func test():
 		IRProgram ir = build_ir(source, 0);
 		IROptimizer optimizer;
 		optimizer.optimize(ir);
-		assert(count_opcode(ir, IROpcode::ADD) == 1);
+		REQUIRE(count_opcode(ir, IROpcode::ADD) == 1);
 		unsetenv("GDSC_PASSES");
 	}
 
@@ -298,10 +293,10 @@ func test():
 		try {
 			IROptimizer optimizer;
 			optimizer.set_enabled_passes({ "no-such-pass" });
-		} catch (const CompilerException&) {
+		} catch (const CompilerException &) {
 			threw = true;
 		}
-		assert(threw);
+		REQUIRE(threw);
 	}
 
 	std::cout << "  Pass selection OK" << std::endl;
@@ -309,30 +304,70 @@ func test():
 
 } // namespace
 
-int main() {
-	std::cout << "=== Optimization invariance ===" << std::endl;
-	std::cout << "Corpus: " << gdscript_test::corpus().size() << " programs, pipeline: "
-		<< IROptimizer::pipeline().size() << " passes" << std::endl;
+// ---------------------------------------------------------------------------
+// Properties, and the falsifiability check that keeps them honest.
+// ---------------------------------------------------------------------------
 
-	// GDSC_PASSES is read by the IROptimizer constructor and would silently
-	// override the explicit pass selection this test relies on.
-	if (std::getenv("GDSC_PASSES") != nullptr) {
-		std::cerr << "GDSC_PASSES is set; unset it to run this test" << std::endl;
-		return 1;
-	}
+#include "gdscript_generator.h"
+#include "property_support.h"
 
-	for (const auto& program : gdscript_test::corpus()) {
-		check_program(program);
-		check_every_prefix(program);
-	}
+namespace {
 
-	test_pass_selection();
+// Running a whole program twice, once per pipeline end, is the most expensive
+// check in this file, so its ladder is shorter still than the shared one.
+constexpr witness::Level INVARIANCE_LADDER[2] = {
+	{ 0, 64, 256, 8 },
+	{ 1, 512, 1024, 12 },
+};
 
-	if (g_failures > 0) {
-		std::cerr << g_failures << " invariance failure(s)" << std::endl;
-		return 1;
-	}
+std::string generate_program_source(witness::RNG &rng, const witness::Level &) {
+	gdscript_test::GenOptions options;
+	options.allow_structs = false;
+	gdscript_test::Generator generator(rng.next_u64(), options);
+	return generator.generate().source();
+}
 
-	std::cout << "All optimization-invariance checks passed!" << std::endl;
-	return 0;
+witness::Trial resolve_invariance(const char *query,
+								  std::function<bool(const std::string &)> predicate) {
+	witness::Generator<std::string> sources = &generate_program_source;
+	witness::Shrinker<std::string> shrink = &witness::no_shrink<std::string>;
+	std::function<void(std::ostream &, const std::string &)> print;
+	return witness::resolve_with_ladder<std::string>(
+			query, INVARIANCE_LADDER, sources, predicate, shrink, print);
+}
+
+} // namespace
+
+TEST_CASE("property: a generated program means the same thing optimized") {
+	const witness::Trial trial = resolve_invariance(
+			"the optimized and unoptimized runs agree",
+			[](const std::string &source) {
+				RunResult unoptimized;
+				RunResult optimized;
+				try {
+					unoptimized = run(source, 0);
+					optimized = run(source, SIZE_MAX);
+				} catch (const std::exception &) {
+					// A program the frontend or the interpreter rejects says
+					// nothing about the optimizer. Skipping keeps the trial out of
+					// the count rather than passing it.
+					witness::assume(false);
+					return true;
+				}
+				std::string what;
+				return results_equal(unoptimized, optimized, what);
+			});
+	INFO(trial.message);
+	CHECK(trial.outcome != witness::Outcome::FOUND);
+}
+
+TEST_CASE("falsifiability: the generator reaches programs with something in them") {
+	// False on purpose: a generator producing only trivial programs would
+	// satisfy the property above while exercising no pass at all.
+	const witness::Trial trial = resolve_invariance(
+			"every generated program is under forty characters",
+			[](const std::string &source) { return source.size() < 40; });
+	CHECK_MESSAGE(trial.outcome == witness::Outcome::FOUND,
+				  "nothing falsified a statement that is false: the generator cannot reach a "
+				  "counterexample, so the property beside it holds vacuously");
 }

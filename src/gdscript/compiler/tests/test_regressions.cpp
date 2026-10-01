@@ -4,29 +4,29 @@
 // Every test here pins down a behaviour that was previously wrong in a way that
 // no existing test noticed: the program still compiled, it just did the wrong
 // thing at run time. Each one names the mistake it guards against.
-#include "../lexer.h"
-#include "../parser.h"
 #include "../codegen.h"
-#include "../ir_optimizer.h"
-#include "../ir_interpreter.h"
-#include "../riscv_codegen.h"
 #include "../compiler_exception.h"
 #include "../instance_layout.h"
-#include "../variant_layout.h"
+#include "../ir_interpreter.h"
+#include "../ir_optimizer.h"
+#include "../lexer.h"
+#include "../parser.h"
+#include "../riscv_codegen.h"
 #include "../syscall_numbers.h"
+#include "../variant_layout.h"
+#include "witness/doctest.h"
 #include <algorithm>
-#include <cassert>
 #include <climits>
-#include <unordered_map>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace gdscript;
 
 // -= Helpers =-
 
-static IRProgram compile_to_ir(const std::string& source, bool optimize = true) {
+static IRProgram compile_to_ir(const std::string &source, bool optimize = true) {
 	Lexer lexer(source);
 	Parser parser(lexer.tokenize());
 	Program program = parser.parse();
@@ -39,8 +39,8 @@ static IRProgram compile_to_ir(const std::string& source, bool optimize = true) 
 	return ir;
 }
 
-static const IRFunction& find_function(const IRProgram& ir, const std::string& name) {
-	for (const auto& func : ir.functions) {
+static const IRFunction &find_function(const IRProgram &ir, const std::string &name) {
+	for (const auto &func : ir.functions) {
 		if (func.name == name) {
 			return func;
 		}
@@ -48,8 +48,8 @@ static const IRFunction& find_function(const IRProgram& ir, const std::string& n
 	throw std::runtime_error("Function not found: " + name);
 }
 
-static const IRGlobalVar& find_global(const IRProgram& ir, const std::string& name) {
-	for (const auto& global : ir.globals) {
+static const IRGlobalVar &find_global(const IRProgram &ir, const std::string &name) {
+	for (const auto &global : ir.globals) {
 		if (global.name == name) {
 			return global;
 		}
@@ -57,9 +57,9 @@ static const IRGlobalVar& find_global(const IRProgram& ir, const std::string& na
 	throw std::runtime_error("Global not found: " + name);
 }
 
-static int count_opcode(const IRFunction& func, IROpcode opcode) {
+static int count_opcode(const IRFunction &func, IROpcode opcode) {
 	int count = 0;
-	for (const auto& instr : func.instructions) {
+	for (const auto &instr : func.instructions) {
 		if (instr.opcode == opcode) {
 			count++;
 		}
@@ -67,17 +67,15 @@ static int count_opcode(const IRFunction& func, IROpcode opcode) {
 	return count;
 }
 
-static IRInterpreter::Value run(const std::string& source, const std::string& function,
-	const std::vector<IRInterpreter::Value>& args = {})
-{
+static IRInterpreter::Value run(const std::string &source, const std::string &function,
+								const std::vector<IRInterpreter::Value> &args = {}) {
 	IRProgram ir = compile_to_ir(source);
 	IRInterpreter interpreter(ir);
 	return interpreter.call(function, args);
 }
 
-static int64_t run_int(const std::string& source, const std::string& function,
-	const std::vector<IRInterpreter::Value>& args = {})
-{
+static int64_t run_int(const std::string &source, const std::string &function,
+					   const std::vector<IRInterpreter::Value> &args = {}) {
 	IRInterpreter::Value value = run(source, function, args);
 	if (std::holds_alternative<bool>(value)) {
 		return std::get<bool>(value) ? 1 : 0;
@@ -86,22 +84,22 @@ static int64_t run_int(const std::string& source, const std::string& function,
 }
 
 // Returns true when compiling the source throws a CompilerException.
-static bool rejects(const std::string& source) {
+static bool rejects(const std::string &source) {
 	try {
 		compile_to_ir(source, false);
 		return false;
-	} catch (const CompilerException&) {
+	} catch (const CompilerException &) {
 		return true;
 	}
 }
 
-static std::vector<uint8_t> compile_to_code(const std::string& source) {
+static std::vector<uint8_t> compile_to_code(const std::string &source) {
 	IRProgram ir = compile_to_ir(source);
 	RISCVCodeGen riscv{ VariantLayout(false) };
 	return riscv.generate(ir);
 }
 
-static uint32_t word_at(const std::vector<uint8_t>& code, size_t off) {
+static uint32_t word_at(const std::vector<uint8_t> &code, size_t off) {
 	return uint32_t(code[off]) | (uint32_t(code[off + 1]) << 8) |
 			(uint32_t(code[off + 2]) << 16) | (uint32_t(code[off + 3]) << 24);
 }
@@ -111,49 +109,43 @@ static uint32_t word_at(const std::vector<uint8_t>& code, size_t off) {
 // Locals shadow globals. The lookup used to consult the global table first, so a
 // local sharing a name with a global was never seen: reads and writes both went
 // to the global, which the function then also corrupted.
-static void test_locals_shadow_globals() {
-	std::cout << "Testing that locals shadow globals..." << std::endl;
-
+TEST_CASE("locals shadow globals") {
 	const std::string source =
-		"var counter = 10\n"
-		"func test():\n"
-		"\tvar counter = 1\n"
-		"\tcounter = counter + 1\n"
-		"\treturn counter\n";
+			"var counter = 10\n"
+			"func test():\n"
+			"\tvar counter = 1\n"
+			"\tcounter = counter + 1\n"
+			"\treturn counter\n";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRFunction& test = find_function(ir, "test");
-	assert(count_opcode(test, IROpcode::LOAD_GLOBAL) == 0);
-	assert(count_opcode(test, IROpcode::STORE_GLOBAL) == 0);
-	assert(run_int(source, "test") == 2);
+	const IRFunction &test = find_function(ir, "test");
+	REQUIRE(count_opcode(test, IROpcode::LOAD_GLOBAL) == 0);
+	REQUIRE(count_opcode(test, IROpcode::STORE_GLOBAL) == 0);
+	REQUIRE(run_int(source, "test") == 2);
 
 	// Parameters shadow globals too.
 	const std::string param_source =
-		"var value = 100\n"
-		"func test(value):\n"
-		"\treturn value\n";
-	assert(count_opcode(find_function(compile_to_ir(param_source), "test"), IROpcode::LOAD_GLOBAL) == 0);
+			"var value = 100\n"
+			"func test(value):\n"
+			"\treturn value\n";
+	REQUIRE(count_opcode(find_function(compile_to_ir(param_source), "test"), IROpcode::LOAD_GLOBAL) == 0);
 
 	// Without a local of that name the global is still reached.
 	const std::string global_source =
-		"var counter = 10\n"
-		"func test():\n"
-		"\tcounter = counter + 1\n"
-		"\treturn counter\n";
-	assert(count_opcode(find_function(compile_to_ir(global_source), "test"), IROpcode::STORE_GLOBAL) == 1);
+			"var counter = 10\n"
+			"func test():\n"
+			"\tcounter = counter + 1\n"
+			"\treturn counter\n";
+	REQUIRE(count_opcode(find_function(compile_to_ir(global_source), "test"), IROpcode::STORE_GLOBAL) == 1);
 
 	// Assigning to a global const is an error, as it is for a local const.
-	assert(rejects("const LIMIT = 3\nfunc test():\n\tLIMIT = 4\n\treturn LIMIT\n"));
-
-	std::cout << "  ✓ Locals shadow globals" << std::endl;
+	REQUIRE(rejects("const LIMIT = 3\nfunc test():\n\tLIMIT = 4\n\treturn LIMIT\n"));
 }
 
 // The operand-role table. Passes used to assume "operand 0 is the destination,
 // every other operand is a source", which is wrong for CALL (destination in
 // operand 1) and for VSET/STORE_GLOBAL/RETURN/branches (operand 0 is read).
-static void test_operand_roles() {
-	std::cout << "Testing IR operand roles..." << std::endl;
-
+TEST_CASE("operand roles") {
 	IRStringTable strings;
 
 	{
@@ -163,9 +155,9 @@ static void test_operand_roles() {
 		call.operands.push_back(IRValue::reg(3)); // destination
 		call.operands.push_back(IRValue::imm(1));
 		call.operands.push_back(IRValue::reg(7)); // argument
-		assert(ir_destination_register(call) == 3);
-		assert(!ir_reads_operand(call, 1));
-		assert(ir_reads_operand(call, 3));
+		REQUIRE(ir_destination_register(call) == 3);
+		REQUIRE(!ir_reads_operand(call, 1));
+		REQUIRE(ir_reads_operand(call, 3));
 	}
 
 	{
@@ -175,35 +167,31 @@ static void test_operand_roles() {
 		vset.operands.push_back(IRValue::imm(0));
 		vset.operands.push_back(IRValue::imm(4));
 		vset.operands.push_back(IRValue::reg(5));
-		assert(ir_destination_register(vset) == -1);
-		assert(ir_reads_operand(vset, 0));
-		assert(ir_reads_operand(vset, 3));
+		REQUIRE(ir_destination_register(vset) == -1);
+		REQUIRE(ir_reads_operand(vset, 0));
+		REQUIRE(ir_reads_operand(vset, 3));
 	}
 
 	{
 		// STORE_GLOBAL index, value - operand 0 is an immediate, not a register.
 		IRInstruction store(IROpcode::STORE_GLOBAL, IRValue::imm(0), IRValue::reg(4));
-		assert(ir_destination_register(store) == -1);
-		assert(!ir_reads_operand(store, 0));
-		assert(ir_reads_operand(store, 1));
+		REQUIRE(ir_destination_register(store) == -1);
+		REQUIRE(!ir_reads_operand(store, 0));
+		REQUIRE(ir_reads_operand(store, 1));
 	}
 
 	{
 		// A bare RETURN reads r0 implicitly.
 		std::vector<int> reads;
 		ir_collect_read_registers(IRInstruction(IROpcode::RETURN), reads);
-		assert(reads.size() == 1 && reads[0] == 0);
+		REQUIRE((reads.size() == 1 && reads[0] == 0));
 	}
-
-	std::cout << "  ✓ IR operand roles" << std::endl;
 }
 
 // A pending MOVE must not be delayed past an instruction that reads the register
 // it writes. VSET reads its object out of operand 0, which the dead-store pass
 // used to skip, so the VSET saw whatever the register held beforehand.
-static void test_store_not_delayed_past_vset() {
-	std::cout << "Testing that stores are not delayed past a VSET..." << std::endl;
-
+TEST_CASE("store not delayed past vset") {
 	IRFunction func;
 	func.name = "test";
 	func.instructions.emplace_back(IROpcode::LOAD_IMM, IRValue::reg(0), IRValue::imm(1));
@@ -224,26 +212,22 @@ static void test_store_not_delayed_past_vset() {
 	size_t move_index = SIZE_MAX;
 	size_t vset_index = SIZE_MAX;
 	for (size_t i = 0; i < func.instructions.size(); i++) {
-		const auto& instr = func.instructions[i];
+		const auto &instr = func.instructions[i];
 		if (instr.opcode == IROpcode::VSET) {
 			vset_index = i;
 		} else if (ir_destination_register(instr) == 1) {
 			move_index = i;
 		}
 	}
-	assert(vset_index != SIZE_MAX);
-	assert(move_index != SIZE_MAX);
-	assert(move_index < vset_index);
-
-	std::cout << "  ✓ Stores are not delayed past a VSET" << std::endl;
+	REQUIRE(vset_index != SIZE_MAX);
+	REQUIRE(move_index != SIZE_MAX);
+	REQUIRE(move_index < vset_index);
 }
 
 // Copy propagation has to kill the register a CALL defines. Because CALL keeps
 // its destination in operand 1, the kill used to be skipped and a constant that
 // had previously lived in that register was propagated over the call result.
-static void test_call_result_kills_constant() {
-	std::cout << "Testing that a call result invalidates a tracked constant..." << std::endl;
-
+TEST_CASE("call result kills constant") {
 	IRStringTable strings;
 	IRFunction func;
 	func.name = "test";
@@ -261,47 +245,39 @@ static void test_call_result_kills_constant() {
 	optimizer.optimize_function(func);
 
 	// The MOVE must not have become "LOAD_IMM r0, 42".
-	for (const auto& instr : func.instructions) {
+	for (const auto &instr : func.instructions) {
 		if (instr.opcode == IROpcode::LOAD_IMM && ir_destination_register(instr) == 0) {
-			assert(false && "call result was replaced by a stale constant");
+			FAIL("call result was replaced by a stale constant");
 		}
 	}
-
-	std::cout << "  ✓ A call result invalidates a tracked constant" << std::endl;
 }
 
 // Register types are per-function. Virtual register numbers restart at 0 in
 // every function, so a type left on r0 by one function used to be inherited by
 // the next, sending the backend down a native path for the wrong Variant type.
-static void test_register_types_do_not_leak_between_functions() {
-	std::cout << "Testing that register types do not leak between functions..." << std::endl;
-
+TEST_CASE("register types do not leak between functions") {
 	const std::string source =
-		"func first():\n"
-		"\treturn 1\n"
-		"func second(a):\n"
-		"\tif a:\n"
-		"\t\treturn 1\n"
-		"\treturn 0\n";
+			"func first():\n"
+			"\treturn 1\n"
+			"func second(a):\n"
+			"\tif a:\n"
+			"\t\treturn 1\n"
+			"\treturn 0\n";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRFunction& second = find_function(ir, "second");
-	for (const auto& instr : second.instructions) {
+	const IRFunction &second = find_function(ir, "second");
+	for (const auto &instr : second.instructions) {
 		if (instr.opcode == IROpcode::BRANCH_ZERO) {
 			// 'a' is an untyped parameter, so nothing is known about its type.
-			assert(instr.type_hint == IRInstruction::TypeHint_NONE);
+			REQUIRE(instr.type_hint == IRInstruction::TypeHint_NONE);
 		}
 	}
-
-	std::cout << "  ✓ Register types do not leak between functions" << std::endl;
 }
 
 // A global's address is `.globals + index * sizeof(Variant)`. Emitting that as
 // `la` followed by `addi` truncates to a 12-bit signed immediate, so every
 // global past #85 (or #51 in a double-precision build) addressed the wrong slot.
-static void test_large_global_offsets() {
-	std::cout << "Testing global addressing past the 12-bit immediate range..." << std::endl;
-
+TEST_CASE("large global offsets") {
 	std::string source;
 	const int global_count = 200;
 	for (int i = 0; i < global_count; i++) {
@@ -324,7 +300,7 @@ static void test_large_global_offsets() {
 		// 199 * 24 = 4776 does not fit a signed 12-bit immediate; it wraps to
 		// 4776 - 4096 = 680. Finding that as an ADDI immediate would mean a
 		// global offset had been silently truncated.
-		assert(imm != 680);
+		REQUIRE(imm != 680);
 	}
 
 	// The same for members: no ADDI off the base register may carry the wrap.
@@ -344,7 +320,7 @@ static void test_large_global_offsets() {
 			if (((instr >> 15) & 0x1F) != REG_TP) {
 				continue;
 			}
-			assert((int32_t(instr) >> 20) != 680);
+			REQUIRE((int32_t(instr) >> 20) != 680);
 		}
 	}
 
@@ -352,9 +328,7 @@ static void test_large_global_offsets() {
 	IRProgram ir = compile_to_ir(source);
 	RISCVCodeGen riscv{ VariantLayout(false) };
 	riscv.generate(ir);
-	assert(riscv.get_global_data_size() >= size_t(global_count) * 24);
-
-	std::cout << "  ✓ Global addressing past the 12-bit immediate range" << std::endl;
+	REQUIRE(riscv.get_global_data_size() >= size_t(global_count) * 24);
 }
 
 // An int constant is materialized by LUI + a 12-bit add. Rounding the split to
@@ -362,12 +336,10 @@ static void test_large_global_offsets() {
 // overflowed the int32 the carry was computed in: the upper half became
 // 0x80000000, LUI sign-extended it to a 64-bit negative, and a plain ADDI left
 // the value 2^32 too small. `return 0x7FFFFFFF` handed back -2147483649.
-static void test_int32_immediates_at_the_lui_carry_boundary() {
-	std::cout << "Testing integer constants at the LUI carry boundary..." << std::endl;
-
+TEST_CASE("int32 immediates at the lui carry boundary") {
 	// The 64-bit value an LUI, alone or followed by ADDI/ADDIW on the same
 	// register, leaves in that register — RV64 semantics, sign extension and all.
-	const auto materialized_values = [](const std::vector<uint8_t>& code) {
+	const auto materialized_values = [](const std::vector<uint8_t> &code) {
 		std::vector<int64_t> values;
 		for (size_t off = 0; off + 4 <= code.size(); off += 4) {
 			const uint32_t lui = word_at(code, off);
@@ -410,140 +382,130 @@ static void test_int32_immediates_at_the_lui_carry_boundary() {
 	};
 	for (const int64_t constant : constants) {
 		const std::vector<uint8_t> code =
-			compile_to_code("func test():\n\treturn " + std::to_string(constant) + "\n");
+				compile_to_code("func test():\n\treturn " + std::to_string(constant) + "\n");
 		const std::vector<int64_t> values = materialized_values(code);
-		assert(std::find(values.begin(), values.end(), constant) != values.end());
+		REQUIRE(std::find(values.begin(), values.end(), constant) != values.end());
 	}
-
-	std::cout << "  ✓ Integer constants at the LUI carry boundary" << std::endl;
 }
 
 // Global initializers that are not compile-time constants. Every one of these
 // used to fall through the initializer matcher silently and leave the global
 // NIL, with no diagnostic.
-static void test_global_initializer_forms() {
-	std::cout << "Testing global initializer forms..." << std::endl;
-
+TEST_CASE("global initializer forms") {
 	// Unary minus over a literal is a constant, not a runtime expression.
 	{
 		const IRProgram ir = compile_to_ir("var x = -5\nvar f = -2.5\nfunc test():\n\treturn x\n");
-		const IRGlobalVar& x = find_global(ir, "x");
-		assert(x.init_type == IRGlobalVar::InitType::INT);
-		assert(std::get<int64_t>(x.init_value) == -5);
-		const IRGlobalVar& f = find_global(ir, "f");
-		assert(f.init_type == IRGlobalVar::InitType::FLOAT);
-		assert(std::get<double>(f.init_value) == -2.5);
-		assert(!ir.has_global_init); // both fold, so nothing runs at startup
+		const IRGlobalVar &x = find_global(ir, "x");
+		REQUIRE(x.init_type == IRGlobalVar::InitType::INT);
+		REQUIRE(std::get<int64_t>(x.init_value) == -5);
+		const IRGlobalVar &f = find_global(ir, "f");
+		REQUIRE(f.init_type == IRGlobalVar::InitType::FLOAT);
+		REQUIRE(std::get<double>(f.init_value) == -2.5);
+		REQUIRE(!ir.has_global_init); // both fold, so nothing runs at startup
 	}
 
 	// A reference to an earlier const folds to that const's value.
 	{
 		const IRProgram ir = compile_to_ir("const M = 10\nvar y = M\nfunc test():\n\treturn y\n");
-		const IRGlobalVar& y = find_global(ir, "y");
-		assert(y.init_type == IRGlobalVar::InitType::INT);
-		assert(std::get<int64_t>(y.init_value) == 10);
+		const IRGlobalVar &y = find_global(ir, "y");
+		REQUIRE(y.init_type == IRGlobalVar::InitType::INT);
+		REQUIRE(std::get<int64_t>(y.init_value) == 10);
 	}
 
 	// Referring to a global declared later would read NIL, so it is rejected.
-	assert(rejects("var a = b\nvar b = 1\nfunc test():\n\treturn a\n"));
+	// A member read before its declaration holds its type's default, null here, as
+	// GDScript runs initializers in order; the typed cases are in test_gdscript_syntax.
+	REQUIRE(!rejects("var a = b\nvar b = 1\nfunc test():\n\treturn a\n"));
 
 	// Non-empty containers, nesting and packed arrays run at startup.
 	{
 		const IRProgram ir = compile_to_ir(
-			"var a = [1, 2, 3]\n"
-			"var d = {\"k\": 1}\n"
-			"var n = [[1, 2], {\"k\": 3}]\n"
-			"var p = PackedInt32Array()\n"
-			"func test():\n"
-			"\treturn a\n");
+				"var a = [1, 2, 3]\n"
+				"var d = {\"k\": 1}\n"
+				"var n = [[1, 2], {\"k\": 3}]\n"
+				"var p = PackedInt32Array()\n"
+				"func test():\n"
+				"\treturn a\n");
 		// Members, so they are built per instance rather than at startup.
-		assert(ir.has_member_init);
-		assert(!ir.has_global_init);
-		for (const char* name : { "a", "d", "n", "p" }) {
-			assert(find_global(ir, name).init_type == IRGlobalVar::InitType::RUNTIME);
+		REQUIRE(ir.has_member_init);
+		REQUIRE(!ir.has_global_init);
+		for (const char *name : { "a", "d", "n", "p" }) {
+			REQUIRE(find_global(ir, name).init_type == IRGlobalVar::InitType::RUNTIME);
 		}
 		// Untyped containers still get a Variant type for @export registration.
-		assert(find_global(ir, "a").value_type == Variant::ARRAY);
-		assert(find_global(ir, "d").value_type == Variant::DICTIONARY);
-		assert(find_global(ir, "p").value_type == Variant::PACKED_INT32_ARRAY);
-		assert(count_opcode(ir.member_init, IROpcode::STORE_GLOBAL) == 4);
+		REQUIRE(find_global(ir, "a").value_type == Variant::ARRAY);
+		REQUIRE(find_global(ir, "d").value_type == Variant::DICTIONARY);
+		REQUIRE(find_global(ir, "p").value_type == Variant::PACKED_INT32_ARRAY);
+		REQUIRE(count_opcode(ir.member_init, IROpcode::STORE_GLOBAL) == 4);
 	}
 
 	// Empty containers stay compile-time constants: no startup code for them.
 	{
 		const IRProgram ir = compile_to_ir("var a = []\nvar d = {}\nfunc test():\n\treturn a\n");
-		assert(find_global(ir, "a").init_type == IRGlobalVar::InitType::EMPTY_ARRAY);
-		assert(find_global(ir, "d").init_type == IRGlobalVar::InitType::EMPTY_DICT);
-		assert(!ir.has_global_init);
-		assert(!ir.has_member_init);
+		REQUIRE(find_global(ir, "a").init_type == IRGlobalVar::InitType::EMPTY_ARRAY);
+		REQUIRE(find_global(ir, "d").init_type == IRGlobalVar::InitType::EMPTY_DICT);
+		REQUIRE(!ir.has_global_init);
+		REQUIRE(!ir.has_member_init);
 	}
 
 	// A type-hinted global with no initializer gets its type's default value,
 	// the way GDScript does, rather than staying NIL.
 	{
 		const IRProgram ir = compile_to_ir(
-			"var a: Array\nvar s: String\nvar n: int\nvar f: float\nvar p: PackedByteArray\n"
-			"func test():\n\treturn n\n");
-		assert(find_global(ir, "a").init_type == IRGlobalVar::InitType::EMPTY_ARRAY);
-		assert(find_global(ir, "s").init_type == IRGlobalVar::InitType::STRING);
-		assert(find_global(ir, "n").init_type == IRGlobalVar::InitType::INT);
-		assert(find_global(ir, "f").init_type == IRGlobalVar::InitType::FLOAT);
-		assert(find_global(ir, "p").init_type == IRGlobalVar::InitType::RUNTIME);
+				"var a: Array\nvar s: String\nvar n: int\nvar f: float\nvar p: PackedByteArray\n"
+				"func test():\n\treturn n\n");
+		REQUIRE(find_global(ir, "a").init_type == IRGlobalVar::InitType::EMPTY_ARRAY);
+		REQUIRE(find_global(ir, "s").init_type == IRGlobalVar::InitType::STRING);
+		REQUIRE(find_global(ir, "n").init_type == IRGlobalVar::InitType::INT);
+		REQUIRE(find_global(ir, "f").init_type == IRGlobalVar::InitType::FLOAT);
+		REQUIRE(find_global(ir, "p").init_type == IRGlobalVar::InitType::RUNTIME);
 	}
 
 	// Declaring the same global twice is an error rather than a silent shadow.
-	assert(rejects("var a = 1\nvar a = 2\nfunc test():\n\treturn a\n"));
-
-	std::cout << "  ✓ Global initializer forms" << std::endl;
+	REQUIRE(rejects("var a = 1\nvar a = 2\nfunc test():\n\treturn a\n"));
 }
 
 // The global init function runs before any @export property is registered, so a
 // property is registered holding the value it was declared with.
-static void test_global_init_runs_before_property_registration() {
-	std::cout << "Testing global init ordering against property registration..." << std::endl;
-
+TEST_CASE("global init runs before property registration") {
 	const std::string source =
-		"@export var items = [1, 2]\n"
-		"func test():\n"
-		"\treturn items\n";
+			"@export var items = [1, 2]\n"
+			"func test():\n"
+			"\treturn items\n";
 
 	const IRProgram ir = compile_to_ir(source);
-	assert(ir.has_member_init);
-	assert(find_global(ir, "items").is_property);
-	assert(find_global(ir, "items").value_type == Variant::ARRAY);
+	REQUIRE(ir.has_member_init);
+	REQUIRE(find_global(ir, "items").is_property);
+	REQUIRE(find_global(ir, "items").value_type == Variant::ARRAY);
 
 	// The init function is internal: it must not be exported as a callable.
 	RISCVCodeGen riscv{ VariantLayout(false) };
 	riscv.generate(ir);
-	assert(riscv.get_function_offsets().count("__init_globals") == 0);
-	assert(riscv.get_function_offsets().count(".init_globals") == 0);
-	assert(riscv.get_function_offsets().count("__init_members") == 0);
+	REQUIRE(riscv.get_function_offsets().count("__init_globals") == 0);
+	REQUIRE(riscv.get_function_offsets().count(".init_globals") == 0);
+	REQUIRE(riscv.get_function_offsets().count("__init_members") == 0);
 
 	// One member, the shared return slot the initializers write into, and the
 	// blob describing the record.
-	assert(riscv.get_global_data_size() == 2 * 24 + size_t(InstanceLayout::BLOB_SIZE));
-
-	std::cout << "  ✓ Global init ordering against property registration" << std::endl;
+	REQUIRE(riscv.get_global_data_size() == 2 * 24 + size_t(InstanceLayout::BLOB_SIZE));
 }
 
 // 'and' and 'or' short-circuit in GDScript: the right-hand side is not evaluated
 // when the left already decides the result. Lowering them to a binary IR op ran
 // the right side's side effects unconditionally.
-static void test_logical_short_circuit() {
-	std::cout << "Testing short-circuit evaluation..." << std::endl;
-
+TEST_CASE("logical short circuit") {
 	const std::string source =
-		"func side():\n"
-		"\treturn 1\n"
-		"func test(a):\n"
-		"\tif a and side():\n"
-		"\t\treturn 1\n"
-		"\treturn 0\n";
+			"func side():\n"
+			"\treturn 1\n"
+			"func test(a):\n"
+			"\tif a and side():\n"
+			"\t\treturn 1\n"
+			"\treturn 0\n";
 
 	const IRProgram ir = compile_to_ir(source);
-	const IRFunction& test = find_function(ir, "test");
-	assert(count_opcode(test, IROpcode::AND) == 0);
-	assert(count_opcode(test, IROpcode::OR) == 0);
+	const IRFunction &test = find_function(ir, "test");
+	REQUIRE(count_opcode(test, IROpcode::AND) == 0);
+	REQUIRE(count_opcode(test, IROpcode::OR) == 0);
 
 	// The call has to sit between the two short-circuit tests, not before them.
 	size_t first_branch = SIZE_MAX;
@@ -555,73 +517,65 @@ static void test_logical_short_circuit() {
 			call_index = i;
 		}
 	}
-	assert(first_branch != SIZE_MAX);
-	assert(call_index != SIZE_MAX);
-	assert(first_branch < call_index);
+	REQUIRE(first_branch != SIZE_MAX);
+	REQUIRE(call_index != SIZE_MAX);
+	REQUIRE(first_branch < call_index);
 
 	// Values are what GDScript produces, and both operators are bools.
-	assert(run_int("func test():\n\treturn 1 and 1\n", "test") == 1);
-	assert(run_int("func test():\n\treturn 1 and 0\n", "test") == 0);
-	assert(run_int("func test():\n\treturn 0 and 1\n", "test") == 0);
-	assert(run_int("func test():\n\treturn 0 or 0\n", "test") == 0);
-	assert(run_int("func test():\n\treturn 0 or 1\n", "test") == 1);
-	assert(run_int("func test():\n\treturn 1 or 0\n", "test") == 1);
-	assert(std::holds_alternative<bool>(run("func test():\n\treturn 1 and 1\n", "test")));
+	REQUIRE(run_int("func test():\n\treturn 1 and 1\n", "test") == 1);
+	REQUIRE(run_int("func test():\n\treturn 1 and 0\n", "test") == 0);
+	REQUIRE(run_int("func test():\n\treturn 0 and 1\n", "test") == 0);
+	REQUIRE(run_int("func test():\n\treturn 0 or 0\n", "test") == 0);
+	REQUIRE(run_int("func test():\n\treturn 0 or 1\n", "test") == 1);
+	REQUIRE(run_int("func test():\n\treturn 1 or 0\n", "test") == 1);
+	REQUIRE(std::holds_alternative<bool>(run("func test():\n\treturn 1 and 1\n", "test")));
 
 	// 5 and 3 is true, not 3: the operators booleanize.
-	assert(run_int("func test():\n\treturn 5 and 3\n", "test") == 1);
-
-	std::cout << "  ✓ Short-circuit evaluation" << std::endl;
+	REQUIRE(run_int("func test():\n\treturn 5 and 3\n", "test") == 1);
 }
 
 // Truthiness follows Variant::booleanize(). Testing only the payload's low byte
 // makes 256 false, and makes any scoped index whose low byte is zero false too.
-static void test_truthiness() {
-	std::cout << "Testing Variant truthiness..." << std::endl;
-
-	assert(run_int("func test():\n\tif 256:\n\t\treturn 1\n\treturn 0\n", "test") == 1);
-	assert(run_int("func test():\n\tif 0:\n\t\treturn 1\n\treturn 0\n", "test") == 0);
-	assert(run_int("func test():\n\tif 0.5:\n\t\treturn 1\n\treturn 0\n", "test") == 1);
-	assert(run_int("func test():\n\tif 0.0:\n\t\treturn 1\n\treturn 0\n", "test") == 0);
+TEST_CASE("truthiness") {
+	REQUIRE(run_int("func test():\n\tif 256:\n\t\treturn 1\n\treturn 0\n", "test") == 1);
+	REQUIRE(run_int("func test():\n\tif 0:\n\t\treturn 1\n\treturn 0\n", "test") == 0);
+	REQUIRE(run_int("func test():\n\tif 0.5:\n\t\treturn 1\n\treturn 0\n", "test") == 1);
+	REQUIRE(run_int("func test():\n\tif 0.0:\n\t\treturn 1\n\treturn 0\n", "test") == 0);
 
 	// A comparison result is a bool, not an int of the operand's type. Tracking
 	// it as INT made the backend read eight bytes of a one-byte payload.
 	// Unoptimized: the optimizer fuses a comparison and its branch into a
 	// BRANCH_LT, which is exactly the branch this is not about.
 	const IRProgram ir = compile_to_ir(
-		"func test(a: int, b: int):\n\tvar c = a < b\n\tif c:\n\t\treturn 1\n\treturn 0\n", false);
-	const IRFunction& test = find_function(ir, "test");
+			"func test(a: int, b: int):\n\tvar c = a < b\n\tif c:\n\t\treturn 1\n\treturn 0\n", false);
+	const IRFunction &test = find_function(ir, "test");
 	bool checked = false;
-	for (const auto& instr : test.instructions) {
+	for (const auto &instr : test.instructions) {
 		if (instr.opcode == IROpcode::BRANCH_ZERO && instr.type_hint != IRInstruction::TypeHint_NONE) {
-			assert(instr.type_hint == Variant::BOOL);
+			REQUIRE(instr.type_hint == Variant::BOOL);
 			checked = true;
 		}
 	}
-	assert(checked);
-
-	std::cout << "  ✓ Variant truthiness" << std::endl;
+	REQUIRE(checked);
 }
 
 // A global whose every read takes its address directly has no frame copy. The
 // branch's truthiness test dropped that base register and handed the host an
 // SP-relative pointer anyway, so `if platform:` booleanized whatever sat at the
 // bottom of the frame -- reliably false for an object member.
-static void test_truthiness_of_a_global_read_in_place() {
-	std::cout << "Testing truthiness of a global read in place..." << std::endl;
-
+TEST_CASE("truthiness of a global read in place") {
 	// Declared by class name, so the slot carries no Variant type and the branch
 	// has to ask the host. `r` keeps the branch off the return register, which is
 	// excluded from the frame-copy elision.
 	const std::string source =
-		"var platform: Sprite2D\n"
-		"func test(a):\n"
-		"\tvar r = a\n"
-		"\tif platform:\n"
-		"\t\tr = 1\n"
-		"\treturn r\n";
+			"var platform: Sprite2D\n"
+			"func test(a):\n"
+			"\tvar r = a\n"
+			"\tif platform:\n"
+			"\t\tr = 1\n"
+			"\treturn r\n";
 
-	assert(count_opcode(find_function(compile_to_ir(source), "test"), IROpcode::BRANCH_ZERO) == 1);
+	REQUIRE(count_opcode(find_function(compile_to_ir(source), "test"), IROpcode::BRANCH_ZERO) == 1);
 
 	constexpr uint8_t REG_SP = 2;
 	constexpr uint8_t REG_A1 = 11;
@@ -639,7 +593,7 @@ static void test_truthiness_of_a_global_read_in_place() {
 		// li a7, ECALL_VEVAL
 		if (!(gdscript::valid_counted_syscall_encoding(instr) && (instr >> 20) == ECALL_VEVAL) &&
 			(!is_addi(instr) || rd_of(instr) != REG_A7 || rs1_of(instr) != 0 ||
-			(int32_t(instr) >> 20) != ECALL_VEVAL)) {
+			 (int32_t(instr) >> 20) != ECALL_VEVAL)) {
 			continue;
 		}
 		// a1 is the operand pointer: the last write of it before the syscall.
@@ -649,111 +603,97 @@ static void test_truthiness_of_a_global_read_in_place() {
 			if (!is_addi(prev) || rd_of(prev) != REG_A1) {
 				continue;
 			}
-			assert(rs1_of(prev) != REG_SP);
+			REQUIRE(rs1_of(prev) != REG_SP);
 			found = true;
 		}
-		assert(found);
+		REQUIRE(found);
 		checked = true;
 	}
-	assert(checked);
-
-	std::cout << "  ✓ truthiness of a global read in place" << std::endl;
+	REQUIRE(checked);
 }
 
 // A declared type is a promise about the value, not just a label on it.
-static void test_declared_type_coercion() {
-	std::cout << "Testing coercion to declared types..." << std::endl;
-
+TEST_CASE("declared type coercion") {
 	// `var f: float = 0` holds 0.0. Folding it as an INT while registering the
 	// global as FLOAT hands Godot a Variant of the wrong type.
 	{
 		const IRProgram ir = compile_to_ir("var f: float = 0\nfunc test():\n\treturn f\n");
-		const IRGlobalVar& f = find_global(ir, "f");
-		assert(f.init_type == IRGlobalVar::InitType::FLOAT);
-		assert(std::get<double>(f.init_value) == 0.0);
-		assert(f.value_type == Variant::FLOAT);
+		const IRGlobalVar &f = find_global(ir, "f");
+		REQUIRE(f.init_type == IRGlobalVar::InitType::FLOAT);
+		REQUIRE(std::get<double>(f.init_value) == 0.0);
+		REQUIRE(f.value_type == Variant::FLOAT);
 	}
 
 	// The same for locals, where the mismatch made the backend read an integer
 	// payload as a double.
 	{
 		const IRProgram ir = compile_to_ir("func test():\n\tvar g: float = 2\n\treturn g\n", false);
-		const IRFunction& test = find_function(ir, "test");
-		assert(count_opcode(test, IROpcode::CONVERT) == 1);
+		const IRFunction &test = find_function(ir, "test");
+		REQUIRE(count_opcode(test, IROpcode::CONVERT) == 1);
 	}
-	assert(std::get<double>(run("func test():\n\tvar g: float = 2\n\treturn g\n", "test")) == 2.0);
+	REQUIRE(std::get<double>(run("func test():\n\tvar g: float = 2\n\treturn g\n", "test")) == 2.0);
 
 	// Mismatches GDScript rejects are rejected here rather than reinterpreted.
-	assert(rejects("var s: String = 5\nfunc test():\n\treturn s\n"));
-	assert(rejects("func test():\n\tvar i: int = 1.5\n\treturn i\n"));
-
-	std::cout << "  ✓ Coercion to declared types" << std::endl;
+	REQUIRE(rejects("var s: String = 5\nfunc test():\n\treturn s\n"));
+	REQUIRE(rejects("func test():\n\tvar i: int = 1.5\n\treturn i\n"));
 }
 
 // Bitwise and shift operators. These are implemented but were never covered, so
 // the integer-only rules and the fallback path went unchecked.
-static void test_bitwise_and_shifts() {
-	std::cout << "Testing bitwise and shift operators..." << std::endl;
-
-	assert(run_int("func test():\n\treturn 12 & 10\n", "test") == 8);
-	assert(run_int("func test():\n\treturn 12 | 10\n", "test") == 14);
-	assert(run_int("func test():\n\treturn 12 ^ 10\n", "test") == 6);
-	assert(run_int("func test():\n\treturn ~0\n", "test") == -1);
-	assert(run_int("func test():\n\treturn 1 << 10\n", "test") == 1024);
-	assert(run_int("func test():\n\treturn 1024 >> 3\n", "test") == 128);
-	assert(run_int("func test():\n\treturn -8 >> 1\n", "test") == -4);
+TEST_CASE("bitwise and shifts") {
+	REQUIRE(run_int("func test():\n\treturn 12 & 10\n", "test") == 8);
+	REQUIRE(run_int("func test():\n\treturn 12 | 10\n", "test") == 14);
+	REQUIRE(run_int("func test():\n\treturn 12 ^ 10\n", "test") == 6);
+	REQUIRE(run_int("func test():\n\treturn ~0\n", "test") == -1);
+	REQUIRE(run_int("func test():\n\treturn 1 << 10\n", "test") == 1024);
+	REQUIRE(run_int("func test():\n\treturn 1024 >> 3\n", "test") == 128);
+	REQUIRE(run_int("func test():\n\treturn -8 >> 1\n", "test") == -4);
 
 	// Compound assignment forms lower to the same operators.
-	assert(run_int("func test():\n\tvar x = 12\n\tx ^= 10\n\treturn x\n", "test") == 6);
-	assert(run_int("func test():\n\tvar x = 1\n\tx <<= 4\n\treturn x\n", "test") == 16);
-	assert(run_int("func test():\n\tvar x = 64\n\tx >>= 4\n\treturn x\n", "test") == 4);
-	assert(run_int("func test():\n\tvar x = 12\n\tx &= 10\n\treturn x\n", "test") == 8);
-	assert(run_int("func test():\n\tvar x = 12\n\tx |= 10\n\treturn x\n", "test") == 14);
+	REQUIRE(run_int("func test():\n\tvar x = 12\n\tx ^= 10\n\treturn x\n", "test") == 6);
+	REQUIRE(run_int("func test():\n\tvar x = 1\n\tx <<= 4\n\treturn x\n", "test") == 16);
+	REQUIRE(run_int("func test():\n\tvar x = 64\n\tx >>= 4\n\treturn x\n", "test") == 4);
+	REQUIRE(run_int("func test():\n\tvar x = 12\n\tx &= 10\n\treturn x\n", "test") == 8);
+	REQUIRE(run_int("func test():\n\tvar x = 12\n\tx |= 10\n\treturn x\n", "test") == 14);
 
 	// Only two known integers take the native path; anything else falls back to
 	// the host, which reports a type error at run time rather than producing
 	// nonsense from a float payload.
 	{
 		const IRProgram typed_ir = compile_to_ir("func test(a: int, b: int):\n\treturn a ^ b\n", false);
-		const IRFunction& typed = find_function(typed_ir, "test");
-		for (const auto& instr : typed.instructions) {
+		const IRFunction &typed = find_function(typed_ir, "test");
+		for (const auto &instr : typed.instructions) {
 			if (instr.opcode == IROpcode::BIT_XOR) {
-				assert(instr.type_hint == Variant::INT);
+				REQUIRE(instr.type_hint == Variant::INT);
 			}
 		}
 
 		const IRProgram untyped_ir = compile_to_ir("func test(a, b):\n\treturn a ^ b\n", false);
-		const IRFunction& untyped = find_function(untyped_ir, "test");
-		for (const auto& instr : untyped.instructions) {
+		const IRFunction &untyped = find_function(untyped_ir, "test");
+		for (const auto &instr : untyped.instructions) {
 			if (instr.opcode == IROpcode::BIT_XOR) {
-				assert(instr.type_hint == IRInstruction::TypeHint_NONE);
+				REQUIRE(instr.type_hint == IRInstruction::TypeHint_NONE);
 			}
 		}
 	}
-
-	std::cout << "  ✓ Bitwise and shift operators" << std::endl;
 }
 
 // Uninitialized globals hold an "empty" payload of INT32_MIN, which is the only
 // value VASSIGN treats as "no destination yet". Leaving it 0 makes the first
 // assignment into a complex global assign through scoped variant 0 instead.
-static void test_globals_start_empty() {
-	std::cout << "Testing that globals start as empty Variants..." << std::endl;
-
+TEST_CASE("globals start empty") {
 	IRProgram ir = compile_to_ir("var a: Callable\nfunc test():\n\treturn a\n");
 	RISCVCodeGen riscv{ VariantLayout(false) };
 	const std::vector<uint8_t> code = riscv.generate(ir);
 	const size_t data_size = riscv.get_global_data_size();
-	assert(data_size >= 24);
+	REQUIRE(data_size >= 24);
 
 	const size_t data_start = code.size() - data_size;
 	int64_t payload = 0;
 	for (int i = 7; i >= 0; i--) {
 		payload = (payload << 8) | code[data_start + 8 + i];
 	}
-	assert(payload == int64_t(INT32_MIN));
-
-	std::cout << "  ✓ Globals start as empty Variants" << std::endl;
+	REQUIRE(payload == int64_t(INT32_MIN));
 }
 
 // Loop-invariant code motion hoisted definitions that only run on one path
@@ -761,9 +701,7 @@ static void test_globals_start_empty() {
 // two invariant definitions of the same register; hoisting either makes the
 // register hold that value on both paths. A generated program found it, and it
 // produced a wrong answer with nothing else to see.
-static void test_licm_leaves_conditional_definitions_alone() {
-	std::cout << "Testing that LICM leaves conditional definitions alone..." << std::endl;
-
+TEST_CASE("licm leaves conditional definitions alone") {
 	// `or` lowers to exactly that shape: a register set to 1 on the
 	// short-circuit path and to 0 on the other, both inside the loop body.
 	const std::string source = R"(
@@ -777,7 +715,7 @@ func test():
 	return taken
 )";
 
-	assert(run_int(source, "test") == 4);
+	REQUIRE(run_int(source, "test") == 4);
 
 	// The same answer with loop-invariant code motion as the only pass, so that
 	// a later pass cannot be the one making it right.
@@ -794,170 +732,180 @@ func test():
 
 	IRInterpreter interpreter(hoisted);
 	const IRInterpreter::Value value = interpreter.call("test");
-	assert(std::get<int64_t>(value) == 4);
+	REQUIRE(std::get<int64_t>(value) == 4);
 
 	// Rotated loops have an entry test before the body label.  LICM may retain
 	// an immediate in that entry path instead of moving it across the label;
 	// the interpreter result above is the semantic guard for the conditional
 	// definition this regression covers.
-
-	std::cout << "  ✓ LICM leaves conditional definitions alone" << std::endl;
 }
 
-static void test_typed_entry_survives_unused_parameters() {
-	std::cout << "Testing typed entry points with unused parameters..." << std::endl;
-
+TEST_CASE("typed entry survives unused parameters") {
 	const std::string unused =
-		"func test():\n"
-		"\thelper(1.0)\n"
-		"func helper(_d: float):\n"
-		"\tprint(1)\n";
+			"func test():\n"
+			"\thelper(1.0)\n"
+			"func helper(_d: float):\n"
+			"\tprint(1)\n";
 
 	const IRProgram ir = compile_to_ir(unused);
-	const IRFunction& caller = find_function(ir, "test");
+	const IRFunction &caller = find_function(ir, "test");
 	bool trusted = false;
-	for (const auto& instr : caller.instructions) {
+	for (const auto &instr : caller.instructions) {
 		if (instr.opcode == IROpcode::CALL && instr.trusted_internal_call) {
 			trusted = true;
 		}
 	}
-	assert(trusted);
-	assert(count_opcode(find_function(ir, "helper"), IROpcode::COERCE) == 0);
-	assert(!compile_to_code(unused).empty());
+	REQUIRE(trusted);
+	REQUIRE(count_opcode(find_function(ir, "helper"), IROpcode::COERCE) == 0);
+	REQUIRE(!compile_to_code(unused).empty());
 
-	assert(!compile_to_code(
-		"func test():\n"
-		"\thelper(1.0, 2.0)\n"
-		"func helper(_a: float, b: float):\n"
-		"\tprint(b)\n").empty());
+	REQUIRE(!compile_to_code(
+					 "func test():\n"
+					 "\thelper(1.0, 2.0)\n"
+					 "func helper(_a: float, b: float):\n"
+					 "\tprint(b)\n")
+					 .empty());
 
-	assert(!compile_to_code(
-		"func test():\n"
-		"\thelper(1.0, 2.0)\n"
-		"func helper(a: float, _b: float):\n"
-		"\tprint(a)\n").empty());
+	REQUIRE(!compile_to_code(
+					 "func test():\n"
+					 "\thelper(1.0, 2.0)\n"
+					 "func helper(a: float, _b: float):\n"
+					 "\tprint(a)\n")
+					 .empty());
 
-	assert(!compile_to_code(
-		"func test():\n"
-		"\thelper(1, 2.0, true)\n"
-		"func helper(_a: int, _b: float, _c: bool):\n"
-		"\tprint(1)\n").empty());
+	REQUIRE(!compile_to_code(
+					 "func test():\n"
+					 "\thelper(1, 2.0, true)\n"
+					 "func helper(_a: int, _b: float, _c: bool):\n"
+					 "\tprint(1)\n")
+					 .empty());
 
 	std::cout << "  \u2713 Typed entry points survive unused parameters" << std::endl;
 }
 
-static void test_vector_int_float_conversion() {
-	std::cout << "Testing implicit vector int/float conversion..." << std::endl;
-
+TEST_CASE("vector int float conversion") {
 	const struct {
-		const char* value;
-		const char* declared;
+		const char *value;
+		const char *declared;
 		IRInstruction::TypeHint type;
 	} cases[] = {
-		{ "Vector2i(1, 2)",                 "Vector2",  Variant::VECTOR2 },
-		{ "Vector2(1.5, 2.5)",              "Vector2i", Variant::VECTOR2I },
-		{ "Vector3i(1, 2, 3)",              "Vector3",  Variant::VECTOR3 },
-		{ "Vector3(1.5, 2.5, 3.5)",         "Vector3i", Variant::VECTOR3I },
-		{ "Vector4i(1, 2, 3, 4)",           "Vector4",  Variant::VECTOR4 },
-		{ "Vector4(1.5, 2.5, 3.5, 4.5)",    "Vector4i", Variant::VECTOR4I },
-		{ "Rect2i(1, 2, 3, 4)",             "Rect2",    Variant::RECT2 },
-		{ "Rect2(1.5, 2.5, 3.5, 4.5)",      "Rect2i",   Variant::RECT2I },
+		{ "Vector2i(1, 2)", "Vector2", Variant::VECTOR2 },
+		{ "Vector2(1.5, 2.5)", "Vector2i", Variant::VECTOR2I },
+		{ "Vector3i(1, 2, 3)", "Vector3", Variant::VECTOR3 },
+		{ "Vector3(1.5, 2.5, 3.5)", "Vector3i", Variant::VECTOR3I },
+		{ "Vector4i(1, 2, 3, 4)", "Vector4", Variant::VECTOR4 },
+		{ "Vector4(1.5, 2.5, 3.5, 4.5)", "Vector4i", Variant::VECTOR4I },
+		{ "Rect2i(1, 2, 3, 4)", "Rect2", Variant::RECT2 },
+		{ "Rect2(1.5, 2.5, 3.5, 4.5)", "Rect2i", Variant::RECT2I },
 	};
 
-	for (const auto& item : cases) {
+	for (const auto &item : cases) {
 		const std::string source = std::string("func test():\n\tvar v: ") + item.declared +
-			" = " + item.value + "\n\treturn v\n";
+				" = " + item.value + "\n\treturn v\n";
 		const IRProgram ir = compile_to_ir(source, false);
-		const IRFunction& test = find_function(ir, "test");
+		const IRFunction &test = find_function(ir, "test");
 		bool converted = false;
-		for (const auto& instr : test.instructions) {
+		for (const auto &instr : test.instructions) {
 			if (instr.opcode == IROpcode::CONSTRUCT && instr.type_hint == item.type) {
 				converted = true;
 			}
 		}
-		assert(converted);
+		REQUIRE(converted);
 
 		const std::string returned = std::string("func test() -> ") + item.declared +
-			":\n\treturn " + item.value + "\n";
-		assert(!rejects(returned));
+				":\n\treturn " + item.value + "\n";
+		REQUIRE(!rejects(returned));
 
 		const std::string reassigned = std::string("func test():\n\tvar v: ") + item.declared +
-			" = " + item.declared + "()\n\tv = " + item.value + "\n\treturn v\n";
-		assert(!rejects(reassigned));
+				" = " + item.declared + "()\n\tv = " + item.value + "\n\treturn v\n";
+		REQUIRE(!rejects(reassigned));
 	}
 
-	assert(!rejects(
-		"func helper(v: Vector2) -> Vector2i:\n"
-		"\treturn Vector2i(v)\n"
-		"func test():\n"
-		"\tvar from: Vector2 = helper(Vector2(1, 2))\n"
-		"\treturn from\n"));
+	REQUIRE(!rejects(
+			"func helper(v: Vector2) -> Vector2i:\n"
+			"\treturn Vector2i(v)\n"
+			"func test():\n"
+			"\tvar from: Vector2 = helper(Vector2(1, 2))\n"
+			"\treturn from\n"));
 
-	const struct { const char* from; const char* to; } engine_pairs[] = {
-		{ "StringName", "String" }, { "NodePath", "String" },
-		{ "String", "StringName" }, { "NodePath", "StringName" },
-		{ "String", "NodePath" }, { "StringName", "NodePath" },
+	const struct {
+		const char *from;
+		const char *to;
+	} engine_pairs[] = {
+		{ "StringName", "String" },
+		{ "NodePath", "String" },
+		{ "String", "StringName" },
+		{ "NodePath", "StringName" },
+		{ "String", "NodePath" },
+		{ "StringName", "NodePath" },
 		{ "String", "Color" },
-		{ "Quaternion", "Basis" }, { "Basis", "Quaternion" },
-		{ "Transform3D", "Transform2D" }, { "Transform2D", "Transform3D" },
-		{ "Quaternion", "Transform3D" }, { "Basis", "Transform3D" },
-		{ "Projection", "Transform3D" }, { "Transform3D", "Projection" },
-		{ "PackedInt32Array", "Array" }, { "PackedStringArray", "Array" },
-		{ "Array", "PackedInt32Array" }, { "Array", "PackedStringArray" },
+		{ "Quaternion", "Basis" },
+		{ "Basis", "Quaternion" },
+		{ "Transform3D", "Transform2D" },
+		{ "Transform2D", "Transform3D" },
+		{ "Quaternion", "Transform3D" },
+		{ "Basis", "Transform3D" },
+		{ "Projection", "Transform3D" },
+		{ "Transform3D", "Projection" },
+		{ "PackedInt32Array", "Array" },
+		{ "PackedStringArray", "Array" },
+		{ "Array", "PackedInt32Array" },
+		{ "Array", "PackedStringArray" },
 	};
-	for (const auto& pair : engine_pairs) {
+	for (const auto &pair : engine_pairs) {
 		const std::string source = std::string("func take(value: ") + pair.from + ") -> " +
-			pair.to + ":\n\treturn value\n";
-		assert(!rejects(source));
+				pair.to + ":\n\treturn value\n";
+		REQUIRE(!rejects(source));
 	}
 
 	{
 		const IRProgram ir = compile_to_ir(
-			"var member: Vector2 = Vector2i(1, 2)\nfunc test():\n\treturn member\n", false);
+				"var member: Vector2 = Vector2i(1, 2)\nfunc test():\n\treturn member\n", false);
 		bool converted = false;
-		for (const auto& instr : ir.member_init.instructions) {
+		for (const auto &instr : ir.member_init.instructions) {
 			if (instr.opcode == IROpcode::CONSTRUCT && instr.type_hint == Variant::VECTOR2) {
 				converted = true;
 			}
 		}
-		assert(converted);
-		assert(find_global(ir, "member").value_type == Variant::VECTOR2);
+		REQUIRE(converted);
+		REQUIRE(find_global(ir, "member").value_type == Variant::VECTOR2);
 	}
-	assert(rejects("var member: Vector2 = Color(1, 1, 1)\nfunc test():\n\treturn member\n"));
+	REQUIRE(rejects("var member: Vector2 = Color(1, 1, 1)\nfunc test():\n\treturn member\n"));
 	{
 		const IRProgram ir = compile_to_ir(
-			"var member: Vector2 = Vector2(0, 0)\n"
-			"func test():\n\tmember = Vector2i(1, 2)\n\treturn member\n", false);
-		assert(count_opcode(find_function(ir, "test"), IROpcode::CONSTRUCT) == 1);
+				"var member: Vector2 = Vector2(0, 0)\n"
+				"func test():\n\tmember = Vector2i(1, 2)\n\treturn member\n",
+				false);
+		REQUIRE(count_opcode(find_function(ir, "test"), IROpcode::CONSTRUCT) == 1);
 	}
 
-	assert(rejects("func test():\n\tvar v: Vector2 = Color(1, 1, 1)\n\treturn v\n"));
-	assert(rejects("func test():\n\tvar v: Vector2 = Vector3(1, 2, 3)\n\treturn v\n"));
-	assert(rejects("func test():\n\tvar v: Rect2 = Vector2i(1, 2)\n\treturn v\n"));
+	REQUIRE(rejects("func test():\n\tvar v: Vector2 = Color(1, 1, 1)\n\treturn v\n"));
+	REQUIRE(rejects("func test():\n\tvar v: Vector2 = Vector3(1, 2, 3)\n\treturn v\n"));
+	REQUIRE(rejects("func test():\n\tvar v: Rect2 = Vector2i(1, 2)\n\treturn v\n"));
 
 	std::cout << "  \u2713 Vector and rect int/float conversion" << std::endl;
 }
 
-static void assert_labels_defined(const IRFunction& func) {
+static void assert_labels_defined(const IRFunction &func) {
 	std::vector<uint32_t> defined;
-	for (const auto& instr : func.instructions) {
+	for (const auto &instr : func.instructions) {
 		if (instr.opcode == IROpcode::LABEL) {
 			defined.push_back(instr.operands[0].string_id);
 		}
 	}
-	for (const auto& instr : func.instructions) {
+	for (const auto &instr : func.instructions) {
 		if (instr.opcode == IROpcode::LABEL) {
 			continue;
 		}
-		for (const auto& operand : instr.operands) {
+		for (const auto &operand : instr.operands) {
 			if (operand.type == IRValue::Type::LABEL) {
-				assert(std::find(defined.begin(), defined.end(), operand.string_id) != defined.end());
+				REQUIRE(std::find(defined.begin(), defined.end(), operand.string_id) != defined.end());
 			}
 		}
 	}
 }
 
-static void test_break_after_a_nested_batched_loop() {
+TEST_CASE("break after a nested batched loop") {
 	const std::string source = R"(
 func over_arrays(items: Array) -> int:
 	var n: int = 0
@@ -997,7 +945,7 @@ func continue_after(items: Array) -> int:
 	}
 }
 
-static void test_class_typed_local_that_starts_null() {
+TEST_CASE("class typed local that starts null") {
 	const std::string source = R"(
 func test(value):
 	var n: Node3D = null
@@ -1015,19 +963,19 @@ func still_null():
 	var n: Node3D = null
 	return n == null
 )";
-	assert(run_int(source, "test", { int64_t(5) }) == 1);
-	assert(run_int(source, "test", { int64_t(4) }) == 0);
-	assert(run_int(source, "without_initializer", { int64_t(5) }) == 0);
-	assert(run_int(source, "still_null") == 1);
+	REQUIRE(run_int(source, "test", { int64_t(5) }) == 1);
+	REQUIRE(run_int(source, "test", { int64_t(4) }) == 0);
+	REQUIRE(run_int(source, "without_initializer", { int64_t(5) }) == 0);
+	REQUIRE(run_int(source, "still_null") == 1);
 
-	assert(!rejects("func test(o: Node3D):\n\tvar n: Node3D = null\n\tn = o\n\treturn n\n"));
-	assert(!rejects("func test():\n\tvar n: Node3D = null\n\tn = self\n\treturn n\n"));
+	REQUIRE(!rejects("func test(o: Node3D):\n\tvar n: Node3D = null\n\tn = o\n\treturn n\n"));
+	REQUIRE(!rejects("func test():\n\tvar n: Node3D = null\n\tn = self\n\treturn n\n"));
 }
 
 // A default is an expression in the callee's scope. It used to be evaluated at
 // the call site in the caller's scope. A default naming an earlier parameter
 // then failed to compile or silently read a caller's local of the same name.
-static void test_defaults_are_evaluated_in_the_callees_scope() {
+TEST_CASE("defaults are evaluated in the callee's scope") {
 	const std::string source = R"(
 func f(a := 1, b := a + 10):
 	return a * 100 + b
@@ -1046,16 +994,16 @@ class Box:
 	static func call_it():
 		return scaled() * 100 + scaled(1)
 )";
-	assert(run_int(source, "shadowed") == 111);
-	assert(run_int(source, "supplied") == 212 * 1000 + 304);
-	assert(run_int(source, "@Box.call_it") == 9 * 100 + 3);
+	REQUIRE(run_int(source, "shadowed") == 111);
+	REQUIRE(run_int(source, "supplied") == 212 * 1000 + 304);
+	REQUIRE(run_int(source, "@Box.call_it") == 9 * 100 + 3);
 
 	// Constant defaults still fold at the call site without a wrapper or an extra call.
 	const IRProgram ir = compile_to_ir(
-		"func g(a := 1, b := 2):\n\treturn a + b\n"
-		"func caller():\n\treturn g()\n");
-	for (const auto& func : ir.functions) {
-		assert(func.name.rfind("@defaults", 0) != 0);
+			"func g(a := 1, b := 2):\n\treturn a + b\n"
+			"func caller():\n\treturn g()\n");
+	for (const auto &func : ir.functions) {
+		REQUIRE(func.name.rfind("@defaults", 0) != 0);
 	}
 
 	// A method's default may read the receiver's fields.
@@ -1068,44 +1016,15 @@ func test():
 	var base = 1
 	return Box.new().get_v()
 )");
-	const IRFunction& wrapper = find_function(members, "@defaults1.Box.get_v");
-	assert(wrapper.parameters.size() == 1 && wrapper.parameters[0] == "self");
+	const IRFunction &wrapper = find_function(members, "@defaults1.Box.get_v");
+	REQUIRE((wrapper.parameters.size() == 1 && wrapper.parameters[0] == "self"));
 	bool calls_wrapper = false;
-	for (const auto& instr : find_function(members, "test").instructions) {
+	for (const auto &instr : find_function(members, "test").instructions) {
 		if (instr.opcode == IROpcode::CALL &&
 			members.strings[instr.operands[0].string_id] == "@defaults1.Box.get_v") {
 			calls_wrapper = true;
 		}
 	}
-	assert(calls_wrapper);
+	REQUIRE(calls_wrapper);
 	std::cout << "  \u2713 Defaults are evaluated in the callee's scope" << std::endl;
-}
-
-int main() {
-	std::cout << "=== Compiler Regression Tests ===" << std::endl << std::endl;
-
-	test_locals_shadow_globals();
-	test_operand_roles();
-	test_store_not_delayed_past_vset();
-	test_call_result_kills_constant();
-	test_register_types_do_not_leak_between_functions();
-	test_large_global_offsets();
-	test_int32_immediates_at_the_lui_carry_boundary();
-	test_global_initializer_forms();
-	test_global_init_runs_before_property_registration();
-	test_logical_short_circuit();
-	test_truthiness();
-	test_truthiness_of_a_global_read_in_place();
-	test_declared_type_coercion();
-	test_bitwise_and_shifts();
-	test_globals_start_empty();
-	test_licm_leaves_conditional_definitions_alone();
-	test_typed_entry_survives_unused_parameters();
-	test_vector_int_float_conversion();
-	test_break_after_a_nested_batched_loop();
-	test_class_typed_local_that_starts_null();
-	test_defaults_are_evaluated_in_the_callees_scope();
-
-	std::cout << std::endl << "All regression tests passed!" << std::endl;
-	return 0;
 }

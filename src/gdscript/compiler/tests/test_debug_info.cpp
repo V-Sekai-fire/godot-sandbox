@@ -1,10 +1,11 @@
 #include "dyncall_shim.h"
+#include "witness/doctest.h"
 // DebugLayout shadow stack on a real libriscv machine. Outer frame lines
 // resolved from return addresses via the line table; nothing per statement.
 #include "../compiler.h"
-#include "scope_stub.h"
 #include "../debug_layout.h"
 #include "../line_table.h"
+#include "scope_stub.h"
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -19,21 +20,16 @@ using machine_t = riscv::Machine<riscv::RISCV64>;
 
 namespace {
 
-int failures = 0;
-
-void check(bool condition, const std::string& what) {
+void check(bool condition, const std::string &what) {
 	if (!condition) {
-		std::cerr << "FAILED: " << what << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: ", what);
 	}
 }
 
 template <typename T>
-void check_eq(T actual, T expected, const std::string& what) {
+void check_eq(T actual, T expected, const std::string &what) {
 	if (actual != expected) {
-		std::cerr << "FAILED: " << what << ": expected " << expected
-			<< ", got " << actual << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: ", what, ": expected ", expected, ", got ", actual);
 	}
 }
 
@@ -43,15 +39,14 @@ struct Program {
 	std::vector<FunctionSignature> signatures;
 };
 
-Program compile(const std::string& source, bool debug_info) {
+Program compile(const std::string &source, bool debug_info) {
 	Program out;
 	Compiler compiler;
 	CompilerOptions options;
 	options.debug_info = debug_info;
 	out.elf = compiler.compile(source, options);
 	if (out.elf.empty()) {
-		std::cerr << "FAILED to compile: " << compiler.get_error() << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED to compile: ", compiler.get_error());
 		return out;
 	}
 	out.lines = compiler.get_line_table();
@@ -79,13 +74,13 @@ struct Area {
 };
 
 template <typename T>
-T read(machine_t& machine, uint64_t address) {
-	T value {};
+T read(machine_t &machine, uint64_t address) {
+	T value{};
 	machine.copy_from_guest(&value, address, sizeof(T));
 	return value;
 }
 
-Area read_area(machine_t& machine) {
+Area read_area(machine_t &machine) {
 	Area area;
 	area.address = machine.address_of(DEBUG_SYMBOL);
 	if (area.address == 0) {
@@ -101,7 +96,8 @@ Area read_area(machine_t& machine) {
 
 	// Frames past MAX_DEPTH are not written; depth still counts.
 	const uint64_t recorded = area.depth < DebugLayout::MAX_DEPTH
-		? area.depth : uint64_t(DebugLayout::MAX_DEPTH);
+			? area.depth
+			: uint64_t(DebugLayout::MAX_DEPTH);
 	for (uint64_t i = 0; i < recorded; i++) {
 		const uint64_t frame = base + DebugLayout::frame_offset(uint32_t(i));
 		Frame entry;
@@ -119,16 +115,17 @@ struct StackEntry {
 	uint32_t line = 0;
 };
 
-std::vector<StackEntry> reconstruct(const Area& area, const Program& program, uint64_t pc) {
+std::vector<StackEntry> reconstruct(const Area &area, const Program &program, uint64_t pc) {
 	std::vector<StackEntry> stack;
 	for (size_t i = 0; i < area.frames.size(); i++) {
 		StackEntry entry;
 		const uint64_t index = area.frames[i].function_index;
 		entry.function = index < program.signatures.size()
-			? program.signatures[index].name : "?";
+				? program.signatures[index].name
+				: "?";
 		if (i + 1 < area.frames.size()) {
 			entry.line = program.lines.line_for_address(
-				uint32_t(area.frames[i + 1].return_address - 4));
+					uint32_t(area.frames[i + 1].return_address - 4));
 		} else {
 			entry.line = program.lines.line_for_address(uint32_t(pc));
 		}
@@ -144,7 +141,7 @@ Area captured;
 uint64_t captured_pc = 0;
 bool capture_armed = false;
 
-void capture_syscall(machine_t& machine) {
+void capture_syscall(machine_t &machine) {
 	if (capture_armed) {
 		captured_pc = machine.cpu.pc();
 		captured = read_area(machine);
@@ -152,18 +149,16 @@ void capture_syscall(machine_t& machine) {
 	}
 }
 
-void fail_on_syscall(machine_t& machine) {
-	std::cerr << "FAILED: the test program made syscall "
-		<< machine.cpu.reg(riscv::REG_ARG7) << std::endl;
-	failures++;
+void fail_on_syscall(machine_t &machine) {
+	FAIL_CHECK("FAILED: the test program made syscall ", machine.cpu.reg(riscv::REG_ARG7));
 	machine.stop();
 }
 
-std::unique_ptr<machine_t> boot(const std::vector<uint8_t>& elf) {
-	auto machine = std::make_unique<machine_t>(elf, riscv::MachineOptions<riscv::RISCV64> {
-		.memory_max = 32ull << 20,
-		.stack_size = 4ull << 20,
-	});
+std::unique_ptr<machine_t> boot(const std::vector<uint8_t> &elf) {
+	auto machine = std::make_unique<machine_t>(elf, riscv::MachineOptions<riscv::RISCV64>{
+															.memory_max = 32ull << 20,
+															.stack_size = 4ull << 20,
+													});
 	for (int number = 500; number < 560; number++) {
 		machine_t::install_syscall_handler(number, fail_on_syscall);
 	}
@@ -174,14 +169,13 @@ std::unique_ptr<machine_t> boot(const std::vector<uint8_t>& elf) {
 }
 
 // Sandbox ABI: a0 = return Variant pointer.
-bool run(machine_t& machine, const std::string& function) {
+bool run(machine_t &machine, const std::string &function) {
 	const uint64_t address = machine.address_of(function);
 	if (address == 0) {
-		std::cerr << "FAILED: no symbol for " << function << "()" << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: no symbol for ", function, "()");
 		return false;
 	}
-	auto& sp = machine.cpu.reg(riscv::REG_SP);
+	auto &sp = machine.cpu.reg(riscv::REG_SP);
 	sp = machine.memory.stack_initial();
 	sp -= 64;
 	machine.cpu.reg(riscv::REG_RA) = machine.memory.exit_address();
@@ -193,12 +187,19 @@ bool run(machine_t& machine, const std::string& function) {
 
 // -= The tests =-
 
-void test_off_by_default() {
+// Upstream installed the dyncall handlers at the top of main(). A doctest
+// binary has no main of its own, so they go in once here, before any case.
+const bool SETUP_ONCE = [] {
+	sgd_install_test_dyncalls();
+	return true;
+}();
+
+TEST_CASE("off by default") {
 	const std::string source =
-		"func leaf():\n"
-		"\treturn 1\n"
-		"func test():\n"
-		"\treturn leaf()\n";
+			"func leaf():\n"
+			"\treturn 1\n"
+			"func test():\n"
+			"\treturn leaf()\n";
 
 	CompilerOptions defaults;
 	check(!defaults.debug_info, "debug info defaults to off");
@@ -211,28 +212,28 @@ void test_off_by_default() {
 
 	auto machine = boot(plain.elf);
 	check_eq(machine->address_of(DEBUG_SYMBOL), uint64_t(0),
-		"an ordinary build exports no debug symbol");
+			 "an ordinary build exports no debug symbol");
 
 	auto debug_machine = boot(debug.elf);
 	check(debug_machine->address_of(DEBUG_SYMBOL) != 0,
-		"a debug build exports the debug symbol");
+		  "a debug build exports the debug symbol");
 
 	check(debug.elf.size() > plain.elf.size(),
-		"the shadow stack is code an ordinary build does not carry");
+		  "the shadow stack is code an ordinary build does not carry");
 
 	// Line table is metadata; produced regardless of debug_info.
 	check(!plain.lines.entries.empty(), "an ordinary build still has a line table");
 	check(plain.lines.is_normalized(), "and it is ordered");
 }
 
-void test_header() {
+TEST_CASE("header") {
 	const std::string source =
-		"func a():\n"
-		"\treturn 1\n"
-		"func b():\n"
-		"\treturn 2\n"
-		"func test():\n"
-		"\treturn 3\n";
+			"func a():\n"
+			"\treturn 1\n"
+			"func b():\n"
+			"\treturn 2\n"
+			"func test():\n"
+			"\treturn 3\n";
 
 	const Program program = compile(source, true);
 	if (program.elf.empty()) {
@@ -250,17 +251,17 @@ void test_header() {
 	check_eq(area.depth, uint64_t(0), "nothing is on the stack before the first call");
 }
 
-void test_call_stack_mid_call() {
+TEST_CASE("call stack mid call") {
 	const std::string source =
-		"func c():\n" // 1
-		"\tprint(1)\n" // 2
-		"\treturn 3\n" // 3
-		"func b():\n" // 4
-		"\treturn c()\n" // 5
-		"func a():\n" // 6
-		"\treturn b()\n" // 7
-		"func test():\n" // 8
-		"\treturn a()\n"; // 9
+			"func c():\n" // 1
+			"\tprint(1)\n" // 2
+			"\treturn 3\n" // 3
+			"func b():\n" // 4
+			"\treturn c()\n" // 5
+			"func a():\n" // 6
+			"\treturn b()\n" // 7
+			"func test():\n" // 8
+			"\treturn a()\n"; // 9
 
 	const Program program = compile(source, true);
 	if (program.elf.empty()) {
@@ -297,19 +298,19 @@ void test_call_stack_mid_call() {
 	// Stack grows down: inner frame sp <= outer frame sp.
 	for (size_t i = 1; i < captured.frames.size(); i++) {
 		check(captured.frames[i].frame_sp <= captured.frames[i - 1].frame_sp,
-			"frame " + std::to_string(i) + " sits below its caller");
+			  "frame " + std::to_string(i) + " sits below its caller");
 	}
 }
 
-void test_depth_balances() {
+TEST_CASE("depth balances") {
 	const std::string source =
-		"func leaf(n):\n"
-		"\treturn n + 1\n"
-		"func test():\n"
-		"\tvar total = 0\n"
-		"\tfor i in range(10):\n"
-		"\t\ttotal = total + leaf(i)\n"
-		"\treturn total\n";
+			"func leaf(n):\n"
+			"\treturn n + 1\n"
+			"func test():\n"
+			"\tvar total = 0\n"
+			"\tfor i in range(10):\n"
+			"\t\ttotal = total + leaf(i)\n"
+			"\treturn total\n";
 
 	const Program program = compile(source, true);
 	if (program.elf.empty()) {
@@ -322,15 +323,15 @@ void test_depth_balances() {
 	check_eq(area.depth, uint64_t(0), "every call that returned was popped");
 }
 
-void test_overflow_keeps_counting() {
+TEST_CASE("overflow keeps counting") {
 	// Past MAX_DEPTH: frames stop recording but depth balances to zero.
 	const std::string source =
-		"func down(n):\n"
-		"\tif n <= 0:\n"
-		"\t\treturn 0\n"
-		"\treturn down(n - 1)\n"
-		"func test():\n"
-		"\treturn down(400)\n";
+			"func down(n):\n"
+			"\tif n <= 0:\n"
+			"\t\treturn 0\n"
+			"\treturn down(n - 1)\n"
+			"func test():\n"
+			"\treturn down(400)\n";
 
 	const Program program = compile(source, true);
 	if (program.elf.empty()) {
@@ -344,19 +345,3 @@ void test_overflow_keeps_counting() {
 }
 
 } // namespace
-
-int main() {
-	sgd_install_test_dyncalls();
-	test_off_by_default();
-	test_header();
-	test_call_stack_mid_call();
-	test_depth_balances();
-	test_overflow_keeps_counting();
-
-	if (failures > 0) {
-		std::cerr << failures << " debug info test(s) failed" << std::endl;
-		return 1;
-	}
-	std::cout << "All debug info tests passed" << std::endl;
-	return 0;
-}

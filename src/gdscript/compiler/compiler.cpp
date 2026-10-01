@@ -6,9 +6,11 @@
 #include "parser.h"
 #include "codegen.h"
 #include "ir_optimizer.h"
+#include "rewrite.h"
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -72,7 +74,9 @@ void import_native_bases(Program &program, const CompilerOptions &options) {
 		if (visiting.size() >= MAX_CHAIN_DEPTH) throw std::runtime_error("Script inheritance is too deep");
 		visiting.insert(loaded.path);
 		Lexer lexer(loaded.source);
+		lexer.set_extensions(options.extensions);
 		Parser parser(lexer.tokenize());
+		parser.set_extensions(options.extensions);
 		auto parsed = parser.parse();
 		apply_traits(parsed);
 		StructDecl decl;
@@ -113,6 +117,45 @@ void import_native_bases(Program &program, const CompilerOptions &options) {
 Compiler::Compiler() {}
 
 std::optional<IRProgram> Compiler::compile_to_ir(const std::string& source, const CompilerOptions& options) {
+	m_rewrite_notes.clear();
+	if (options.rewrite) {
+		RewriteResult rewrite;
+		try {
+			Lexer lexer(source);
+			lexer.set_extensions(options.extensions);
+			Parser parser(lexer.tokenize());
+			parser.set_extensions(options.extensions);
+			const Program authored = parser.parse();
+			RewriteOptions rewrite_options;
+			rewrite_options.fast_arrays = options.fast_arrays;
+			rewrite = rewrite_packed_loops(source, authored, rewrite_options);
+		} catch (const std::exception&) {
+			// The authored text does not parse: compiling it below says why.
+		}
+		if (rewrite.applied > 0) {
+			std::vector<std::string> notes = rewrite.notes;
+			std::optional<IRProgram> program = compile_text(rewrite.source, rewrite.line_map, source, options);
+			if (program) {
+				m_rewritten_source = std::move(rewrite.source);
+				m_rewrite_notes = std::move(notes);
+				return program;
+			}
+			// The authored loops are the fallback: compile them, which either
+			// succeeds or reports the authored text's own error.
+			const std::string dropped = "rewrite dropped, the rewritten text did not compile: " + m_error;
+			std::optional<IRProgram> authored = compile_text(source, {}, source, options);
+			m_rewritten_source = source;
+			m_rewrite_notes.assign(1, dropped);
+			return authored;
+		}
+	}
+	m_rewritten_source = source;
+	return compile_text(source, {}, source, options);
+}
+
+std::optional<IRProgram> Compiler::compile_text(const std::string& source, const std::vector<int>& line_map,
+	const std::string& authored, const CompilerOptions& options)
+{
 	m_signatures.clear();
 	m_signals.clear();
 	m_rpc_configs.clear();
@@ -144,7 +187,22 @@ std::optional<IRProgram> Compiler::compile_to_ir(const std::string& source, cons
 		}
 
 		Lexer lexer(source);
+		lexer.set_extensions(options.extensions);
 		auto tokens = lexer.tokenize();
+		// A rewritten text: every token -- and so every AST node, diagnostic and
+		// line-table entry -- takes the authored line it came from.
+		const std::function<int(int)> authored_line = [&](int line) {
+			return line > 0 && size_t(line) < line_map.size() ? line_map[size_t(line)] : line;
+		};
+		std::vector<std::pair<int, std::string>> doc_comments = lexer.doc_comments();
+		if (!line_map.empty()) {
+			for (Token& token : tokens) {
+				token.line = authored_line(token.line);
+			}
+			for (std::pair<int, std::string>& comment : doc_comments) {
+				comment.first = authored_line(comment.first);
+			}
+		}
 
 		if (options.dump_tokens) {
 			std::cout << "=== TOKENS ===" << std::endl;
@@ -155,7 +213,8 @@ std::optional<IRProgram> Compiler::compile_to_ir(const std::string& source, cons
 		}
 
 		Parser parser(tokens);
-		parser.set_doc_comments(lexer.doc_comments());
+		parser.set_extensions(options.extensions);
+		parser.set_doc_comments(doc_comments);
 		Program program = parser.parse();
 		m_warnings = parser.warnings();
 
@@ -170,7 +229,9 @@ std::optional<IRProgram> Compiler::compile_to_ir(const std::string& source, cons
 			for (size_t i = options.base_sources.size(); i-- > 0;) {
 				const CompilerOptions::BaseSource& base = options.base_sources[i];
 				Lexer base_lexer(base.source);
+				base_lexer.set_extensions(options.extensions);
 				Parser base_parser(base_lexer.tokenize());
+				base_parser.set_extensions(options.extensions);
 				base_parser.set_doc_comments(base_lexer.doc_comments());
 				ChainLink link;
 				link.name = base.name;
@@ -256,9 +317,11 @@ std::optional<IRProgram> Compiler::compile_to_ir(const std::string& source, cons
 		}
 		CodeGenerator codegen;
 		codegen.set_native_classes(options.native_classes);
+		codegen.set_extensions(options.extensions);
 		codegen.set_dropped_tests(dropped_tests);
 		codegen.set_restricted(options.restricted);
 		codegen.set_batch_iteration(options.batch_iteration);
+		codegen.set_fast_arrays(options.fast_arrays);
 		codegen.set_struct_checks(options.restricted ||
 			options.struct_checks != CompilerOptions::StructChecks::OFF,
 			options.struct_checks == CompilerOptions::StructChecks::DEEP);
@@ -268,6 +331,7 @@ std::optional<IRProgram> Compiler::compile_to_ir(const std::string& source, cons
 		codegen.set_global_script_classes(options.global_script_classes);
 		codegen.set_engine_ancestry(options.engine_ancestry);
 		IRProgram ir_program = codegen.generate(program);
+		m_packed_notes = codegen.packed_notes();
 		m_signatures = ir_program.signatures;
 		m_signals = ir_program.signals;
 		m_rpc_configs = ir_program.rpc_configs;
@@ -420,7 +484,7 @@ std::optional<IRProgram> Compiler::compile_to_ir(const std::string& source, cons
 		return ir_program;
 
 	} catch (const CompilerException& e) {
-		set_error(source, e);
+		set_error(authored, e);
 		return std::nullopt;
 	} catch (const std::exception& e) {
 		set_error(e);
@@ -452,6 +516,8 @@ namespace gdscript {
 std::optional<std::string> Compiler::compile_to_c(const std::string &source, CompilerOptions options) {
     options.optimize = false;
     options.batch_iteration = false;
+    options.fast_arrays = false;
+    options.rewrite = false;
     auto program = compile_to_ir(source, options);
     if (!program) return std::nullopt;
     try { return CCodeGenerator().generate(*program,

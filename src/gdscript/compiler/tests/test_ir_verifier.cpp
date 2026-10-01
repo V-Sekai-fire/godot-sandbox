@@ -15,7 +15,7 @@
 #include "../lexer.h"
 #include "../parser.h"
 #include "test_corpus.h"
-#include <cassert>
+#include "witness/doctest.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -24,7 +24,7 @@ using namespace gdscript;
 
 namespace {
 
-IRProgram compile_to_ir(const std::string& source) {
+IRProgram compile_to_ir(const std::string &source) {
 	Lexer lexer(source);
 	Parser parser(lexer.tokenize());
 	Program program = parser.parse();
@@ -34,17 +34,24 @@ IRProgram compile_to_ir(const std::string& source) {
 
 // -= What the compiler produces has to verify =-
 
-void test_corpus_verifies() {
+// Upstream ran this at the top of main(). A doctest binary has no main of
+// its own, so it runs once here, before any case.
+const bool SETUP_ONCE = [] {
+	set_ir_verification_enabled(true);
+	return true;
+}();
+
+TEST_CASE("corpus verifies") {
 	std::cout << "Verifying the corpus, at every point in the pipeline..." << std::endl;
 
-	const auto& passes = IROptimizer::pipeline();
-	for (const auto& program : gdscript_test::corpus()) {
+	const auto &passes = IROptimizer::pipeline();
+	for (const auto &program : gdscript_test::corpus()) {
 		IRProgram ir = compile_to_ir(program.source);
 		try {
 			ir_verify(ir, "codegen");
-		} catch (const CompilerException& e) {
+		} catch (const CompilerException &e) {
 			std::cerr << "FAIL " << program.name << ": " << e.what() << std::endl;
-			assert(false && "code generation produced IR the verifier rejects");
+			FAIL("code generation produced IR the verifier rejects");
 		}
 
 		// Each prefix of the pipeline separately: the verifier runs between
@@ -57,16 +64,16 @@ void test_corpus_verifies() {
 			try {
 				optimizer.optimize(optimized);
 				ir_verify(optimized, passes[n - 1].name);
-			} catch (const CompilerException& e) {
+			} catch (const CompilerException &e) {
 				std::cerr << "FAIL " << program.name << " after passes 1.." << n << " ("
-					<< passes[n - 1].name << "): " << e.what() << std::endl;
-				assert(false && "an optimizer pass produced IR the verifier rejects");
+						  << passes[n - 1].name << "): " << e.what() << std::endl;
+				FAIL("an optimizer pass produced IR the verifier rejects");
 			}
 		}
 	}
 
 	std::cout << "  " << gdscript_test::corpus().size() << " programs verified through "
-		<< passes.size() << " passes" << std::endl;
+			  << passes.size() << " passes" << std::endl;
 }
 
 // -= Broken IR has to be rejected =-
@@ -76,21 +83,21 @@ IRStringTable test_strings;
 
 // Runs the verifier and requires it to reject, with `expected` appearing in the
 // message so a check cannot pass for the wrong reason.
-void expect_rejected(const IRFunction& func, const std::string& expected) {
+void expect_rejected(const IRFunction &func, const std::string &expected) {
 	try {
 		ir_verify(func, "a test", &test_strings);
-	} catch (const CompilerException& e) {
+	} catch (const CompilerException &e) {
 		const std::string message = e.what();
 		if (message.find(expected) == std::string::npos) {
 			std::cerr << "Rejected, but not for the expected reason.\n"
-				<< "  expected to contain: " << expected << "\n"
-				<< "  actual: " << message << std::endl;
-			assert(false && "verifier rejected for the wrong reason");
+					  << "  expected to contain: " << expected << "\n"
+					  << "  actual: " << message << std::endl;
+			FAIL("verifier rejected for the wrong reason");
 		}
 		return;
 	}
 	std::cerr << "The verifier accepted IR it should have rejected (" << expected << ")" << std::endl;
-	assert(false && "verifier accepted broken IR");
+	FAIL("verifier accepted broken IR");
 }
 
 // A function that verifies clean, as the starting point for each mutation.
@@ -105,15 +112,12 @@ IRFunction good_function() {
 	return func;
 }
 
-void test_good_function_verifies() {
-	std::cout << "Testing the baseline function..." << std::endl;
+TEST_CASE("good function verifies") {
 	ir_verify(good_function(), "a test");
 	std::cout << "  Baseline verifies" << std::endl;
 }
 
-void test_arity() {
-	std::cout << "Testing arity checks..." << std::endl;
-
+TEST_CASE("arity") {
 	// Too few operands.
 	{
 		IRFunction func = good_function();
@@ -131,9 +135,7 @@ void test_arity() {
 	std::cout << "  Arity OK" << std::endl;
 }
 
-void test_operand_kinds() {
-	std::cout << "Testing operand kind checks..." << std::endl;
-
+TEST_CASE("operand kinds") {
 	// An immediate where a source register belongs.
 	{
 		IRFunction func = good_function();
@@ -158,9 +160,7 @@ void test_operand_kinds() {
 	std::cout << "  Operand kinds OK" << std::endl;
 }
 
-void test_undefined_register() {
-	std::cout << "Testing definedness..." << std::endl;
-
+TEST_CASE("undefined register") {
 	// Reading a register nothing defined. This is the shape a dead-store pass
 	// leaves behind when it deletes a definition that was still live.
 	{
@@ -213,10 +213,10 @@ void test_undefined_register() {
 	std::cout << "  Definedness OK" << std::endl;
 }
 
-void test_backward_join_definedness() {
+TEST_CASE("backward join definedness") {
 	IRFunction func;
 	func.name = "backward_join";
-	func.parameters = {"condition"};
+	func.parameters = { "condition" };
 	func.max_registers = 3;
 	const auto late = IRValue::label(test_strings.intern("late_predecessor"));
 	const auto join = IRValue::label(test_strings.intern("earlier_join"));
@@ -230,19 +230,17 @@ void test_backward_join_definedness() {
 	func.instructions.emplace_back(IROpcode::JUMP, join);
 	expect_rejected(func, "r2 is read but is not defined on every path");
 	func.instructions.insert(func.instructions.end() - 1,
-		IRInstruction(IROpcode::LOAD_IMM, IRValue::reg(2), IRValue::imm(2)));
+							 IRInstruction(IROpcode::LOAD_IMM, IRValue::reg(2), IRValue::imm(2)));
 	ir_verify(func, "a test", &test_strings);
 }
 
-void test_labels() {
-	std::cout << "Testing label checks..." << std::endl;
-
+TEST_CASE("labels") {
 	// A branch to a label that does not exist -- what a pass leaves behind when
 	// it deletes a label it thought was unreachable.
 	{
 		IRFunction func = good_function();
 		func.instructions.insert(func.instructions.begin() + 2,
-			IRInstruction(IROpcode::JUMP, IRValue::label(test_strings.intern("nowhere"))));
+								 IRInstruction(IROpcode::JUMP, IRValue::label(test_strings.intern("nowhere"))));
 		expect_rejected(func, "branch target 'nowhere' has no label");
 	}
 
@@ -250,18 +248,16 @@ void test_labels() {
 	{
 		IRFunction func = good_function();
 		func.instructions.insert(func.instructions.begin(),
-			IRInstruction(IROpcode::LABEL, IRValue::label(test_strings.intern("twice"))));
+								 IRInstruction(IROpcode::LABEL, IRValue::label(test_strings.intern("twice"))));
 		func.instructions.insert(func.instructions.begin() + 2,
-			IRInstruction(IROpcode::LABEL, IRValue::label(test_strings.intern("twice"))));
+								 IRInstruction(IROpcode::LABEL, IRValue::label(test_strings.intern("twice"))));
 		expect_rejected(func, "defined more than once");
 	}
 
 	std::cout << "  Labels OK" << std::endl;
 }
 
-void test_max_registers() {
-	std::cout << "Testing max_registers..." << std::endl;
-
+TEST_CASE("max registers") {
 	{
 		IRFunction func = good_function();
 		func.max_registers = 2;
@@ -280,9 +276,7 @@ void test_max_registers() {
 	std::cout << "  max_registers OK" << std::endl;
 }
 
-void test_call_shape() {
-	std::cout << "Testing call checks..." << std::endl;
-
+TEST_CASE("call shape") {
 	// CALL keeps its destination in operand 1, so a pass that assumes operand 0
 	// is the destination rewrites the callee name instead. The verifier catches
 	// the result as an operand-kind mismatch.
@@ -353,9 +347,7 @@ void test_call_shape() {
 	std::cout << "  Calls OK" << std::endl;
 }
 
-void test_dictionary_pair_count() {
-	std::cout << "Testing pair counts..." << std::endl;
-
+TEST_CASE("dictionary pair count") {
 	IRFunction func;
 	func.name = "dict";
 	func.max_registers = 3;
@@ -378,9 +370,7 @@ void test_dictionary_pair_count() {
 	std::cout << "  Pair counts OK" << std::endl;
 }
 
-void test_type_hints() {
-	std::cout << "Testing type hint checks..." << std::endl;
-
+TEST_CASE("type hints") {
 	// A CONVERT that does not say what it converts to.
 	{
 		IRFunction func;
@@ -388,7 +378,7 @@ void test_type_hints() {
 		func.max_registers = 2;
 		func.instructions.emplace_back(IROpcode::LOAD_IMM, IRValue::reg(1), IRValue::imm(1));
 		func.instructions.emplace_back(IROpcode::CONVERT, IRValue::reg(0), IRValue::reg(1),
-			IRValue::imm(Variant::INT));
+									   IRValue::imm(Variant::INT));
 		func.instructions.emplace_back(IROpcode::RETURN);
 		expect_rejected(func, "CONVERT does not say what it converts to");
 
@@ -405,7 +395,7 @@ void test_type_hints() {
 		func.max_registers = 3;
 		func.instructions.emplace_back(IROpcode::LOAD_FLOAT_IMM, IRValue::reg(1), IRValue::fimm(1.5));
 		func.instructions.emplace_back(IROpcode::LOAD_IMM, IRValue::reg(2), IRValue::imm(2));
-		auto& add = func.instructions.emplace_back(IROpcode::ADD, IRValue::reg(0), IRValue::reg(1), IRValue::reg(2));
+		auto &add = func.instructions.emplace_back(IROpcode::ADD, IRValue::reg(0), IRValue::reg(1), IRValue::reg(2));
 		add.type_hint = Variant::INT;
 		func.instructions.emplace_back(IROpcode::RETURN);
 		expect_rejected(func, "is hinted INT but r1 holds FLOAT");
@@ -418,7 +408,7 @@ void test_type_hints() {
 		func.max_registers = 3;
 		func.instructions.emplace_back(IROpcode::LOAD_IMM, IRValue::reg(1), IRValue::imm(1));
 		func.instructions.emplace_back(IROpcode::LOAD_IMM, IRValue::reg(2), IRValue::imm(2));
-		auto& add = func.instructions.emplace_back(IROpcode::ADD, IRValue::reg(0), IRValue::reg(1), IRValue::reg(2));
+		auto &add = func.instructions.emplace_back(IROpcode::ADD, IRValue::reg(0), IRValue::reg(1), IRValue::reg(2));
 		add.type_hint = Variant::INT;
 		func.instructions.emplace_back(IROpcode::RETURN);
 		ir_verify(func, "a test");
@@ -436,7 +426,7 @@ void test_type_hints() {
 		func.instructions.emplace_back(IROpcode::LOAD_FLOAT_IMM, IRValue::reg(1), IRValue::fimm(1.5));
 		func.instructions.emplace_back(IROpcode::LABEL, IRValue::label(test_strings.intern("skip")));
 		func.instructions.emplace_back(IROpcode::LOAD_IMM, IRValue::reg(2), IRValue::imm(2));
-		auto& add = func.instructions.emplace_back(IROpcode::ADD, IRValue::reg(0), IRValue::reg(1), IRValue::reg(2));
+		auto &add = func.instructions.emplace_back(IROpcode::ADD, IRValue::reg(0), IRValue::reg(1), IRValue::reg(2));
 		add.type_hint = Variant::INT;
 		func.instructions.emplace_back(IROpcode::RETURN);
 		ir_verify(func, "a test");
@@ -445,40 +435,15 @@ void test_type_hints() {
 	std::cout << "  Type hints OK" << std::endl;
 }
 
-void test_verification_toggle() {
-	std::cout << "Testing the verification switch..." << std::endl;
-
+TEST_CASE("verification toggle") {
 	const bool previous = ir_verification_enabled();
 	set_ir_verification_enabled(false);
-	assert(!ir_verification_enabled());
+	REQUIRE(!ir_verification_enabled());
 	set_ir_verification_enabled(true);
-	assert(ir_verification_enabled());
+	REQUIRE(ir_verification_enabled());
 	set_ir_verification_enabled(previous);
 
 	std::cout << "  Switch OK" << std::endl;
 }
 
 } // namespace
-
-int main() {
-	std::cout << "=== IR verifier ===" << std::endl;
-
-	// Every unit test verifies unconditionally, whatever the build type.
-	set_ir_verification_enabled(true);
-
-	test_good_function_verifies();
-	test_arity();
-	test_operand_kinds();
-	test_undefined_register();
-	test_backward_join_definedness();
-	test_labels();
-	test_max_registers();
-	test_call_shape();
-	test_dictionary_pair_count();
-	test_type_hints();
-	test_verification_toggle();
-	test_corpus_verifies();
-
-	std::cout << "All IR verifier tests passed!" << std::endl;
-	return 0;
-}

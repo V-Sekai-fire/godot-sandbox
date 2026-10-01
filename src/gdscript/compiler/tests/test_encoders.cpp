@@ -15,7 +15,7 @@
 #include "../lexer.h"
 #include "../parser.h"
 #include "../riscv_codegen.h"
-#include <cassert>
+#include "witness/doctest.h"
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -25,7 +25,7 @@ using namespace gdscript;
 
 namespace {
 
-std::vector<uint8_t> compile_to_code(const std::string& source, RISCVCodeGen& codegen, bool optimize = true) {
+std::vector<uint8_t> compile_to_code(const std::string &source, RISCVCodeGen &codegen, bool optimize = true) {
 	Lexer lexer(source);
 	Parser parser(lexer.tokenize());
 	Program program = parser.parse();
@@ -38,53 +38,49 @@ std::vector<uint8_t> compile_to_code(const std::string& source, RISCVCodeGen& co
 	return codegen.generate(ir);
 }
 
-uint32_t word_at(const std::vector<uint8_t>& code, size_t offset) {
+uint32_t word_at(const std::vector<uint8_t> &code, size_t offset) {
 	uint32_t word = 0;
 	std::memcpy(&word, code.data() + offset, 4);
 	return word;
 }
 
-void test_range_boundaries() {
-	std::cout << "Testing immediate range boundaries..." << std::endl;
-
+TEST_CASE("range boundaries") {
 	// 12 bits signed is -2048 .. 2047. The old inline checks tested `< 2048`
 	// and forgot `>= -2048`, so the negative boundary is the interesting one.
-	assert(RISCVCodeGen::fits_in_signed(2047, 12));
-	assert(!RISCVCodeGen::fits_in_signed(2048, 12));
-	assert(RISCVCodeGen::fits_in_signed(-2048, 12));
-	assert(!RISCVCodeGen::fits_in_signed(-2049, 12));
-	assert(RISCVCodeGen::fits_in_signed(0, 12));
+	REQUIRE(RISCVCodeGen::fits_in_signed(2047, 12));
+	REQUIRE(!RISCVCodeGen::fits_in_signed(2048, 12));
+	REQUIRE(RISCVCodeGen::fits_in_signed(-2048, 12));
+	REQUIRE(!RISCVCodeGen::fits_in_signed(-2049, 12));
+	REQUIRE(RISCVCodeGen::fits_in_signed(0, 12));
 
 	// 13 bits signed for a branch, 21 for a jump.
-	assert(RISCVCodeGen::fits_in_signed(4094, 13));
-	assert(!RISCVCodeGen::fits_in_signed(4096, 13));
-	assert(RISCVCodeGen::fits_in_signed(1048574, 21));
-	assert(!RISCVCodeGen::fits_in_signed(1048576, 21));
+	REQUIRE(RISCVCodeGen::fits_in_signed(4094, 13));
+	REQUIRE(!RISCVCodeGen::fits_in_signed(4096, 13));
+	REQUIRE(RISCVCodeGen::fits_in_signed(1048574, 21));
+	REQUIRE(!RISCVCodeGen::fits_in_signed(1048576, 21));
 
 	std::cout << "  Boundaries OK" << std::endl;
 }
 
-void expect_rejected(const std::string& what, int64_t value, int bits, bool displacement) {
+void expect_rejected(const std::string &what, int64_t value, int bits, bool displacement) {
 	try {
 		if (displacement) {
 			RISCVCodeGen::check_displacement(what, value, bits);
 		} else {
 			RISCVCodeGen::check_immediate(what, value, bits);
 		}
-	} catch (const CompilerException& e) {
+	} catch (const CompilerException &e) {
 		const std::string message = e.what();
 		// The diagnostic has to name the value, otherwise it does not help
 		// anyone find the instruction that produced it.
-		assert(message.find(std::to_string(value)) != std::string::npos);
+		REQUIRE(message.find(std::to_string(value)) != std::string::npos);
 		return;
 	}
 	std::cerr << "Accepted an out-of-range immediate: " << value << " in " << bits << " bits" << std::endl;
-	assert(false && "out-of-range immediate accepted");
+	FAIL("out-of-range immediate accepted");
 }
 
-void test_out_of_range_is_an_error() {
-	std::cout << "Testing that an out-of-range immediate is an error..." << std::endl;
-
+TEST_CASE("out of range is an error") {
 	// The exact value from the bug: 4776 masked to 680.
 	expect_rejected("I-type", 4776, RISCVCodeGen::I_TYPE_IMM_BITS, false);
 	expect_rejected("I-type", -2049, RISCVCodeGen::I_TYPE_IMM_BITS, false);
@@ -116,7 +112,7 @@ std::string program_with_globals(int count, bool shared) {
 	return source;
 }
 
-std::vector<int64_t> decode_base_offsets(const std::vector<uint8_t>& code, size_t from, size_t limit) {
+std::vector<int64_t> decode_base_offsets(const std::vector<uint8_t> &code, size_t from, size_t limit) {
 	constexpr uint8_t REG_TP = 4;
 	std::vector<int64_t> offsets;
 	int64_t pending_li = 0;
@@ -152,7 +148,7 @@ std::vector<int64_t> decode_base_offsets(const std::vector<uint8_t>& code, size_
 
 // Decode an AUIPC + ADDI pair at `offset` into the address it computes,
 // relative to the address of the AUIPC.
-bool decode_address_pair(const std::vector<uint8_t>& code, size_t offset, int64_t& relative_address) {
+bool decode_address_pair(const std::vector<uint8_t> &code, size_t offset, int64_t &relative_address) {
 	if (offset + 8 > code.size()) {
 		return false;
 	}
@@ -177,19 +173,17 @@ bool decode_address_pair(const std::vector<uint8_t>& code, size_t offset, int64_
 	return true;
 }
 
-void test_global_addressing_does_not_truncate() {
-	std::cout << "Testing global addressing past the 12-bit immediate..." << std::endl;
-
+TEST_CASE("global addressing does not truncate") {
 	// 85 globals is where a 24-byte Variant stride runs out of 12-bit signed
 	// immediate, which is where the original bug started producing wrong code.
 	for (int count : { 4, 85, 86, 200 }) {
 		RISCVCodeGen codegen;
 		const std::vector<uint8_t> code = compile_to_code(program_with_globals(count, true), codegen);
-		assert(!code.empty());
+		REQUIRE(!code.empty());
 
-		const auto& functions = codegen.get_function_offsets();
+		const auto &functions = codegen.get_function_offsets();
 		auto it = functions.find("test");
-		assert(it != functions.end());
+		REQUIRE(it != functions.end());
 
 		// Find the first two global addresses computed in test(). LOAD_GLOBAL
 		// emits an AUIPC + ADDI pair for each.
@@ -202,42 +196,40 @@ void test_global_addressing_does_not_truncate() {
 			}
 		}
 
-		assert(addresses.size() == 2 && "test() should compute two global addresses");
+		REQUIRE((addresses.size() == 2 && "test() should compute two global addresses"));
 		const int64_t stride = codegen.get_layout().variant_size();
 		const int64_t expected = static_cast<int64_t>(count - 1) * stride;
 		const int64_t actual = addresses[1] - addresses[0];
 		if (actual != expected) {
 			std::cerr << "With " << count << " globals: g0 and g" << (count - 1)
-				<< " are " << actual << " bytes apart, expected " << expected << std::endl;
-			assert(false && "global address truncated");
+					  << " are " << actual << " bytes apart, expected " << expected << std::endl;
+			FAIL("global address truncated");
 		}
 	}
 
 	for (int count : { 4, 85, 86, 200 }) {
 		RISCVCodeGen codegen;
 		const std::vector<uint8_t> code = compile_to_code(program_with_globals(count, false), codegen);
-		const auto& functions = codegen.get_function_offsets();
+		const auto &functions = codegen.get_function_offsets();
 		auto it = functions.find("test");
-		assert(it != functions.end());
+		REQUIRE(it != functions.end());
 
 		const std::vector<int64_t> offsets = decode_base_offsets(code, it->second, 2);
-		assert(offsets.size() == 2 && "test() should compute two member addresses");
+		REQUIRE((offsets.size() == 2 && "test() should compute two member addresses"));
 		const int64_t stride = codegen.get_layout().variant_size();
 		const int64_t expected = static_cast<int64_t>(count - 1) * stride;
 		const int64_t actual = offsets[1] - offsets[0];
 		if (actual != expected) {
 			std::cerr << "With " << count << " members: g0 and g" << (count - 1)
-				<< " are " << actual << " bytes apart, expected " << expected << std::endl;
-			assert(false && "member offset truncated");
+					  << " are " << actual << " bytes apart, expected " << expected << std::endl;
+			FAIL("member offset truncated");
 		}
 	}
 
 	std::cout << "  Global addressing OK" << std::endl;
 }
 
-void test_large_frames_still_compile() {
-	std::cout << "Testing a function whose frame is past the 12-bit immediate..." << std::endl;
-
+TEST_CASE("large frames still compile") {
 	// Every local is a Variant slot, so enough of them pushes the stack frame
 	// and the slot offsets past 2047 and onto emit_add_offset's wide path.
 	// Compiled unoptimized on purpose: the point is the wide offsets, and the
@@ -251,11 +243,11 @@ void test_large_frames_still_compile() {
 
 	RISCVCodeGen codegen;
 	const std::vector<uint8_t> code = compile_to_code(source, codegen, /*optimize=*/false);
-	assert(!code.empty());
+	REQUIRE(!code.empty());
 
 	// 300 Variant slots is well past the 2047 an addi can reach, so this
 	// program only encodes at all because the wide path exists.
-	assert(300 * codegen.get_layout().variant_size() > 2047);
+	REQUIRE(300 * codegen.get_layout().variant_size() > 2047);
 
 	std::cout << "  Large frames OK (" << code.size() << " bytes of code)" << std::endl;
 }
@@ -266,9 +258,7 @@ void test_large_frames_still_compile() {
 // "compute sp+2048 into t2, then store t2", writing a stack address into the
 // Variant. A frame over 2047 bytes was enough to hit it, which is around eighty
 // locals.
-void test_wide_stores_keep_their_value() {
-	std::cout << "Testing that a wide store stores the value, not the address..." << std::endl;
-
+TEST_CASE("wide stores keep their value") {
 	// Enough locals that the upper Variant slots are past the 12-bit immediate.
 	std::string source = "func test():\n";
 	for (int i = 0; i < 120; i++) {
@@ -278,8 +268,8 @@ void test_wide_stores_keep_their_value() {
 
 	RISCVCodeGen codegen;
 	const std::vector<uint8_t> code = compile_to_code(source, codegen, /*optimize=*/false);
-	assert(!code.empty());
-	assert(120 * codegen.get_layout().variant_size() > 2047);
+	REQUIRE(!code.empty());
+	REQUIRE(120 * codegen.get_layout().variant_size() > 2047);
 
 	// The address scratch is reserved, so no store may name it as the value it
 	// is storing. That is exactly the shape the bug produced.
@@ -293,11 +283,11 @@ void test_wide_stores_keep_their_value() {
 		const uint8_t rs2 = (instr >> 20) & 0x1F;
 		if (rs2 == RISCVCodeGen::REG_WIDE_SCRATCH) {
 			std::cerr << "A store at offset " << offset << " stores the wide-address register"
-				<< std::endl;
-			assert(false && "a wide store clobbered the value it was storing");
+					  << std::endl;
+			FAIL("a wide store clobbered the value it was storing");
 		}
 	}
-	assert(stores > 0 && "no stores were generated, so this test proves nothing");
+	REQUIRE((stores > 0 && "no stores were generated, so this test proves nothing"));
 
 	std::cout << "  Wide stores OK (" << stores << " stores checked)" << std::endl;
 }
@@ -306,9 +296,7 @@ void test_wide_stores_keep_their_value() {
 // get a masked displacement -- a branch to somewhere else entirely. The encoder
 // now refuses to emit one, and the code generator turns it into an inverted
 // branch over a jump instead, which reaches +-1MB.
-void test_far_branches_are_relaxed() {
-	std::cout << "Testing that a branch too far to encode is relaxed..." << std::endl;
-
+TEST_CASE("far branches are relaxed") {
 	// A loop whose body is thousands of instructions long, so the exit branch
 	// cannot reach the end of the loop.
 	std::string source = "func test():\n\tvar total = 0\n\tvar i = 0\n\twhile i < 3:\n";
@@ -323,7 +311,7 @@ void test_far_branches_are_relaxed() {
 
 	RISCVCodeGen codegen;
 	const std::vector<uint8_t> code = compile_to_code(source, codegen);
-	assert(!code.empty());
+	REQUIRE(!code.empty());
 
 	// Every branch in the result has to be in range: relaxation ran, and ran to
 	// a fixpoint. Decoding the displacement is the check -- a masked one would
@@ -338,36 +326,22 @@ void test_far_branches_are_relaxed() {
 		}
 		branches++;
 		const int32_t imm =
-			(static_cast<int32_t>(instr) >> 31 << 12) |
-			static_cast<int32_t>(((instr >> 7) & 1) << 11) |
-			static_cast<int32_t>(((instr >> 25) & 0x3F) << 5) |
-			static_cast<int32_t>(((instr >> 8) & 0xF) << 1);
-		assert(RISCVCodeGen::fits_in_signed(imm, RISCVCodeGen::B_TYPE_IMM_BITS));
+				(static_cast<int32_t>(instr) >> 31 << 12) |
+				static_cast<int32_t>(((instr >> 7) & 1) << 11) |
+				static_cast<int32_t>(((instr >> 25) & 0x3F) << 5) |
+				static_cast<int32_t>(((instr >> 8) & 0xF) << 1);
+		REQUIRE(RISCVCodeGen::fits_in_signed(imm, RISCVCodeGen::B_TYPE_IMM_BITS));
 
 		// The relaxed form: a branch over the following jump.
 		if (imm == 8 && offset + 8 <= code.size() && (word_at(code, offset + 4) & 0x7F) == 0x6F) {
 			relaxed++;
 		}
 	}
-	assert(branches > 0 && "no branches were generated, so this test proves nothing");
-	assert(relaxed > 0 && "no branch was relaxed, so this test is not exercising relaxation");
+	REQUIRE((branches > 0 && "no branches were generated, so this test proves nothing"));
+	REQUIRE((relaxed > 0 && "no branch was relaxed, so this test is not exercising relaxation"));
 
 	std::cout << "  Far branches OK (" << branches << " branches, " << relaxed
-		<< " relaxed, " << code.size() << " bytes of code)" << std::endl;
+			  << " relaxed, " << code.size() << " bytes of code)" << std::endl;
 }
 
 } // namespace
-
-int main() {
-	std::cout << "=== Instruction encoding limits ===" << std::endl;
-
-	test_range_boundaries();
-	test_out_of_range_is_an_error();
-	test_global_addressing_does_not_truncate();
-	test_large_frames_still_compile();
-	test_wide_stores_keep_their_value();
-	test_far_branches_are_relaxed();
-
-	std::cout << "All encoder tests passed!" << std::endl;
-	return 0;
-}
