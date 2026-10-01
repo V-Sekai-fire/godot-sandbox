@@ -4369,6 +4369,7 @@ void Sandbox::initialize_syscalls() {
 
 	// Add system calls from other modules.
 	Sandbox::initialize_syscalls_2d();
+	Sandbox::initialize_syscalls_packed();
 	Sandbox::initialize_syscalls_3d();
 
 	using namespace riscv;
