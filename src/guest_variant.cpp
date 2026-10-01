@@ -96,6 +96,13 @@ void BorrowedVariant::borrow_uncommon(const Sandbox &emu, const GuestVariant &gv
 		m_ptr = (const Variant *)m_storage;
 		return;
 	}
+	if (!gv.is_scoped_variant()) {
+		// Inline in the guest, but in real_t: a double build has no fast layout for it.
+		new (m_storage) Variant(gv.toVariant(emu));
+		m_constructed = true;
+		m_ptr = (const Variant *)m_storage;
+		return;
+	}
 	m_ptr = gv.toVariantPtr(emu);
 }
 
@@ -276,6 +283,11 @@ void GuestVariant::create(Sandbox &emu, Variant &&value) {
 		}
 
 		default: {
+			if (!this->is_scoped_variant()) {
+				// Inline in the guest; set_inlined() only handles it when real_t is float.
+				this->set(emu, value, true);
+				return;
+			}
 			// Store the variant in the current state
 			unsigned int idx = emu.create_scoped_variant(std::move(value));
 			this->v.i = idx;
