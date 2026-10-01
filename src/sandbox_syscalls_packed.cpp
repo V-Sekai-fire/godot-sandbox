@@ -1,12 +1,14 @@
 // ECALL_PACKED_ACQUIRE and ECALL_PACKED_RELEASE (syscalls.h), after JNI's
-// Get<Type>ArrayElements / Release<Type>ArrayElements. handle_exception() stores
-// and frees the copies a region it unwound left behind.
+// Get<Type>ArrayElements / Release<Type>ArrayElements. handle_exception() and the
+// end of a call store and free the copies a region left behind.
 #include "guest_datatypes.h"
 #include "syscalls.h"
 
 #include <godot_cpp/variant/variant.hpp>
 #include <cstring>
+#include <optional>
 #include <random>
+#include <string_view>
 #include <tuple>
 #include "syscalls_helpers.hpp"
 
@@ -63,12 +65,15 @@ template <typename Packed, typename Element>
 int64_t acquire_typed(machine_t &machine, void *storage, gaddr_t desc, int64_t expected, PackedDescriptor &out) {
 	const Packed &array = *reinterpret_cast<const Packed *>(storage);
 	const int64_t size = array.size();
-	if (expected >= 0 && size > expected * ELEMENTS_PER_ACCESS) {
+	// size > expected * ELEMENTS_PER_ACCESS, without overflowing on a guest's expected.
+	if (expected >= 0 && expected < (size + ELEMENTS_PER_ACCESS - 1) / ELEMENTS_PER_ACCESS) {
 		return 1;
 	}
 	if (size > MAX_PACKED_ELEMENTS || !machine.has_arena()) {
 		return 3;
 	}
+	// Before anything is allocated, so a descriptor the guest cannot write leaks no copy.
+	machine.memory.writable_memview(desc, sizeof(PackedDescriptor), sizeof(PackedDescriptor));
 	const size_t bytes = size_t(size) * sizeof(Element);
 	gaddr_t data = 0;
 	if (bytes > 0) {
@@ -88,14 +93,20 @@ void release_typed(machine_t &machine, void *storage, const PackedDescriptor &de
 	if (descriptor.size > uint64_t(MAX_PACKED_ELEMENTS)) {
 		throw std::runtime_error("PackedArray release: too many elements");
 	}
+	const size_t bytes = size_t(descriptor.size) * sizeof(Element);
+	// Checked before the array is touched: a copy the guest cannot supply leaves it as it was.
+	const std::string_view source = machine.memory.memview(descriptor.data, bytes, bytes);
 	Packed &array = *reinterpret_cast<Packed *>(storage);
 	if (uint64_t(array.size()) != descriptor.size) {
 		array.resize(int64_t(descriptor.size));
+		if (uint64_t(array.size()) != descriptor.size) {
+			throw std::runtime_error("PackedArray release: the array could not be resized");
+		}
 	}
-	if (descriptor.size > 0) {
+	if (bytes > 0) {
 		// ptrw() on the shared storage: the engine's copy-on-write applies exactly
 		// as it does for a single element set.
-		machine.memory.memcpy_out(array.ptrw(), descriptor.data, size_t(descriptor.size) * sizeof(Element));
+		std::memcpy(array.ptrw(), source.data(), bytes);
 	}
 }
 
@@ -109,6 +120,18 @@ void release_typed(machine_t &machine, void *storage, const PackedDescriptor &de
 	X(Variant::PACKED_VECTOR3_ARRAY, PackedVector3Array, Vector3)  \
 	X(Variant::PACKED_VECTOR4_ARRAY, PackedVector4Array, Vector4)  \
 	X(Variant::PACKED_COLOR_ARRAY, PackedColorArray, Color)
+
+void free_copy(machine_t &machine, gaddr_t copy) {
+	if (copy != 0 && machine.has_arena()) {
+		machine.arena().free(copy);
+	}
+}
+
+// The Packed*Array of `type` a scoped index holds now, or null.
+void *packed_storage_at(const Sandbox &emu, int32_t index, int type) {
+	const std::optional<const Variant *> var = emu.get_scoped_variant(index);
+	return var.has_value() && var.value() != nullptr ? packed_storage(*var.value(), type) : nullptr;
+}
 
 // Write a dirty copy into `storage`, the array of `type` it was taken from.
 void store_typed(machine_t &machine, void *storage, int type, const PackedDescriptor &descriptor) {
@@ -162,8 +185,8 @@ APICALL(api_packed_acquire) {
 			break;
 	}
 	if (status == 0) {
-		emu.packed_acquired(Sandbox::PackedAcquisition{ &emu.state(), storage, type, desc,
-				gaddr_t(descriptor.data), descriptor.size, written });
+		emu.packed_acquired(Sandbox::PackedAcquisition{ &emu.state(), int32_t(g_subject->v.i), type,
+				descriptor.identity, desc, gaddr_t(descriptor.data), descriptor.size, written });
 	}
 	machine.set_result(status);
 }
@@ -180,21 +203,24 @@ APICALL(api_packed_release) {
 	SYS_TRACE("packed_release", g_subject, type, desc);
 
 	// Forgotten first: if the store below throws, handle_exception() must not try
-	// it a second time.
-	emu.packed_released(desc);
+	// it a second time. Only the copy acquired here is freed, never an address the guest names.
+	const gaddr_t copy = emu.packed_released(desc);
 	PackedDescriptor descriptor;
 	machine.memory.memcpy_out(&descriptor, desc, sizeof(descriptor));
 	if (written || descriptor.dirty != 0) {
-		const Variant *var = int(g_subject->type) == type ? g_subject->toVariantPtr(emu) : nullptr;
-		void *storage = var != nullptr ? packed_storage(*var, type) : nullptr;
-		if (storage == nullptr) {
-			throw std::runtime_error("PackedArray release: the Variant is no longer that Packed*Array");
+		try {
+			const Variant *var = int(g_subject->type) == type ? g_subject->toVariantPtr(emu) : nullptr;
+			void *storage = var != nullptr ? packed_storage(*var, type) : nullptr;
+			if (storage == nullptr) {
+				throw std::runtime_error("PackedArray release: the Variant is no longer that Packed*Array");
+			}
+			store_typed(machine, storage, type, descriptor);
+		} catch (...) {
+			free_copy(machine, copy);
+			throw;
 		}
-		store_typed(machine, storage, type, descriptor);
 	}
-	if (descriptor.data != 0 && machine.has_arena()) {
-		machine.arena().free(descriptor.data);
-	}
+	free_copy(machine, copy);
 	const PackedDescriptor cleared{ 0, 0, descriptor.identity, 0 };
 	machine.memory.memcpy(desc, &cleared, sizeof(cleared));
 	machine.set_result(0);
@@ -216,47 +242,57 @@ void Sandbox::packed_acquired(const PackedAcquisition &acquisition) {
 	m_packed_acquisitions.push_back(acquisition);
 }
 
-void Sandbox::packed_released(gaddr_t descriptor) {
+gaddr_t Sandbox::packed_released(gaddr_t descriptor) {
 	for (std::vector<PackedAcquisition>::iterator it = m_packed_acquisitions.begin(); it != m_packed_acquisitions.end(); ++it) {
 		if (it->descriptor == descriptor) {
+			const gaddr_t data = it->data;
 			m_packed_acquisitions.erase(it);
-			return;
+			return data;
 		}
 	}
+	return 0;
 }
 
-void Sandbox::commit_packed_acquisitions() {
+void Sandbox::commit_packed_acquisitions() noexcept {
 	if (m_packed_acquisitions.empty()) {
 		return;
 	}
-	// This call level and deeper: the regions of calls still running stay.
-	std::vector<PackedAcquisition> unwound;
-	for (std::vector<PackedAcquisition>::iterator it = m_packed_acquisitions.begin(); it != m_packed_acquisitions.end();) {
-		if (it->level >= m_current_state) {
-			unwound.push_back(*it);
-			it = m_packed_acquisitions.erase(it);
-		} else {
-			++it;
-		}
-	}
-	for (std::vector<PackedAcquisition>::reverse_iterator it = unwound.rbegin(); it != unwound.rend(); ++it) {
-		try {
-			riscv::PackedDescriptor descriptor;
-			machine().memory.memcpy_out(&descriptor, it->descriptor, sizeof(descriptor));
-			// The descriptor still describes this copy unless the guest overwrote it.
-			if (descriptor.data == it->data && descriptor.size == it->size &&
-					(it->written || descriptor.dirty != 0)) {
-				riscv::store_typed(machine(), it->storage, it->type, descriptor);
+	try {
+		// This call level and deeper: the regions of calls still running stay.
+		std::vector<PackedAcquisition> unwound;
+		for (std::vector<PackedAcquisition>::iterator it = m_packed_acquisitions.begin(); it != m_packed_acquisitions.end();) {
+			if (it->level >= m_current_state) {
+				unwound.push_back(*it);
+				it = m_packed_acquisitions.erase(it);
+			} else {
+				++it;
 			}
-		} catch (const std::exception &e) {
-			ERR_PRINT(("PackedArray: could not store a region unwound by an exception: " + std::string(e.what())).c_str());
 		}
-		if (it->data != 0 && machine().has_arena()) {
+		for (std::vector<PackedAcquisition>::reverse_iterator it = unwound.rbegin(); it != unwound.rend(); ++it) {
 			try {
-				machine().arena().free(it->data);
+				riscv::PackedDescriptor descriptor;
+				machine().memory.memcpy_out(&descriptor, it->descriptor, sizeof(descriptor));
+				// The descriptor still describes this copy unless the guest overwrote it.
+				if (descriptor.data == it->data && descriptor.size == it->size &&
+						(it->written || descriptor.dirty != 0)) {
+					// Resolved again: the guest may have replaced or freed that Variant since.
+					void *storage = it->level == m_current_state ? riscv::packed_storage_at(*this, it->index, it->type) : nullptr;
+					if (storage == nullptr || riscv::packed_identity(storage) != it->identity) {
+						ERR_PRINT("PackedArray: a region's array was replaced before the region ended; its writes are dropped");
+					} else {
+						riscv::store_typed(machine(), storage, it->type, descriptor);
+					}
+				}
+			} catch (const std::exception &e) {
+				ERR_PRINT(("PackedArray: could not store a region unwound by an exception: " + std::string(e.what())).c_str());
+			}
+			try {
+				riscv::free_copy(machine(), it->data);
 			} catch (const std::exception &) {
 			}
 		}
+	} catch (...) {
+		ERR_PRINT("PackedArray: could not end a region's copies");
 	}
 }
 
