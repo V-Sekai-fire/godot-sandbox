@@ -1,0 +1,72 @@
+name: fuzz repro
+
+on:
+  push:
+    branches: [fix/fuzz-repro]
+
+jobs:
+  asan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-14-riscv64-linux-gnu g++-14-riscv64-linux-gnu cmake ninja-build
+      - name: Godot
+        working-directory: tests
+        run: |
+          wget -q https://github.com/godotengine/godot/releases/download/4.6.3-stable/Godot_v4.6.3-stable_linux.x86_64.zip
+          unzip -q Godot_v4.6.3-stable_linux.x86_64.zip
+      - name: Test program
+        working-directory: tests
+        env:
+          CXX: riscv64-linux-gnu-g++-14
+        run: |
+          mkdir -p .build && cd .build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake -DSTRIPPED=OFF -DFLTO=ON
+          make -j4
+          cd .. && ln -fs ../.build/unittests tests/tests.elf
+      - name: Address-sanitized addon
+        run: |
+          cmake -S . -B .build_asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DASAN=ON
+          cmake --build .build_asan -j"$(nproc)"
+          cc -shared -fPIC -O2 -o .build_asan/fuzz_no_deepbind.so tests/fuzz_no_deepbind.c -ldl
+          ln -fs "$PWD/.build_asan/libgodot-riscv.so" tests/extensions/bin/libgodot-riscv.linux.release.x86_64.so
+          ln -fs "$PWD/.build_asan/libgodot-riscv.so" tests/extensions/bin/libgodot-riscv.linux.debug.x86_64.so
+      - name: Soak fixed seeds under ASAN
+        working-directory: tests
+        run: |
+          export LD_PRELOAD="$GITHUB_WORKSPACE/.build_asan/fuzz_no_deepbind.so $(c++ -print-file-name=libasan.so) $(c++ -print-file-name=libstdc++.so)"
+          export ASAN_OPTIONS="detect_leaks=0:detect_odr_violation=0:abort_on_error=0:print_stacktrace=1:verify_asan_link_order=0"
+          ./Godot_v4.6.3-stable_linux.x86_64 --path . --headless --import > import.log 2>&1 || true
+          mkdir -p logs
+          found=0
+          for i in $(seq 1 10); do
+            seed=$(( ${{ matrix.shard }} * 1000 + i ))
+            log=logs/seed-$seed.log
+            set +e
+            timeout 600 ./Godot_v4.6.3-stable_linux.x86_64 --path . --headless -s fuzz_soak.gd -- --iterations=200000 --seed=$seed > "$log" 2>&1
+            code=$?
+            set -e
+            echo "seed $seed exit $code"
+            if [ $code -ne 0 ] || grep -q -E 'AddressSanitizer|runtime error|Aborted' "$log"; then
+              found=1
+              echo "::group::seed $seed"
+              grep -n -A60 -E '==[0-9]+==ERROR|runtime error|Aborted' "$log" | head -150
+              echo "::endgroup::"
+            fi
+          done
+          exit $found
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-logs-${{ matrix.shard }}
+          path: tests/logs/
