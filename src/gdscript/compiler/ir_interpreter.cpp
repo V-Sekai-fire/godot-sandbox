@@ -569,6 +569,12 @@ void IRInterpreter::execute_instruction(const IRFunction& func, const IRInstruct
 		case IROpcode::MAKE_SCOPED:
 		case IROpcode::BATCH_GET:
 		case IROpcode::CODEPOINT_GET:
+		case IROpcode::PACKED_GET:
+		case IROpcode::PACKED_SET:
+		case IROpcode::PACKED_SIZE:
+		case IROpcode::PACKED_DATA:
+		case IROpcode::PACKED_IDENTITY:
+		case IROpcode::PACKED_INDEX:
 		case IROpcode::GET_NODE:
 		case IROpcode::LOAD_RESOURCE:
 		case IROpcode::LOAD_RESOURCE_VAR:

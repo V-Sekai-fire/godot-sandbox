@@ -24,7 +24,7 @@ struct Phases {
 
 	double total() const { return lex + parse + codegen + optimize + elf; }
 
-	void min_with(const Phases& other) {
+	void min_with(const Phases &other) {
 		lex = std::min(lex, other.lex);
 		parse = std::min(parse, other.parse);
 		codegen = std::min(codegen, other.codegen);
@@ -37,7 +37,7 @@ double elapsed_ms(Clock::time_point from, Clock::time_point to) {
 	return std::chrono::duration<double, std::milli>(to - from).count();
 }
 
-Phases run_once(const std::string& source, bool optimize, bool output_elf, size_t& elf_size) {
+Phases run_once(const std::string &source, bool optimize, bool output_elf, size_t &elf_size) {
 	Phases phases;
 
 	auto t0 = Clock::now();
@@ -63,7 +63,7 @@ Phases run_once(const std::string& source, bool optimize, bool output_elf, size_
 	if (output_elf) {
 		ElfBuilder elf_builder;
 		auto elf = elf_builder.build(ir_program, VariantLayout(native_variant_layout().double_precision),
-			false, ProfilingClock::TIME, false, {});
+									 false, ProfilingClock::TIME, false, {});
 		elf_size = elf.size();
 	}
 	auto t5 = Clock::now();
@@ -76,13 +76,13 @@ Phases run_once(const std::string& source, bool optimize, bool output_elf, size_
 	return phases;
 }
 
-void report(const char* label, double ms, double total) {
+void report(const char *label, double ms, double total) {
 	std::printf("| %-12s | %8.2f | %4.0f%% |\n", label, ms, total > 0 ? 100.0 * ms / total : 0.0);
 }
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
 	int repetitions = 3;
 	bool optimize = true;
 	bool output_elf = true;
@@ -107,8 +107,8 @@ int main(int argc, char** argv) {
 		buffer << std::cin.rdbuf();
 		inputs.emplace_back("<stdin>", buffer.str());
 	} else {
-		for (const auto& path : paths) {
-			FILE* file = std::fopen(path.c_str(), "rb");
+		for (const auto &path : paths) {
+			FILE *file = std::fopen(path.c_str(), "rb");
 			if (!file) {
 				std::cerr << "Failed to open " << path << std::endl;
 				return 1;
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	for (const auto& input : inputs) {
+	for (const auto &input : inputs) {
 		size_t elf_size = 0;
 		Phases best;
 		try {
@@ -132,13 +132,13 @@ int main(int argc, char** argv) {
 			for (int i = 1; i < repetitions; i++) {
 				best.min_with(run_once(input.second, optimize, output_elf, elf_size));
 			}
-		} catch (const std::exception& e) {
+		} catch (const std::exception &e) {
 			std::cerr << input.first << ": " << e.what() << std::endl;
 			return 1;
 		}
 
 		std::printf("%s (%zu bytes source, %zu bytes ELF, best of %d)\n",
-			input.first.c_str(), input.second.size(), elf_size, repetitions);
+					input.first.c_str(), input.second.size(), elf_size, repetitions);
 		std::printf("| phase        |       ms | share |\n");
 		std::printf("| ------------ | -------- | ----- |\n");
 		report("lex", best.lex, best.total());

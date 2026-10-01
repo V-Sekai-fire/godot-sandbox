@@ -1,11 +1,11 @@
+#include "../codegen.h"
 #include "../compiler.h"
+#include "../ir.h"
 #include "../lexer.h"
 #include "../parser.h"
-#include "../codegen.h"
-#include "../riscv_codegen.h"
 #include "../register_allocator.h"
-#include "../ir.h"
-#include <cassert>
+#include "../riscv_codegen.h"
+#include "witness/doctest.h"
 #include <iostream>
 #include <vector>
 
@@ -14,12 +14,12 @@ using namespace gdscript;
 // Helper to compile and get register allocation info
 struct CompilationResult {
 	IRFunction ir_func;
-	const RegisterAllocator* allocator;
+	const RegisterAllocator *allocator;
 	int spilled_count = 0;
 	int max_registers = 0;
 };
 
-CompilationResult compile_with_register_info(const std::string& source, const std::string& function_name = "main") {
+CompilationResult compile_with_register_info(const std::string &source, const std::string &function_name = "main") {
 	// Compile to IR
 	Lexer lexer(source);
 	Parser parser(lexer.tokenize());
@@ -28,14 +28,14 @@ CompilationResult compile_with_register_info(const std::string& source, const st
 	IRProgram ir_program = codegen.generate(program);
 
 	// Find the function
-	IRFunction* ir_func = nullptr;
-	for (auto& func : ir_program.functions) {
+	IRFunction *ir_func = nullptr;
+	for (auto &func : ir_program.functions) {
 		if (func.name == function_name) {
 			ir_func = &func;
 			break;
 		}
 	}
-	assert(ir_func != nullptr && "Function not found");
+	REQUIRE((ir_func != nullptr && "Function not found"));
 
 	// Generate RISC-V code (this runs register allocation)
 	// Use the public generate() method which calls gen_function internally
@@ -44,13 +44,13 @@ CompilationResult compile_with_register_info(const std::string& source, const st
 
 	// Get register allocator state
 	// Note: The allocator processes each function, so we get the state after all functions
-	const RegisterAllocator& allocator = riscv_gen.get_allocator();
+	const RegisterAllocator &allocator = riscv_gen.get_allocator();
 
 	CompilationResult result;
 	result.ir_func = *ir_func;
 	result.allocator = &allocator;
 	result.max_registers = ir_func->max_registers;
-	
+
 	// Count spilled registers by checking how many vregs have stack offsets
 	// For each virtual register, check if it's spilled
 	// Note: This checks the final state after all functions are processed
@@ -59,13 +59,11 @@ CompilationResult compile_with_register_info(const std::string& source, const st
 			result.spilled_count++;
 		}
 	}
-	
+
 	return result;
 }
 
-void test_basic_compilation() {
-	std::cout << "Testing basic compilation..." << std::endl;
-
+TEST_CASE("basic compilation") {
 	std::string source = R"(
 func add(x, y):
 	return x + y
@@ -76,14 +74,10 @@ func add(x, y):
 	options.output_elf = true;
 
 	std::vector<uint8_t> elf_data = compiler.compile(source, options);
-	assert(!elf_data.empty());
-
-	std::cout << "  ✓ Basic compilation passed" << std::endl;
+	REQUIRE(!elf_data.empty());
 }
 
-void test_many_variables_no_spill() {
-	std::cout << "Testing register allocation with 15 variables..." << std::endl;
-
+TEST_CASE("many variables no spill") {
 	std::string source = R"(
 func many_variables():
 	var a = 1
@@ -105,28 +99,20 @@ func many_variables():
 )";
 
 	CompilationResult result = compile_with_register_info(source, "many_variables");
-	assert(result.max_registers > 0);
-	
-	std::cout << "  ✓ Many variables test passed" << std::endl;
+	REQUIRE(result.max_registers > 0);
 }
 
-void test_complex_expression_no_unnecessary_spill() {
-	std::cout << "Testing register allocation with complex expressions..." << std::endl;
-
+TEST_CASE("complex expression no unnecessary spill") {
 	std::string source = R"(
 func complex_expr(x, y, z):
 	return (x + y) * (y + z) * (z + x) + (x * y) + (y * z) + (z * x)
 )";
 
 	CompilationResult result = compile_with_register_info(source, "complex_expr");
-	assert(result.max_registers > 0);
-	
-	std::cout << "  ✓ Complex expression test passed" << std::endl;
+	REQUIRE(result.max_registers > 0);
 }
 
-void test_arithmetic_operations_compilation() {
-	std::cout << "Testing compilation with arithmetic operations..." << std::endl;
-
+TEST_CASE("arithmetic operations compilation") {
 	std::string source = R"(
 func arithmetic(a, b, c):
 	var sum = a + b
@@ -142,14 +128,10 @@ func arithmetic(a, b, c):
 	options.output_elf = true;
 
 	std::vector<uint8_t> elf_data = compiler.compile(source, options);
-	assert(!elf_data.empty());
-
-	std::cout << "  ✓ Arithmetic operations compilation passed" << std::endl;
+	REQUIRE(!elf_data.empty());
 }
 
-void test_nested_expressions_compilation() {
-	std::cout << "Testing compilation with nested expressions..." << std::endl;
-
+TEST_CASE("nested expressions compilation") {
 	std::string source = R"(
 func nested(x, y, z):
 	var a = (x + y) * (y + z)
@@ -163,14 +145,10 @@ func nested(x, y, z):
 	options.output_elf = true;
 
 	std::vector<uint8_t> elf_data = compiler.compile(source, options);
-	assert(!elf_data.empty());
-
-	std::cout << "  ✓ Nested expressions compilation passed" << std::endl;
+	REQUIRE(!elf_data.empty());
 }
 
-void test_loop_compilation() {
-	std::cout << "Testing compilation with loops..." << std::endl;
-
+TEST_CASE("loop compilation") {
 	std::string source = R"(
 func sum_to_n(n):
 	var total = 0
@@ -186,14 +164,10 @@ func sum_to_n(n):
 	options.output_elf = true;
 
 	std::vector<uint8_t> elf_data = compiler.compile(source, options);
-	assert(!elf_data.empty());
-
-	std::cout << "  ✓ Loop compilation passed" << std::endl;
+	REQUIRE(!elf_data.empty());
 }
 
-void test_conditional_compilation() {
-	std::cout << "Testing compilation with conditionals..." << std::endl;
-
+TEST_CASE("conditional compilation") {
 	std::string source = R"(
 func max(a, b):
 	if a > b:
@@ -207,14 +181,10 @@ func max(a, b):
 	options.output_elf = true;
 
 	std::vector<uint8_t> elf_data = compiler.compile(source, options);
-	assert(!elf_data.empty());
-
-	std::cout << "  ✓ Conditional compilation passed" << std::endl;
+	REQUIRE(!elf_data.empty());
 }
 
-void test_compilation_errors() {
-	std::cout << "Testing compilation error handling..." << std::endl;
-
+TEST_CASE("compilation errors") {
 	std::string invalid_source = R"(
 func broken():
 	return +  // Syntax error
@@ -226,13 +196,9 @@ func broken():
 
 	compiler.compile(invalid_source, options);
 	std::string error = compiler.get_error();
-	
-	std::cout << "  ✓ Compilation error handling passed" << std::endl;
 }
 
-void test_register_allocation_no_unnecessary_spills() {
-	std::cout << "Testing register allocation avoids unnecessary spills..." << std::endl;
-
+TEST_CASE("register allocation no unnecessary spills") {
 	std::string source = R"(
 func test_15_vars():
 	var v0 = 0
@@ -254,14 +220,10 @@ func test_15_vars():
 )";
 
 	CompilationResult result = compile_with_register_info(source, "test_15_vars");
-	assert(result.max_registers > 0);
-	
-	std::cout << "  ✓ Register allocation avoids unnecessary spills" << std::endl;
+	REQUIRE(result.max_registers > 0);
 }
 
-void test_register_allocation_minimal_spilling() {
-	std::cout << "Testing codegen handles many variables correctly..." << std::endl;
-
+TEST_CASE("register allocation minimal spilling") {
 	std::string source = R"(
 func test_25_vars():
 	var v0 = 0
@@ -297,14 +259,10 @@ func test_25_vars():
 	// In current implementation, all Variants are stack-allocated
 	// The codegen should successfully handle any number of variables
 	const int VARIABLES = 25;
-	assert(result.max_registers >= VARIABLES && "Should allocate at least stack slots for all variables");
-
-	std::cout << "  ✓ Codegen handles many variables correctly" << std::endl;
+	REQUIRE((result.max_registers >= VARIABLES && "Should allocate at least stack slots for all variables"));
 }
 
-void test_register_allocation_never_exceeds_limit() {
-	std::cout << "Testing codegen handles variable counts correctly..." << std::endl;
-
+TEST_CASE("register allocation never exceeds limit") {
 	std::string source_18 = R"(
 func test_exactly_18():
 	var v0 = 0
@@ -357,50 +315,39 @@ func test_19_vars():
 	CompilationResult result_19 = compile_with_register_info(source_19, "test_19_vars");
 
 	// In current implementation, all Variants are stack-allocated
-	assert(result_18.max_registers >= 18 && "Should allocate at least enough stack slots");
-	assert(result_19.max_registers >= 19 && "Should allocate at least enough stack slots");
-
-	std::cout << "  ✓ Codegen handles variable counts correctly" << std::endl;
+	REQUIRE((result_18.max_registers >= 18 && "Should allocate at least enough stack slots"));
+	REQUIRE((result_19.max_registers >= 19 && "Should allocate at least enough stack slots"));
 }
 
-void test_edge_case_empty_function() {
-	std::cout << "Testing edge case: empty function..." << std::endl;
-
+TEST_CASE("edge case empty function") {
 	std::string source = R"(
 func empty():
 	pass
 )";
 
 	CompilationResult result = compile_with_register_info(source, "empty");
-	assert(result.max_registers == 0 || result.max_registers <= 1);
-	
-	std::cout << "  ✓ Empty function handled correctly" << std::endl;
+	REQUIRE((result.max_registers == 0 || result.max_registers <= 1));
 }
 
-void test_edge_case_only_parameters() {
-	std::cout << "Testing edge case: function with only parameters..." << std::endl;
-
+TEST_CASE("edge case only parameters") {
 	std::string source = R"(
 func only_params(x, y, z):
 	return x + y + z
 )";
 
 	CompilationResult result = compile_with_register_info(source, "only_params");
-	assert(result.max_registers > 0);
-	
-	std::cout << "  ✓ Parameters handled correctly" << std::endl;
+	REQUIRE(result.max_registers > 0);
 }
 
-void test_edge_case_many_variables_stress() {
-	std::cout << "Testing edge case: very large number of variables (stress test)..." << std::endl;
-
+TEST_CASE("edge case many variables stress") {
 	std::string source = "func stress_test():\n";
 	for (int i = 0; i < 50; i++) {
 		source += "	var v" + std::to_string(i) + " = " + std::to_string(i) + "\n";
 	}
 	source += "	return ";
 	for (int i = 0; i < 50; i++) {
-		if (i > 0) source += " + ";
+		if (i > 0)
+			source += " + ";
 		source += "v" + std::to_string(i);
 	}
 	source += "\n";
@@ -410,14 +357,10 @@ void test_edge_case_many_variables_stress() {
 	const int VARIABLES = 50;
 	// In current implementation, all Variants are stack-allocated
 	// Should handle any number of variables (limited only by stack size)
-	assert(result.max_registers >= VARIABLES && "Should allocate at least stack slots for all variables");
-
-	std::cout << "  ✓ Stress test passed" << std::endl;
+	REQUIRE((result.max_registers >= VARIABLES && "Should allocate at least stack slots for all variables"));
 }
 
-void test_edge_case_overlapping_live_ranges() {
-	std::cout << "Testing edge case: overlapping live ranges..." << std::endl;
-
+TEST_CASE("edge case overlapping live ranges") {
 	std::string source = R"(
 func overlapping():
 	var a = 1
@@ -430,51 +373,16 @@ func overlapping():
 )";
 
 	CompilationResult result = compile_with_register_info(source, "overlapping");
-	assert(result.max_registers > 0);
-	
-	std::cout << "  ✓ Overlapping live ranges handled correctly" << std::endl;
+	REQUIRE(result.max_registers > 0);
 }
 
-void test_fixed_register_reservation() {
+TEST_CASE("fixed register reservation") {
 	IRFunction func;
 	RegisterAllocator allocator;
 	allocator.init(func);
 	allocator.reserve_register(9); // s1
-	assert(!allocator.is_register_available(9));
+	REQUIRE(!allocator.is_register_available(9));
 	for (int vreg = 0; vreg < 17; vreg++) {
-		assert(allocator.allocate_register(vreg, 0) != 9);
-	}
-}
-
-
-int main() {
-	std::cout << "\n=== Running Compilation Tests ===" << std::endl;
-	std::cout << "These tests verify the full compilation pipeline and register allocation\n" << std::endl;
-
-	try {
-		test_basic_compilation();
-		test_many_variables_no_spill();
-		test_complex_expression_no_unnecessary_spill();
-		test_register_allocation_no_unnecessary_spills();
-		test_register_allocation_minimal_spilling();
-		test_register_allocation_never_exceeds_limit();
-		
-		test_edge_case_empty_function();
-		test_edge_case_only_parameters();
-		test_edge_case_many_variables_stress();
-		test_edge_case_overlapping_live_ranges();
-		test_fixed_register_reservation();
-		
-		test_arithmetic_operations_compilation();
-		test_nested_expressions_compilation();
-		test_loop_compilation();
-		test_conditional_compilation();
-		test_compilation_errors();
-
-		std::cout << "\n✅ All compilation tests passed!" << std::endl;
-		return 0;
-	} catch (const std::exception& e) {
-		std::cerr << "\n❌ Test failed: " << e.what() << std::endl;
-		return 1;
+		REQUIRE(allocator.allocate_register(vreg, 0) != 9);
 	}
 }

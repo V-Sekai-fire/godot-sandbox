@@ -1,6 +1,9 @@
 #include "parser.h"
 #include "compiler_exception.h"
 #include "globals.h"
+#include <algorithm>
+#include <cctype>
+#include <functional>
 #include <stdexcept>
 #include <sstream>
 #include <cmath>
@@ -209,6 +212,10 @@ Program Parser::parse() {
 			saw_declaration = true;
 		} else if (check(TokenType::CLASS)) {
 			program.structs.push_back(parse_class());
+			for (StructDecl& nested : m_nested_classes) {
+				program.structs.push_back(std::move(nested));
+			}
+			m_nested_classes.clear();
 			saw_declaration = true;
 		} else if (check(TokenType::ENUM)) {
 			program.enums.push_back(parse_enum());
@@ -245,6 +252,15 @@ Program Parser::parse() {
 			function.is_static = is_static;
 			program.functions.push_back(std::move(function));
 			saw_declaration = true;
+		} else if (check(TokenType::STRING) && (peek_ahead(1).type == TokenType::NEWLINE ||
+				peek_ahead(1).type == TokenType::EOF_TOKEN)) {
+			// A bare string at file level is a block comment, as GDScript reads it.
+			advance();
+			consume_statement_end("Expected newline after the string");
+		} else if (check(TokenType::PASS)) {
+			// `pass` is a statement in a class body too, as GDScript reads it.
+			advance();
+			consume_statement_end("Expected newline after 'pass'");
 		} else {
 			error("Expected function or variable declaration");
 			synchronize();
@@ -762,6 +778,12 @@ StructDecl Parser::parse_class() {
 			continue;
 		}
 
+		// A nested class is hoisted to file scope under its own name; the outer body refers to it bare.
+		if (check(TokenType::CLASS)) {
+			m_nested_classes.push_back(parse_class());
+			continue;
+		}
+
 		bool is_static = match(TokenType::STATIC);
 
 		if (check(TokenType::AT)) {
@@ -841,12 +863,46 @@ StructDecl Parser::parse_class() {
 
 		const Token& field_name = consume(TokenType::IDENTIFIER, "Expected a field name");
 		field.name = field_name.lexeme;
-		field.type_hint = parse_type_hint();
+		// ':' is a type hint, or opens accessors directly on an untyped `var x:`.
+		bool accessors_follow = false;
+		if (match(TokenType::COLON)) {
+			if (at_property_accessor() || check(TokenType::NEWLINE)) {
+				accessors_follow = true;
+			} else if (check(TokenType::IDENTIFIER) || check(TokenType::NULL_VAL)) {
+				field.type_hint = parse_type_expr();
+			}
+		}
 
-		if (match(TokenType::ASSIGN)) {
+		if (!accessors_follow && match(TokenType::ASSIGN)) {
 			field.default_value = parse_expression();
 		}
-		consume_statement_end("Expected newline after the field declaration");
+		// `var x: T:` + `get:` lifts the getter to the method `@x_getter`; reads call it.
+		if (accessors_follow || match(TokenType::COLON)) {
+			VarDeclStmt accessors(field.name);
+			parse_property_accessors(accessors);
+			if (accessors.setter_body || !accessors.setter_name.empty()) {
+				error("A class field setter is not supported yet", field.line, field.column);
+			}
+			if (accessors.getter_body) {
+				accessors.getter_body->name = "@" + field.name + "_getter";
+				decl.methods.push_back(std::move(*accessors.getter_body));
+			} else if (!accessors.getter_name.empty()) {
+				FunctionDecl getter;
+				getter.name = "@" + field.name + "_getter";
+				getter.line = field.line;
+				getter.column = field.column;
+				std::unique_ptr<CallExpr> call = std::make_unique<CallExpr>(accessors.getter_name, std::vector<ExprPtr>{});
+				call->line = field.line;
+				call->column = field.column;
+				std::unique_ptr<ReturnStmt> ret = std::make_unique<ReturnStmt>(std::move(call));
+				ret->line = field.line;
+				ret->column = field.column;
+				getter.body.push_back(std::move(ret));
+				decl.methods.push_back(std::move(getter));
+			}
+		} else {
+			consume_statement_end("Expected newline after the field declaration");
+		}
 
 		if (decl.find_field(field.name) != nullptr || decl.find_constant(field.name) != nullptr) {
 			throw CompilerException::parser_error(
@@ -1355,11 +1411,14 @@ StmtPtr Parser::parse_var_decl(bool is_const) {
 	// ':' is ambiguous: type hint, accessor block, or bare `var x:`.
 	TypeExpr type_hint;
 	bool accessors_follow = false;
+	bool inferred = false;
 	if (match(TokenType::COLON)) {
 		if (at_property_accessor() || check(TokenType::NEWLINE)) {
 			accessors_follow = true;
 		} else if (check(TokenType::IDENTIFIER) || check(TokenType::NULL_VAL)) {
 			type_hint = parse_type_expr();
+		} else {
+			inferred = check(TokenType::ASSIGN);
 		}
 	}
 
@@ -1376,6 +1435,7 @@ StmtPtr Parser::parse_var_decl(bool is_const) {
 
 	auto stmt = make_at<VarDeclStmt>(name, name.lexeme, std::move(initializer), is_const);
 	stmt->type_hint = type_hint;
+	stmt->inferred = inferred;
 	stmt->doc_comment = doc_comment_above(name.line);
 
 	if (accessors_follow) {
@@ -1393,7 +1453,7 @@ StmtPtr Parser::parse_var_decl(bool is_const) {
 void Parser::parse_property_accessors(VarDeclStmt& decl) {
 	const bool block = check(TokenType::NEWLINE);
 	if (block) {
-		advance();
+		skip_newlines();
 		consume(TokenType::INDENT, "Expected an indented block of property accessors");
 	}
 
@@ -1780,6 +1840,7 @@ StmtPtr Parser::parse_expr_or_assign_stmt() {
 		return std::make_unique<ExprStmt>(std::move(expr));
 	}
 
+	const size_t statement_start = m_current;
 	ExprPtr lhs = parse_call();
 
 	if (match(TokenType::ASSIGN)) {
@@ -1831,8 +1892,17 @@ StmtPtr Parser::parse_expr_or_assign_stmt() {
 		}
 		ExprPtr read = clone_lvalue(lhs.get());
 		if (!read) {
-			throw CompilerException::parser_error(
-				"Invalid target for compound assignment", lhs->line, lhs->column);
+			const IndexExpr* index = dynamic_cast<const IndexExpr*>(lhs.get());
+			const MemberCallExpr* member = dynamic_cast<const MemberCallExpr*>(lhs.get());
+			if (!(index && !index->safe_chain_root) &&
+				!(member && !member->is_method_call && !member->safe)) {
+				throw CompilerException::parser_error(
+					"Invalid target for compound assignment", lhs->line, lhs->column);
+			}
+			advance();
+			ExprPtr rhs = parse_expression();
+			consume_statement_end("Expected newline after assignment");
+			return hoist_compound_target(std::move(lhs), entry.op, std::move(rhs));
 		}
 		advance();
 
@@ -1846,6 +1916,12 @@ StmtPtr Parser::parse_expr_or_assign_stmt() {
 		return std::make_unique<AssignStmt>(std::move(lhs), std::move(combined));
 	}
 
+	// GDScript accepts any expression as a statement (`a + b`); reparse it whole.
+	if (!check(TokenType::NEWLINE) && !check(TokenType::SEMICOLON) && !check(TokenType::DEDENT) &&
+		!is_at_end() && !(m_inline_suite_depth > 0 && at_inline_suite_end())) {
+		m_current = statement_start;
+		lhs = parse_expression();
+	}
 	consume_statement_end("Expected newline after expression");
 	return std::make_unique<ExprStmt>(std::move(lhs));
 }
@@ -1897,7 +1973,51 @@ ExprPtr Parser::clone_lvalue(const Expr* expr) {
 		}
 		return make_like<IndexExpr>(*expr, std::move(object), std::move(subscript));
 	}
+	if (const UnaryExpr* unary = dynamic_cast<const UnaryExpr*>(expr)) {
+		ExprPtr operand = clone_lvalue(unary->operand.get());
+		if (!operand) {
+			return nullptr;
+		}
+		return make_like<UnaryExpr>(*expr, unary->op, std::move(operand));
+	}
 	return nullptr;
+}
+
+// `f()[k] op= v` evaluates the container and key once into temporaries, inside an `if true:` scope.
+StmtPtr Parser::hoist_compound_target(ExprPtr target, BinaryExpr::Op op, ExprPtr rhs) {
+	const Expr& at = *target;
+	std::vector<StmtPtr> body;
+	const std::function<std::string(ExprPtr)> temp = [&](ExprPtr value) {
+		std::string name = "__compound_" + std::to_string(m_compound_temps++);
+		std::unique_ptr<VarDeclStmt> decl = std::make_unique<VarDeclStmt>(name, std::move(value));
+		decl->line = at.line;
+		decl->column = at.column;
+		body.push_back(std::move(decl));
+		return name;
+	};
+	ExprPtr write;
+	ExprPtr read;
+	if (IndexExpr* index = dynamic_cast<IndexExpr*>(target.get())) {
+		const std::string object = temp(std::move(index->object));
+		const std::string key = temp(std::move(index->index));
+		write = make_like<IndexExpr>(at, make_like<VariableExpr>(at, object), make_like<VariableExpr>(at, key));
+		read = make_like<IndexExpr>(at, make_like<VariableExpr>(at, object), make_like<VariableExpr>(at, key));
+	} else {
+		MemberCallExpr* member = static_cast<MemberCallExpr*>(target.get());
+		const std::string object = temp(std::move(member->object));
+		write = make_like<MemberCallExpr>(at, make_like<VariableExpr>(at, object), member->member_name,
+			std::vector<ExprPtr>{}, false);
+		read = make_like<MemberCallExpr>(at, make_like<VariableExpr>(at, object), member->member_name,
+			std::vector<ExprPtr>{}, false);
+	}
+	std::unique_ptr<AssignStmt> assign = std::make_unique<AssignStmt>(std::move(write), make_binary(std::move(read), op, std::move(rhs)));
+	assign->line = at.line;
+	assign->column = at.column;
+	body.push_back(std::move(assign));
+	std::unique_ptr<IfStmt> scope = std::make_unique<IfStmt>(make_like<LiteralExpr>(at, true), std::move(body));
+	scope->line = at.line;
+	scope->column = at.column;
+	return scope;
 }
 
 ExprPtr Parser::make_binary(ExprPtr left, BinaryExpr::Op op, ExprPtr right) {
@@ -1952,6 +2072,10 @@ ExprPtr Parser::parse_expression_impl() {
 			const Expr& start = *expr;
 			expr = make_like<CastExpr>(start, std::move(expr), type_name,
 				std::move(type_arguments));
+			if (continues_after_cast()) {
+				m_pending_primary = std::move(expr);
+				expr = parse_ternary();
+			}
 			continue;
 		}
 		// A cast is the only expression `??` can meet here: everything else was
@@ -1965,6 +2089,23 @@ ExprPtr Parser::parse_expression_impl() {
 	}
 
 	return expr;
+}
+
+// GDScript keeps parsing infix operators after a cast: `x as T != null`, `x as T if c else d`.
+bool Parser::continues_after_cast() const {
+	switch (peek().type) {
+		case TokenType::PLUS: case TokenType::MINUS: case TokenType::MULTIPLY: case TokenType::POWER:
+		case TokenType::DIVIDE: case TokenType::MODULO: case TokenType::BIT_AND: case TokenType::BIT_OR:
+		case TokenType::BIT_XOR: case TokenType::SHIFT_LEFT: case TokenType::SHIFT_RIGHT:
+		case TokenType::EQUAL: case TokenType::NOT_EQUAL: case TokenType::LESS: case TokenType::LESS_EQUAL:
+		case TokenType::GREATER: case TokenType::GREATER_EQUAL: case TokenType::AND: case TokenType::OR:
+		case TokenType::IN: case TokenType::IS: case TokenType::IF:
+			return true;
+		case TokenType::NOT:
+			return peek_ahead(1).type == TokenType::IN;
+		default:
+			return false;
+	}
 }
 
 ExprPtr Parser::parse_ternary() {
@@ -2017,7 +2158,7 @@ ExprPtr Parser::parse_and_expression() {
 
 ExprPtr Parser::parse_not() {
 	// `not` binds looser than comparison: `not a == b` is `not (a == b)`.
-	if (match(TokenType::NOT)) {
+	if (!m_pending_primary && match(TokenType::NOT)) {
 		const Token& op = previous();
 		return make_at<UnaryExpr>(op, UnaryExpr::Op::NOT, parse_not());
 	}
@@ -2168,6 +2309,11 @@ ExprPtr Parser::parse_factor() {
 }
 
 ExprPtr Parser::parse_unary() {
+	// A finished cast is the operand here. Before the `not` check: in `x as T not in a`
+	// the next token is that `not`, which parse_not leaves alone while a cast is pending.
+	if (m_pending_primary) {
+		return parse_call();
+	}
 	// Prefix not is also legal after a tighter binary operator.
 	if (check(TokenType::NOT)) return parse_not();
 	// `await` at unary precedence, matching GDScript.
@@ -2231,7 +2377,7 @@ ExprPtr Parser::parse_call() {
 
 	while (true) {
 		if (match(TokenType::QUESTION_DOT)) {
-			const Token& member = consume(TokenType::IDENTIFIER,
+			const Token& member = consume_member_name(
 				"Expected property or method name after '?.'");
 			std::vector<ExprPtr> arguments;
 			std::vector<std::string> names;
@@ -2268,7 +2414,7 @@ ExprPtr Parser::parse_call() {
 					std::move(arguments), true);
 			}
 		} else if (match(TokenType::DOT)) {
-			const Token& member = consume(TokenType::IDENTIFIER, "Expected property or method name after '.'");
+			const Token& member = consume_member_name("Expected property or method name after '.'");
 
 			if (match(TokenType::LPAREN)) {
 				std::vector<ExprPtr> arguments;
@@ -2368,6 +2514,9 @@ ExprPtr Parser::parse_lambda() {
 }
 
 ExprPtr Parser::parse_primary() {
+	if (m_pending_primary) {
+		return std::move(m_pending_primary);
+	}
 	if (check(TokenType::FUNC)) {
 		return parse_lambda();
 	}
@@ -2550,6 +2699,18 @@ const Token& Parser::consume(TokenType type, const std::string& message) {
 	return peek();
 }
 
+const Token& Parser::consume_member_name(const std::string& message) {
+	const Token& token = peek();
+	const bool keyword_shaped = !token.lexeme.empty() &&
+		(std::isalpha(static_cast<unsigned char>(token.lexeme[0])) || token.lexeme[0] == '_') &&
+		std::all_of(token.lexeme.begin(), token.lexeme.end(),
+			[](unsigned char c) { return std::isalnum(c) || c == '_'; });
+	if (token.type == TokenType::IDENTIFIER || keyword_shaped) {
+		return advance();
+	}
+	return consume(TokenType::IDENTIFIER, message);
+}
+
 void Parser::synchronize() {
 	advance();
 
@@ -2675,6 +2836,9 @@ TypeExpr Parser::parse_type_expr() {
 
 	member();
 	while (match(TokenType::BIT_OR)) {
+		if (!m_extensions) {
+			error("Union types are a SafeGDScript extension, not GDScript; enable them with --extensions");
+		}
 		if (!check(TokenType::IDENTIFIER) && !check(TokenType::NULL_VAL)) {
 			error("Expected a type name or 'null' after '|'");
 		}
@@ -2871,6 +3035,10 @@ bool Parser::parse_attribute(ExportHint& hint, bool* is_onready,
 		return false;
 	}
 	if (name.lexeme == "requires_host_hook") {
+		if (!m_extensions) {
+			error("@requires_host_hook is a SafeGDScript extension, not GDScript; enable it with --extensions", name.line, name.column);
+			return false;
+		}
 		if (requires_host_hook == nullptr) {
 			error("@requires_host_hook is only supported on a file-level instance function", name.line, name.column);
 			return false;
@@ -2883,6 +3051,10 @@ bool Parser::parse_attribute(ExportHint& hint, bool* is_onready,
 		return false;
 	}
 	if (name.lexeme == "test") {
+		if (!m_extensions) {
+			error("@test is a SafeGDScript extension, not GDScript; enable it with --extensions", name.line, name.column);
+			return false;
+		}
 		if (is_test == nullptr) {
 			error("@test is for a file-level function", name.line, name.column);
 			return false;

@@ -16,6 +16,12 @@ namespace {
 const char* packed_array_constructor_name(IRInstruction::TypeHint type);
 }
 
+// The hidden per-program seal global, and the key every class instance carries it under.
+static constexpr const char* SEAL_GLOBAL_NAME = "@seal";
+static constexpr const char* SEAL_KEY = "@seal";
+// Hidden global holding the object a class name evaluates to when used as a value.
+static constexpr const char* CLASS_VALUE_PREFIX = "@class:";
+
 void CodeGenerator::set_engine_ancestry(
 	const std::vector<std::pair<std::string, std::string>>& pairs) {
 	m_engine_ancestry = pairs;
@@ -214,6 +220,18 @@ bool constructs_implicitly_from(IRInstruction::TypeHint from, IRInstruction::Typ
 			return from == Variant::TRANSFORM2D || from == Variant::QUATERNION ||
 				from == Variant::BASIS || from == Variant::PROJECTION;
 		case Variant::PROJECTION:  return from == Variant::TRANSFORM3D;
+		// GDScript converts an Array literal assigned to a packed array's slot.
+		case Variant::PACKED_BYTE_ARRAY:
+		case Variant::PACKED_INT32_ARRAY:
+		case Variant::PACKED_INT64_ARRAY:
+		case Variant::PACKED_FLOAT32_ARRAY:
+		case Variant::PACKED_FLOAT64_ARRAY:
+		case Variant::PACKED_STRING_ARRAY:
+		case Variant::PACKED_VECTOR2_ARRAY:
+		case Variant::PACKED_VECTOR3_ARRAY:
+		case Variant::PACKED_VECTOR4_ARRAY:
+		case Variant::PACKED_COLOR_ARRAY:
+			return from == Variant::ARRAY;
 		case Variant::ARRAY:
 			switch (from) {
 				case Variant::PACKED_BYTE_ARRAY:
@@ -529,6 +547,52 @@ IRProgram CodeGenerator::generate(const Program& program) {
 		m_global_holds_object.push_back(declared.contains(Variant::OBJECT));
 	}
 
+	// One engine object per program marks every class instance it builds, and one per class is
+	// what the class name evaluates to as a value. Parsed data can only yield strings, numbers
+	// and containers, so it can forge neither an instance's `@seal` nor a class value.
+	m_seal_global = -1;
+	m_seal_used = false;
+	const bool declares_class = std::any_of(program.structs.begin(), program.structs.end(),
+		[](const StructDecl& decl) { return decl.is_class; });
+	m_class_value_globals.clear();
+	m_class_values_used.clear();
+	if (declares_class) {
+		std::vector<std::string> hidden = { SEAL_GLOBAL_NAME };
+		std::vector<std::string> class_names;
+		for (const StructDecl& decl : program.structs) {
+			if (decl.is_class) class_names.push_back(decl.name);
+		}
+		std::sort(class_names.begin(), class_names.end());
+		for (const std::string& name : class_names) hidden.push_back(CLASS_VALUE_PREFIX + name);
+		for (const std::string& hidden_name : hidden) {
+			const int index = int(ir_program.globals.size());
+			if (hidden_name == SEAL_GLOBAL_NAME) {
+				m_seal_global = index;
+			} else {
+				m_class_value_globals[hidden_name.substr(std::string(CLASS_VALUE_PREFIX).size())] = index;
+			}
+			IRGlobalVar sentinel;
+			sentinel.name = hidden_name;
+			sentinel.is_static = true;
+			sentinel.storage = IRGlobalVar::Storage::Data;
+			sentinel.init_type = IRGlobalVar::InitType::RUNTIME;
+			sentinel.type_hint = Variant::OBJECT;
+			sentinel.value_type = Variant::OBJECT;
+			ir_program.globals.push_back(std::move(sentinel));
+			m_global_is_member.push_back(false);
+			m_global_types.push_back(Variant::OBJECT);
+			m_global_sets.push_back(TypeSet{});
+			m_global_type_names.push_back("Object");
+			m_global_structs.push_back(nullptr);
+			m_global_traits.push_back(nullptr);
+			m_global_array_element_structs.push_back(nullptr);
+			m_global_dictionary_value_structs.push_back(nullptr);
+			m_global_array_element_traits.push_back(nullptr);
+			m_global_dictionary_value_traits.push_back(nullptr);
+			m_global_holds_object.push_back(true);
+		}
+	}
+
 	collect_property_accessors(program);
 
 	FunctionContext init_func;
@@ -757,9 +821,8 @@ IRProgram CodeGenerator::generate(const Program& program) {
 	m_members_in_scope = true;
 	ir_program.global_init = std::move(init_func.ir);
 	ir_program.member_init = std::move(member_func.ir);
-
-	m_pending_lambdas.clear();
-	m_next_lambda = 0;
+	// A lambda in a member initializer is queued like any other and lifted below. Clearing the
+	// queue here left `__init_members` calling a label nothing emitted.
 
 	struct NativeDefault {
 		FunctionDecl function;
@@ -957,41 +1020,66 @@ IRProgram CodeGenerator::generate(const Program& program) {
 	};
 	emit_defaults();
 
-	// Queue grows while iterating (nested lambdas append).
-	for (size_t i = 0; i < m_pending_lambdas.size(); i++) {
-		const PendingLambda pending = m_pending_lambdas[i];
-		m_current_function = pending.lifted_name;
-
-		// Keep the sandbox ABI unchanged; native Callables complete defaults at the host boundary.
-		FunctionSignature signature = m_native_classes ? build_signature(*pending.decl) : FunctionSignature();
-		if (m_native_classes && !pending.captures.empty()) {
-			FunctionParameter captures;
-			captures.name = "@captures";
-			captures.type = Variant::ARRAY;
-			signature.parameters.insert(signature.parameters.begin(), std::move(captures));
-			++signature.required_arguments;
+	// Both queues grow while iterating: lambdas nest, and a constructor's field defaults
+	// may build other classes through a class value or hold lambdas.
+	size_t lambda_index = 0;
+	size_t constructor_index = 0;
+	while (lambda_index < m_pending_lambdas.size() || constructor_index < m_pending_constructors.size()) {
+		if (constructor_index < m_pending_constructors.size()) {
+			const std::pair<std::string, size_t> pending = m_pending_constructors[constructor_index++];
+			FunctionSignature signature;
+			signature.name = class_value_constructor_name(pending.first, pending.second);
+			ir_program.signatures.push_back(std::move(signature));
+			ir_program.functions.push_back(generate_class_value_constructor(*find_struct(pending.first), pending.second));
+			emit_defaults();
+			continue;
 		}
-		complete_defaults(signature, *pending.decl, pending.owner);
-		signature.name = pending.lifted_name;
-		signature.line = pending.decl->line;
-		ir_program.signatures.push_back(std::move(signature));
+		{
+			const PendingLambda pending = m_pending_lambdas[lambda_index++];
+			m_current_function = pending.lifted_name;
 
-		m_current_class = pending.owner;
-		m_current_chain_link = pending.chain_link;
-		m_current_chain_function = pending.chain_function;
-		m_in_static_function = pending.in_static_function;
-		IRFunction lifted = generate_lambda_function(*pending.decl, pending.captures);
-		lifted.source_path = size_t(pending.chain_link) < m_chain.paths.size()
-			? m_chain.paths[size_t(pending.chain_link)] : m_source_path;
-		m_in_static_function = false;
-		m_current_class = nullptr;
-		m_current_chain_link = 0;
-		m_current_chain_function.clear();
-		lifted.name = pending.lifted_name;
-		ir_program.functions.push_back(std::move(lifted));
-		emit_defaults();
+			// Keep the sandbox ABI unchanged; native Callables complete defaults at the host boundary.
+			FunctionSignature signature = m_native_classes ? build_signature(*pending.decl) : FunctionSignature();
+			if (m_native_classes && !pending.captures.empty()) {
+				FunctionParameter captures;
+				captures.name = "@captures";
+				captures.type = Variant::ARRAY;
+				signature.parameters.insert(signature.parameters.begin(), std::move(captures));
+				++signature.required_arguments;
+			}
+			complete_defaults(signature, *pending.decl, pending.owner);
+			signature.name = pending.lifted_name;
+			signature.line = pending.decl->line;
+			ir_program.signatures.push_back(std::move(signature));
+
+			m_current_class = pending.owner;
+			m_current_chain_link = pending.chain_link;
+			m_current_chain_function = pending.chain_function;
+			m_in_static_function = pending.in_static_function;
+			IRFunction lifted = generate_lambda_function(*pending.decl, pending.captures);
+			lifted.source_path = size_t(pending.chain_link) < m_chain.paths.size()
+				? m_chain.paths[size_t(pending.chain_link)] : m_source_path;
+			m_in_static_function = false;
+			m_current_class = nullptr;
+			m_current_chain_link = 0;
+			m_current_chain_function.clear();
+			lifted.name = pending.lifted_name;
+			ir_program.functions.push_back(std::move(lifted));
+			emit_defaults();
+		}
 	}
 	m_pending_lambdas.clear();
+	m_pending_constructors.clear();
+
+	// The seal and the class values are created first thing at startup, before a global
+	// initializer can build an instance or name a class, and only when some code reads them:
+	// a program that never does creates no object, so it still runs where creating one is refused.
+	std::vector<int> sentinels(m_class_values_used.begin(), m_class_values_used.end());
+	if (m_seal_global >= 0 && m_seal_used) sentinels.push_back(m_seal_global);
+	std::sort(sentinels.begin(), sentinels.end());
+	for (std::vector<int>::const_reverse_iterator it = sentinels.rbegin(); it != sentinels.rend(); ++it) {
+		prepend_global_object(ir_program, *it, "RefCounted");
+	}
 
 	for (size_t i = 0; i < ir_program.globals.size() && i < m_global_holds_object.size(); i++) {
 		ir_program.globals[i].holds_object = m_global_holds_object[i];
@@ -1001,6 +1089,60 @@ IRProgram CodeGenerator::generate(const Program& program) {
 	ir_program.strings = std::move(m_strings);
 	ir_program.has_breakpoint_statement = m_saw_breakpoint_statement;
 	return ir_program;
+}
+
+// Creates an engine object into a hidden global ahead of everything else global init does.
+void CodeGenerator::prepend_global_object(IRProgram& ir_program, int global_index, const char* class_name) {
+	IRFunction& init = ir_program.global_init;
+	const int reg = init.max_registers;
+	IRInstruction create(IROpcode::CALL_SYSCALL);
+	create.operands.push_back(IRValue::reg(reg));
+	create.operands.push_back(IRValue::imm(ECALL_NODE_CREATE));
+	create.operands.push_back(IRValue::imm(add_string_constant(class_name)));
+	create.operands.push_back(IRValue::imm(int64_t(std::string(class_name).length())));
+	std::vector<IRInstruction> prologue;
+	prologue.push_back(create);
+	prologue.emplace_back(IROpcode::STORE_GLOBAL, IRValue::imm(int64_t(global_index)), IRValue::reg(reg));
+	if (!ir_program.has_global_init) {
+		init.instructions.clear();
+		prologue.emplace_back(IROpcode::RETURN);
+		ir_program.has_global_init = true;
+	}
+	init.instructions.insert(init.instructions.begin(), prologue.begin(), prologue.end());
+	init.max_registers = reg + 1;
+}
+
+std::string CodeGenerator::class_value_constructor_name(const std::string& class_name, size_t arity) {
+	return "@" + class_name + ".@new" + std::to_string(arity);
+}
+
+// `Name.new(a0..aN)` as a function, so a class value's `.new()` calls it instead of
+// inlining every class's construction (which recurses through field defaults).
+IRFunction CodeGenerator::generate_class_value_constructor(const StructDecl& decl, size_t arity) {
+	FunctionContext func;
+	func.ir.name = class_value_constructor_name(decl.name, arity);
+	func.ir.source_path = m_source_path;
+	m_current_function = func.ir.name;
+	m_current_class = nullptr;
+	push_scope(func);
+	std::vector<ExprPtr> arguments;
+	for (size_t i = 0; i < arity; i++) {
+		const std::string name = "@arg" + std::to_string(i);
+		func.ir.parameters.push_back(name);
+		func.ir.param_sets.push_back(0);
+		int reg = alloc_register(func);
+		declare_variable(func, name, reg, false, nullptr, false, true);
+		std::unique_ptr<VariableExpr> argument = std::make_unique<VariableExpr>(name);
+		argument->line = decl.line;
+		argument->column = decl.column;
+		arguments.push_back(std::move(argument));
+	}
+	int built_reg = gen_class_construct(decl, arguments, NamedArguments{}, func, nullptr);
+	func.ir.instructions.emplace_back(IROpcode::MOVE, IRValue::reg(0), IRValue::reg(built_reg));
+	func.ir.instructions.emplace_back(IROpcode::RETURN);
+	func.ir.max_registers = std::max(func.next_register, 1);
+	pop_scope(func);
+	return std::move(func.ir);
 }
 
 IRFunction CodeGenerator::generate_function(const FunctionDecl& decl, const StructDecl* owner) {
@@ -1113,7 +1255,10 @@ void CodeGenerator::error_at(const std::string& message, const Stmt* stmt,
 void CodeGenerator::gen_stmt(const Stmt* stmt, FunctionContext& func) {
 	// Nested statements stamp first; unstamped remainder belongs to the outer.
 	const size_t first_instruction = func.ir.instructions.size();
+	const int enclosing_line = func.stmt_line;
+	func.stmt_line = stmt->line;
 	gen_stmt_dispatch(stmt, func);
+	func.stmt_line = enclosing_line;
 	for (size_t i = first_instruction; i < func.ir.instructions.size(); i++) {
 		if (func.ir.instructions[i].line == 0) {
 			func.ir.instructions[i].line = stmt->line;
@@ -1163,6 +1308,10 @@ void CodeGenerator::gen_var_decl(const VarDeclStmt* stmt, FunctionContext& func,
 		accepted_type.nullable = true;
 	}
 	const StructDecl* declared_struct = find_struct(accepted_type.sole_name());
+	// A class hint accepts null without `?`, as it does on a global and in GDScript.
+	if (declared_struct != nullptr && declared_struct->is_class && !accepted_type.is_union()) {
+		accepted_type.nullable = true;
+	}
 	const TraitDecl* declared_trait = find_trait(accepted_type.sole_name());
 	const TypeSet declared_set = type_set_from(accepted_type, stmt->line, stmt->column);
 	const bool nullable_single = declared_set.is_nullable_single();
@@ -1218,9 +1367,11 @@ void CodeGenerator::gen_var_decl(const VarDeclStmt* stmt, FunctionContext& func,
 		accepted_type.single_name() != "Variant" &&
 		single_type_from(accepted_type) == IRInstruction::TypeHint_NONE &&
 		get_register_type(func, reg) == Variant::NIL;
+	const bool gdscript_variant = !m_extensions && accepted_type.empty() && stmt->initializer != nullptr &&
+		!stmt->inferred && !conditional_binding;
 
 	const bool declared_variant = accepted_type.single_name() == "Variant" || untyped_null ||
-		class_typed_null;
+		class_typed_null || gdscript_variant;
 	if (declared_variant) {
 		// Fresh register: clearing type on the initializer's would reach other uses.
 		int untyped_reg = alloc_register(func);
@@ -1428,6 +1579,13 @@ void CodeGenerator::gen_store_to_variable(const std::string& name, int value_reg
 	} else if (var->is_variant) {
 		set_register_type(func, var->register_num, IRInstruction::TypeHint_NONE);
 	} else {
+		// GDScript truncates a float stored into an int variable instead of refusing it.
+		if (!m_extensions && get_register_type(func, var->register_num) == Variant::INT &&
+			get_register_type(func, value_reg) == Variant::FLOAT) {
+			const int truncated = gen_host_constructor_typed("int", Variant::INT, { value_reg }, func, nullptr);
+			free_register(func, value_reg);
+			value_reg = truncated;
+		}
 		reject_reclassification(*var, value_reg, func, site);
 		value_reg = coerce_to_declared_type(value_reg, get_register_type(func, var->register_num), func,
 			"variable '" + name + "'", site);
@@ -1451,6 +1609,11 @@ void CodeGenerator::gen_store_to(const Expr* target, int value_reg, FunctionCont
 	}
 
 	if (auto* index_expr = dynamic_cast<const IndexExpr*>(target)) {
+		if (FunctionContext::PackedCandidate* candidate = packed_candidate(index_expr->object.get(), func)) {
+			gen_packed_store(*candidate, index_expr, value_reg, func);
+			free_register(func, value_reg);
+			return;
+		}
 		// Handles need no write-back, but the container may be a copy: resolve as lvalue.
 		LValue base = resolve_lvalue(index_expr->object.get(), func);
 		check_struct_subscript(base.reg, index_expr->index.get(), func);
@@ -1763,6 +1926,8 @@ void CodeGenerator::gen_return(const ReturnStmt* stmt, FunctionContext& func) {
 			reg = coerce_to_declared_type(reg, single_type_from(func.return_type), func,
 				"the return value of '" + m_current_function + "'", stmt);
 		}
+		// Before r0 is written: r0 is also the first parameter, which may be a candidate.
+		emit_packed_region_exit(func);
 		if (reg != 0) {
 			func.ir.instructions.emplace_back(IROpcode::MOVE, IRValue::reg(0), IRValue::reg(reg));
 		}
@@ -1771,6 +1936,7 @@ void CodeGenerator::gen_return(const ReturnStmt* stmt, FunctionContext& func) {
 		if (func.return_type.is_union() && !type_set_from(func.return_type).contains(Variant::NIL)) {
 			error_at("A bare return cannot satisfy return type " + func.return_type.to_string(), stmt);
 		}
+		emit_packed_region_exit(func);
 		// r0 aliases the first parameter; explicit null needed.
 		func.ir.instructions.emplace_back(IROpcode::LOAD_NIL, IRValue::reg(0));
 	}
@@ -3109,6 +3275,9 @@ void CodeGenerator::invalidate_loop_character_registers(const std::vector<StmtPt
 }
 
 void CodeGenerator::gen_while(const WhileStmt* stmt, FunctionContext& func) {
+	if (try_packed_region(stmt, func)) {
+		return;
+	}
 	invalidate_loop_character_registers(stmt->body, func);
 	std::string body_label = make_label("loop");
 	std::string continue_label = make_label("loop_continue");
@@ -3142,7 +3311,14 @@ void CodeGenerator::gen_while(const WhileStmt* stmt, FunctionContext& func) {
 }
 
 void CodeGenerator::gen_for(const ForStmt* stmt, FunctionContext& func) {
+	if (try_packed_region(stmt, func)) {
+		return;
+	}
 	invalidate_loop_character_registers(stmt->body, func);
+	if (FunctionContext::PackedCandidate* candidate = packed_candidate(stmt->iterable.get(), func)) {
+		gen_packed_walk(stmt, *candidate, func);
+		return;
+	}
 	auto* call_expr = dynamic_cast<const CallExpr*>(stmt->iterable.get());
 	bool is_range = call_expr && call_expr->function_name == "range";
 
@@ -3425,6 +3601,7 @@ void CodeGenerator::gen_for(const ForStmt* stmt, FunctionContext& func) {
 			set_register_type(func, elem_reg, IRInstruction::TypeHint_NONE);
 		} else if (packed_walk) {
 			emit_vcall_get(elem_reg);
+			type_packed_element(array_reg, elem_reg, func);
 		} else if (string_walk) {
 			emit_string_at(elem_reg);
 			set_register_type(func, elem_reg, Variant::STRING);
@@ -3617,6 +3794,1365 @@ void CodeGenerator::gen_array_walk(const ForStmt* stmt, int array_reg, FunctionC
 	free_register(func, one_reg);
 	free_register(func, batch_index_reg);
 	free_register(func, index_reg);
+}
+
+// -= Packed array regions =-
+//
+// Through VARIANT_GET and VARIANT_SET every Packed*Array element a loop touches
+// is a host call. A loop that indexes typed Packed*Array locals instead copies
+// each of them into guest memory once (ECALL_PACKED_ACQUIRE), reads and writes
+// the copies with plain loads and stores (PACKED_GET / PACKED_SET), and on the
+// way out stores the written ones back into the same host arrays
+// (ECALL_PACKED_RELEASE), in place, so every reference to an array -- another
+// variable, a container slot, the caller of vmcall() -- sees what element by
+// element access would have shown it.
+//
+// Prior art. JNI's Get<Type>ArrayElements / Release<Type>ArrayElements, whose
+// release modes are this one's: store and free (0), store and keep (JNI_COMMIT),
+// free without storing (JNI_ABORT, a copy nobody wrote); and
+// GetPrimitiveArrayCritical, whose region may not call back into Java -- here,
+// may not let the host see or change the array behind the copy's back.
+// wasm-bindgen copies a &[u8] across the boundary once per call rather than
+// once per element; PEP 3118 hands out a buffer view instead of an element
+// protocol. And like HotSpot C2's range check elimination by loop predication,
+// the loop is versioned: guards at its entry pick the copy loop or the original
+// one, and nothing inside the copy loop tests them again.
+//
+// A region is one loop statement, the outermost that qualifies. Its candidates
+// are the typed Packed*Array locals the loop uses only as `v[i]`, `v[i] = x`,
+// `v.size()`, `v.is_empty()` and `for x in v` (scan_packed_region). The loop is
+// lowered twice, the copy loop first and the original loop as its fallback:
+//
+//     acquire each candidate          refused (cost, type, room) -> release those acquired, fallback
+//     identity guards                 a written copy shares its array with another -> fallback
+//     copy loop                       an index out of range -> the host access, which reports it
+//     release each candidate          a return inside the loop releases first
+//     jump end
+//   fallback:
+//     original loop
+//   end:
+//
+// The copy loop is then scanned with the type of every operand
+// (packed_effects): an instruction that can reach the host storage of a
+// candidate's packed type -- through an unknown Variant, an Object, a
+// container, a call into the guest, or a method on another array of that type
+// -- drops that candidate, and the loop is lowered again without it. A host
+// error or a failed assert inside the region unwinds it without the release;
+// the host stores the copies it handed out from handle_exception().
+namespace {
+
+// Only the observer scan sees this: an Array or Dictionary built in the region
+// from values that cannot hold a packed array, so it cannot either.
+constexpr IRInstruction::TypeHint PACKED_INERT_CONTAINER = 1000;
+constexpr uint32_t PACKED_REACH_ALL = 1u << 31;
+
+// The packed array storage a value of this type can reach: its own type's bit
+// for a packed array, everything for a value that could hold or call anything,
+// nothing for a plain value.
+uint32_t packed_reach(IRInstruction::TypeHint type) {
+	if (type == PACKED_INERT_CONTAINER) {
+		return 0;
+	}
+	if (type >= int(Variant::PACKED_BYTE_ARRAY) && type <= int(Variant::PACKED_VECTOR4_ARRAY)) {
+		return 1u << uint32_t(type - int(Variant::PACKED_BYTE_ARRAY));
+	}
+	if (type >= int(Variant::NIL) && type < int(Variant::OBJECT)) {
+		return 0;
+	}
+	// TypeHint_NONE (unknown), OBJECT, CALLABLE, SIGNAL, DICTIONARY, ARRAY.
+	return PACKED_REACH_ALL;
+}
+
+// Methods of a Packed*Array that only read it.
+bool packed_method_reads_only(const std::string& method) {
+	static const std::unordered_set<std::string> readers = {
+		"size", "is_empty", "get", "has", "find", "rfind", "count", "slice", "duplicate",
+		"bsearch", "hex_encode", "to_byte_array", "compress", "decompress", "decompress_dynamic",
+		"get_string_from_ascii", "get_string_from_utf8", "get_string_from_utf16",
+		"get_string_from_utf32", "get_string_from_wchar", "get_string_from_multibyte_char",
+		"decode_u8", "decode_s8", "decode_u16", "decode_s16", "decode_u32", "decode_s32",
+		"decode_u64", "decode_s64", "decode_half", "decode_float", "decode_double",
+		"decode_var", "decode_var_size", "has_encoded_var",
+		"to_int32_array", "to_int64_array", "to_float32_array", "to_float64_array",
+		"to_vector2_array", "to_vector3_array", "to_vector4_array", "to_color_array",
+	};
+	return readers.count(method) != 0;
+}
+
+struct PackedEffects {
+	uint32_t reads = 0;
+	uint32_t writes = 0;
+};
+
+// The four-operand instructions (PACKED_GET, PACKED_SET) have no constructor.
+IRInstruction& emit_four(std::vector<IRInstruction>& out, IROpcode opcode, IRValue a, IRValue b,
+	IRValue c, IRValue d)
+{
+	IRInstruction instr(opcode, a, b, c);
+	instr.operands.push_back(d);
+	out.push_back(std::move(instr));
+	return out.back();
+}
+
+// What one instruction of a copy loop may read or write of host packed array
+// storage, by type. Conservative: an opcode not named here may do anything.
+PackedEffects packed_effects(const IRInstruction& instr, const IRStringTable& strings,
+	const std::function<IRInstruction::TypeHint(int)>& type_of)
+{
+	PackedEffects effects;
+	const SmallVector<IRValue, 3>& operands = instr.operands;
+	const std::function<uint32_t(size_t)> reach = [&](size_t index) -> uint32_t {
+		if (index >= operands.size() || operands[index].type != IRValue::Type::REGISTER) {
+			return 0;
+		}
+		return packed_reach(type_of(operands[index].reg_index()));
+	};
+	// Registers the instruction reads from operand `first` on; a destination is not
+	// read (and its type is not known until after the instruction).
+	const IROperandSignature& signature = ir_opcode_info(instr.opcode).signature;
+	const std::function<uint32_t(size_t)> reach_from = [&](size_t first) -> uint32_t {
+		uint32_t mask = 0;
+		for (size_t i = first; i < operands.size(); i++) {
+			if (signature.kind_at(i) != IROperandKind::DST) {
+				mask |= reach(i);
+			}
+		}
+		return mask;
+	};
+	const std::function<void()> everything = [&]() {
+		effects.reads = PACKED_REACH_ALL;
+		effects.writes = PACKED_REACH_ALL;
+	};
+	// A value that may be an Object may run a script (to_string, a getter).
+	const std::function<void(uint32_t)> reads_values = [&](uint32_t mask) {
+		effects.reads |= mask;
+		if (mask & PACKED_REACH_ALL) {
+			effects.writes = PACKED_REACH_ALL;
+		}
+	};
+
+	switch (instr.opcode) {
+		// Guest only, or a Variant reference copied or stored without its contents
+		// being read. A branch tests truthiness, which for an array is its size, and
+		// no size changes inside a region.
+		case IROpcode::LOAD_IMM:
+		case IROpcode::LOAD_FLOAT_IMM:
+		case IROpcode::LOAD_BOOL:
+		case IROpcode::LOAD_STRING:
+		case IROpcode::LOAD_STRING_AS:
+		case IROpcode::LOAD_GLOBAL:
+		case IROpcode::STORE_GLOBAL:
+		case IROpcode::MOVE:
+		case IROpcode::CONVERT:
+		case IROpcode::TYPE_TEST:
+		case IROpcode::TYPE_TEST_MASK:
+		case IROpcode::MAKE_SCOPED:
+		case IROpcode::BATCH_GET:
+		case IROpcode::CODEPOINT_GET:
+		case IROpcode::PACKED_GET:
+		case IROpcode::PACKED_SET:
+		case IROpcode::PACKED_SIZE:
+		case IROpcode::PACKED_DATA:
+		case IROpcode::PACKED_IDENTITY:
+		case IROpcode::PACKED_INDEX:
+		case IROpcode::SCOPE_MARK:
+		case IROpcode::SCOPE_RELEASE:
+		case IROpcode::TYPE_OF:
+		case IROpcode::LOAD_NIL:
+		case IROpcode::LABEL:
+		case IROpcode::JUMP:
+		case IROpcode::BRANCH_ZERO:
+		case IROpcode::BRANCH_NOT_ZERO:
+		case IROpcode::SWITCH:
+		case IROpcode::RETURN:
+		case IROpcode::THROW:
+		case IROpcode::MAKE_VECTOR2:
+		case IROpcode::MAKE_VECTOR3:
+		case IROpcode::MAKE_VECTOR4:
+		case IROpcode::MAKE_VECTOR2I:
+		case IROpcode::MAKE_VECTOR3I:
+		case IROpcode::MAKE_VECTOR4I:
+		case IROpcode::MAKE_COLOR:
+		case IROpcode::MAKE_RECT2:
+		case IROpcode::MAKE_RECT2I:
+		case IROpcode::MAKE_PLANE:
+		case IROpcode::ARRAY_GET:
+		case IROpcode::ARRAY_SET:
+		case IROpcode::ARRAY_APPEND:
+		case IROpcode::DICT_GET_CONST:
+		case IROpcode::DICT_SET_CONST:
+		case IROpcode::DICT_SET_CONST_STR:
+		case IROpcode::DICT_HAS_CONST:
+		case IROpcode::MAKE_ARRAY:
+		case IROpcode::MAKE_DICTIONARY_KEYED:
+		case IROpcode::MAKE_CALLABLE:
+		case IROpcode::GET_NODE:
+		case IROpcode::VGET_INLINE:
+		case IROpcode::VSET_INLINE:
+			return effects;
+
+		// Operators read their operands: `a + b` concatenates arrays, `==` compares
+		// them element by element, `in` searches.
+		case IROpcode::COERCE:
+		case IROpcode::ADD:
+		case IROpcode::SUB:
+		case IROpcode::MUL:
+		case IROpcode::DIV:
+		case IROpcode::MOD:
+		case IROpcode::NEG:
+		case IROpcode::POW:
+		case IROpcode::CMP_EQ:
+		case IROpcode::CMP_NEQ:
+		case IROpcode::CMP_LT:
+		case IROpcode::CMP_LTE:
+		case IROpcode::CMP_GT:
+		case IROpcode::CMP_GTE:
+		case IROpcode::AND:
+		case IROpcode::OR:
+		case IROpcode::NOT:
+		case IROpcode::BIT_AND:
+		case IROpcode::BIT_OR:
+		case IROpcode::BIT_XOR:
+		case IROpcode::BIT_NOT:
+		case IROpcode::SHL:
+		case IROpcode::SHR:
+		case IROpcode::IN:
+		case IROpcode::BRANCH_EQ:
+		case IROpcode::BRANCH_NEQ:
+		case IROpcode::BRANCH_LT:
+		case IROpcode::BRANCH_LTE:
+		case IROpcode::BRANCH_GT:
+		case IROpcode::BRANCH_GTE:
+			reads_values(reach_from(0));
+			return effects;
+
+		case IROpcode::GLOBAL_CALL:
+		case IROpcode::PRINT:
+		case IROpcode::CONSTRUCT:
+		case IROpcode::MAKE_PACKED_BYTE_ARRAY:
+		case IROpcode::MAKE_PACKED_INT32_ARRAY:
+		case IROpcode::MAKE_PACKED_INT64_ARRAY:
+		case IROpcode::MAKE_PACKED_FLOAT32_ARRAY:
+		case IROpcode::MAKE_PACKED_FLOAT64_ARRAY:
+		case IROpcode::MAKE_PACKED_STRING_ARRAY:
+		case IROpcode::MAKE_PACKED_VECTOR2_ARRAY:
+		case IROpcode::MAKE_PACKED_VECTOR3_ARRAY:
+		case IROpcode::MAKE_PACKED_COLOR_ARRAY:
+		case IROpcode::MAKE_PACKED_VECTOR4_ARRAY:
+			reads_values(reach_from(1));
+			return effects;
+
+		// Keys are hashed, values only stored.
+		case IROpcode::MAKE_DICTIONARY:
+			for (size_t i = 2; i < operands.size(); i += 2) {
+				reads_values(reach(i));
+			}
+			return effects;
+		case IROpcode::DICT_SET:
+			reads_values(reach(1));
+			return effects;
+
+		case IROpcode::VARIANT_SET: {
+			const uint32_t subject = reach(0);
+			if (subject & PACKED_REACH_ALL) {
+				everything();
+				return effects;
+			}
+			effects.writes |= subject;
+			reads_values(reach(1));
+			return effects;
+		}
+
+		case IROpcode::VGET:
+		case IROpcode::VSET:
+			if (reach(instr.opcode == IROpcode::VGET ? 1 : 0) != 0) {
+				everything();
+			}
+			if (instr.opcode == IROpcode::VSET) {
+				reads_values(reach(3) & PACKED_REACH_ALL);
+			}
+			return effects;
+
+		case IROpcode::VCALL: {
+			const uint32_t receiver = reach(1);
+			if (receiver & PACKED_REACH_ALL) {
+				everything();
+				return effects;
+			}
+			reads_values(reach_from(4));
+			effects.reads |= receiver;
+			if (receiver != 0 && !(operands.size() > 2 &&
+					packed_method_reads_only(strings[operands[2].string_id]))) {
+				effects.writes |= receiver;
+			}
+			return effects;
+		}
+
+		case IROpcode::CALL_SYSCALL: {
+			const int64_t number = operands.size() > 1 ? operands[1].immediate() : -1;
+			switch (number) {
+				case ECALL_PACKED_ACQUIRE:
+				case ECALL_PACKED_RELEASE:
+				case ECALL_STRING_AT:
+				case ECALL_STRING_SIZE:
+				case ECALL_STRING_BATCH:
+				case ECALL_STRING_CODEPOINT_BATCH:
+				case ECALL_ARRAY_SIZE:
+				case ECALL_ARRAY_AT:
+				case ECALL_ARRAY_BATCH:
+					return effects;
+				case ECALL_VARIANT_GET: {
+					const uint32_t subject = reach(2);
+					if (subject & PACKED_REACH_ALL) {
+						everything();
+						return effects;
+					}
+					effects.reads |= subject;
+					reads_values(reach(3));
+					return effects;
+				}
+				case ECALL_DICTIONARY_OPS:
+					reads_values(reach_from(4));
+					return effects;
+				default:
+					everything();
+					return effects;
+			}
+		}
+
+		default:
+			// CALL, CALL_HOSTED, AWAIT, LOAD_RESOURCE, TRAIT_TEST, STRUCT_CHECK,
+			// BREAKPOINT and anything added later.
+			everything();
+			return effects;
+	}
+}
+
+// Which registers of a copy loop hold plain values: numbers, bools, strings,
+// vectors, fresh arrays, and containers of those that nothing in the loop
+// changes. None of them can lead to the storage of an existing packed array,
+// whatever type the front end recorded for them (often none: the product of an
+// untyped int, the answer of decode_u16). A register is plain when every one of
+// its definitions in the loop is; the registers that were live before the loop
+// keep their recorded type. Greatest fixed point: a loop-carried `t = t + x` is
+// plain when `x` is, since `t` cannot be read before its first definition.
+template <typename LogEntry>
+std::unordered_set<int> plain_registers(const std::vector<IRInstruction>& instructions, size_t begin,
+	size_t end, const std::vector<std::pair<size_t, size_t>>& cold, int first_new,
+	const std::unordered_map<int, IRInstruction::TypeHint>& entry_types,
+	const std::vector<LogEntry>& log, const IRStringTable& strings)
+{
+	enum class Rule { ALWAYS, IF_SOURCES, NEVER };
+	struct Def {
+		Rule rule;
+		std::vector<std::pair<int, IRInstruction::TypeHint>> sources; // register, type there
+	};
+	std::unordered_map<int, std::vector<Def>> defs;
+	std::unordered_set<int> containers; // defined by MAKE_ARRAY / MAKE_DICTIONARY
+	std::unordered_set<int> mutated;    // used where a container could be changed or escape
+
+	std::unordered_map<int, IRInstruction::TypeHint> types = entry_types;
+	size_t next_log = 0;
+	size_t next_cold = 0;
+	const std::function<bool(IRInstruction::TypeHint)> value_type = [](IRInstruction::TypeHint type) {
+		return type == PACKED_INERT_CONTAINER || (type >= int(Variant::NIL) && type < int(Variant::OBJECT));
+	};
+	for (size_t i = begin; i < end; i++) {
+		while (next_log < log.size() && log[next_log].at <= i) {
+			types[log[next_log].reg] = log[next_log].type;
+			next_log++;
+		}
+		while (next_cold < cold.size() && cold[next_cold].second <= i) {
+			next_cold++;
+		}
+		if (next_cold < cold.size() && cold[next_cold].first <= i) {
+			continue;
+		}
+		const IRInstruction& instr = instructions[i];
+		const SmallVector<IRValue, 3>& operands = instr.operands;
+		const std::function<IRInstruction::TypeHint(int)> type_of = [&](int reg) {
+			const std::unordered_map<int, IRInstruction::TypeHint>::const_iterator it = types.find(reg);
+			return it != types.end() ? it->second : IRInstruction::TypeHint_NONE;
+		};
+		const std::function<int(size_t)> reg_at = [&](size_t index) -> int {
+			return index < operands.size() && operands[index].type == IRValue::Type::REGISTER
+				? operands[index].reg_index() : -1;
+		};
+		const std::function<void(size_t)> mark = [&](size_t index) {
+			if (const int reg = reg_at(index); reg >= 0) {
+				mutated.insert(reg);
+			}
+		};
+		// Where a container may be changed or copied somewhere this pass cannot follow.
+		switch (instr.opcode) {
+			case IROpcode::VCALL:
+			case IROpcode::ARRAY_APPEND:
+				mark(1);
+				break;
+			case IROpcode::ARRAY_SET:
+			case IROpcode::DICT_SET:
+			case IROpcode::DICT_SET_CONST:
+			case IROpcode::DICT_SET_CONST_STR:
+			case IROpcode::VARIANT_SET:
+			case IROpcode::VSET:
+				mark(0);
+				break;
+			case IROpcode::MOVE:
+			case IROpcode::COERCE:
+				// Into r0 is the return value on its way out of the region.
+				if (reg_at(0) != 0) {
+					mark(1);
+				}
+				break;
+			case IROpcode::STORE_GLOBAL:
+				mark(1);
+				break;
+			case IROpcode::CALL:
+			case IROpcode::CALL_HOSTED:
+				for (size_t index = 3; index < operands.size(); index++) {
+					mark(index);
+				}
+				break;
+			default:
+				break;
+		}
+
+		const int dst = ir_destination_register(instr);
+		if (dst < first_new) {
+			continue;
+		}
+		Def def { Rule::NEVER, {} };
+		const std::function<void(size_t)> from_sources = [&](size_t first) {
+			def.rule = Rule::IF_SOURCES;
+			const IROperandSignature& signature = ir_opcode_info(instr.opcode).signature;
+			for (size_t index = first; index < operands.size(); index++) {
+				if (signature.kind_at(index) != IROperandKind::DST && operands[index].type == IRValue::Type::REGISTER) {
+					def.sources.emplace_back(operands[index].reg_index(), type_of(operands[index].reg_index()));
+				}
+			}
+		};
+		// A receiver that is a value, a packed array or a String answers with a
+		// value or a fresh array; so does one this pass already counts as plain.
+		const std::function<void(int)> plain_receiver = [&](int reg) {
+			const IRInstruction::TypeHint type = type_of(reg);
+			def.rule = Rule::IF_SOURCES;
+			if (value_type(type) || (type >= int(Variant::PACKED_BYTE_ARRAY) && type <= int(Variant::PACKED_VECTOR4_ARRAY))) {
+				def.rule = Rule::ALWAYS;
+			} else {
+				def.sources.emplace_back(reg, type);
+			}
+		};
+		switch (instr.opcode) {
+			case IROpcode::LOAD_IMM:
+			case IROpcode::LOAD_FLOAT_IMM:
+			case IROpcode::LOAD_BOOL:
+			case IROpcode::LOAD_STRING:
+			case IROpcode::LOAD_STRING_AS:
+			case IROpcode::LOAD_NIL:
+			case IROpcode::CMP_EQ:
+			case IROpcode::CMP_NEQ:
+			case IROpcode::CMP_LT:
+			case IROpcode::CMP_LTE:
+			case IROpcode::CMP_GT:
+			case IROpcode::CMP_GTE:
+			case IROpcode::AND:
+			case IROpcode::OR:
+			case IROpcode::NOT:
+			case IROpcode::IN:
+			case IROpcode::TYPE_TEST:
+			case IROpcode::TYPE_TEST_MASK:
+			case IROpcode::TYPE_OF:
+			case IROpcode::PACKED_GET:
+			case IROpcode::PACKED_SIZE:
+			case IROpcode::PACKED_DATA:
+			case IROpcode::PACKED_IDENTITY:
+			case IROpcode::PACKED_INDEX:
+			case IROpcode::MAKE_VECTOR2:
+			case IROpcode::MAKE_VECTOR3:
+			case IROpcode::MAKE_VECTOR4:
+			case IROpcode::MAKE_VECTOR2I:
+			case IROpcode::MAKE_VECTOR3I:
+			case IROpcode::MAKE_VECTOR4I:
+			case IROpcode::MAKE_COLOR:
+			case IROpcode::MAKE_RECT2:
+			case IROpcode::MAKE_RECT2I:
+			case IROpcode::MAKE_PLANE:
+			case IROpcode::VGET_INLINE:
+			case IROpcode::CODEPOINT_GET:
+			case IROpcode::MAKE_PACKED_BYTE_ARRAY:
+			case IROpcode::MAKE_PACKED_INT32_ARRAY:
+			case IROpcode::MAKE_PACKED_INT64_ARRAY:
+			case IROpcode::MAKE_PACKED_FLOAT32_ARRAY:
+			case IROpcode::MAKE_PACKED_FLOAT64_ARRAY:
+			case IROpcode::MAKE_PACKED_STRING_ARRAY:
+			case IROpcode::MAKE_PACKED_VECTOR2_ARRAY:
+			case IROpcode::MAKE_PACKED_VECTOR3_ARRAY:
+			case IROpcode::MAKE_PACKED_COLOR_ARRAY:
+			case IROpcode::MAKE_PACKED_VECTOR4_ARRAY:
+				def.rule = Rule::ALWAYS;
+				break;
+			case IROpcode::MAKE_ARRAY:
+			case IROpcode::MAKE_DICTIONARY:
+			case IROpcode::MAKE_DICTIONARY_KEYED:
+				containers.insert(dst);
+				from_sources(1);
+				break;
+			case IROpcode::MOVE:
+			case IROpcode::CONVERT:
+			case IROpcode::COERCE:
+			case IROpcode::ADD:
+			case IROpcode::SUB:
+			case IROpcode::MUL:
+			case IROpcode::DIV:
+			case IROpcode::MOD:
+			case IROpcode::NEG:
+			case IROpcode::POW:
+			case IROpcode::BIT_AND:
+			case IROpcode::BIT_OR:
+			case IROpcode::BIT_XOR:
+			case IROpcode::BIT_NOT:
+			case IROpcode::SHL:
+			case IROpcode::SHR:
+			case IROpcode::GLOBAL_CALL:
+			case IROpcode::CONSTRUCT:
+				from_sources(1);
+				break;
+			case IROpcode::VCALL:
+				plain_receiver(reg_at(1));
+				break;
+			case IROpcode::ARRAY_GET:
+				plain_receiver(reg_at(1));
+				if (def.rule == Rule::ALWAYS && type_of(reg_at(1)) == int(Variant::ARRAY)) {
+					def.rule = Rule::NEVER; // an Array of unknown elements
+				}
+				break;
+			case IROpcode::CALL_SYSCALL: {
+				const int64_t number = operands.size() > 1 ? operands[1].immediate() : -1;
+				switch (number) {
+					case ECALL_VARIANT_GET:
+						plain_receiver(reg_at(2));
+						if (def.rule == Rule::ALWAYS && !(type_of(reg_at(2)) >= int(Variant::PACKED_BYTE_ARRAY) &&
+								type_of(reg_at(2)) <= int(Variant::PACKED_VECTOR4_ARRAY)) &&
+							type_of(reg_at(2)) != int(Variant::STRING)) {
+							def.rule = Rule::NEVER; // a value type indexed by a Variant key: keep it simple
+						}
+						break;
+					case ECALL_ARRAY_SIZE:
+					case ECALL_STRING_SIZE:
+					case ECALL_STRING_AT:
+					case ECALL_PACKED_ACQUIRE:
+					case ECALL_PACKED_RELEASE:
+						def.rule = Rule::ALWAYS;
+						break;
+					default:
+						break;
+				}
+				break;
+			}
+			default:
+				break;
+		}
+		(void)strings;
+		defs[dst].push_back(std::move(def));
+	}
+
+	std::unordered_set<int> plain;
+	for (const std::pair<const int, std::vector<Def>>& entry : defs) {
+		const int reg = entry.first;
+		bool possible = !(containers.count(reg) && mutated.count(reg));
+		for (const Def& def : entry.second) {
+			possible = possible && def.rule != Rule::NEVER;
+		}
+		if (possible) {
+			plain.insert(reg);
+		}
+	}
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (std::unordered_set<int>::iterator it = plain.begin(); it != plain.end();) {
+			bool keep = true;
+			for (const Def& def : defs[*it]) {
+				for (const std::pair<int, IRInstruction::TypeHint>& source : def.sources) {
+					if (!value_type(source.second) && plain.count(source.first) == 0) {
+						keep = false;
+					}
+				}
+			}
+			if (keep) {
+				++it;
+			} else {
+				it = plain.erase(it);
+				changed = true;
+			}
+		}
+	}
+	return plain;
+}
+
+} // namespace
+
+IRInstruction::TypeHint CodeGenerator::packed_element_type(IRInstruction::TypeHint packed) {
+	switch (packed) {
+		case Variant::PACKED_BYTE_ARRAY:
+		case Variant::PACKED_INT32_ARRAY:
+		case Variant::PACKED_INT64_ARRAY:
+			return Variant::INT;
+		case Variant::PACKED_FLOAT32_ARRAY:
+		case Variant::PACKED_FLOAT64_ARRAY:
+			return Variant::FLOAT;
+		case Variant::PACKED_STRING_ARRAY:
+			return Variant::STRING;
+		case Variant::PACKED_VECTOR2_ARRAY:
+			return Variant::VECTOR2;
+		case Variant::PACKED_VECTOR3_ARRAY:
+			return Variant::VECTOR3;
+		case Variant::PACKED_VECTOR4_ARRAY:
+			return Variant::VECTOR4;
+		case Variant::PACKED_COLOR_ARRAY:
+			return Variant::COLOR;
+		default:
+			return IRInstruction::TypeHint_NONE;
+	}
+}
+
+bool CodeGenerator::packed_region_supports(IRInstruction::TypeHint packed) {
+	return packed != Variant::PACKED_STRING_ARRAY &&
+		packed_element_type(packed) != IRInstruction::TypeHint_NONE;
+}
+
+// An element of a typed Packed*Array has the element type, whichever path read
+// it (Godot's analyzer types `var x := packed[i]` the same way). A local keeps
+// the type it was given here -- assigning another is rejected or coerced -- so
+// an inferred (reclassifiable) one promises it as well.
+void CodeGenerator::type_packed_element(int obj_reg, int result_reg, FunctionContext& func) {
+	if (!m_fast_arrays) {
+		return;
+	}
+	const IRInstruction::TypeHint element = packed_element_type(get_register_type(func, obj_reg));
+	if (element != IRInstruction::TypeHint_NONE) {
+		set_register_type(func, result_reg, element);
+	}
+}
+
+CodeGenerator::PackedScan CodeGenerator::scan_packed_region(const Stmt* loop, FunctionContext& func) {
+	struct Use {
+		size_t order = 0;
+		int64_t accesses = 0;
+		bool written = false;
+		bool escapes = false;
+	};
+	std::unordered_map<std::string, Use> uses;
+	std::unordered_set<std::string> declared;
+	bool refused = false;
+	bool unknown_trip = false;
+	size_t next_order = 0;
+	const std::function<Use&(const std::string&)> use = [&](const std::string& name) -> Use& {
+		const std::pair<std::unordered_map<std::string, Use>::iterator, bool> found = uses.try_emplace(name);
+		if (found.second) {
+			found.first->second.order = next_order++;
+		}
+		return found.first->second;
+	};
+	const std::function<const std::string*(const Expr*)> variable_name = [](const Expr* expr) -> const std::string* {
+		const VariableExpr* variable = dynamic_cast<const VariableExpr*>(expr);
+		return variable != nullptr ? &variable->name : nullptr;
+	};
+	// Weights multiply by constant trip counts; saturate rather than overflow.
+	const std::function<int64_t(int64_t, int64_t)> times = [](int64_t weight, int64_t trip) -> int64_t {
+		return trip > 0 && weight > (int64_t(1) << 40) / trip ? (int64_t(1) << 40) : weight * trip;
+	};
+
+	std::function<void(const Expr*, int64_t)> expression;
+	std::function<void(const Stmt*, int64_t)> statement;
+	std::function<void(const MatchPattern*, int64_t)> pattern;
+	const std::function<void(const std::vector<StmtPtr>&, int64_t)> statements = [&](const std::vector<StmtPtr>& body, int64_t weight) {
+		for (const StmtPtr& body_stmt : body) {
+			statement(body_stmt.get(), weight);
+		}
+	};
+	// The walk `for x in v` reads every element: allowed, an unknown trip count.
+	const std::function<void(const Expr*, int64_t)> iterable = [&](const Expr* expr, int64_t weight) {
+		if (const std::string* name = variable_name(expr)) {
+			use(*name).accesses += weight;
+			unknown_trip = true;
+		} else {
+			expression(expr, weight);
+		}
+	};
+
+	expression = [&](const Expr* expr, int64_t weight) {
+		if (expr == nullptr || refused) {
+			return;
+		}
+		if (const VariableExpr* variable = dynamic_cast<const VariableExpr*>(expr)) {
+			// A bare use: the value goes somewhere the copy cannot follow.
+			use(variable->name).escapes = true;
+		} else if (const IndexExpr* index = dynamic_cast<const IndexExpr*>(expr)) {
+			if (const std::string* name = variable_name(index->object.get())) {
+				use(*name).accesses += weight;
+			} else {
+				expression(index->object.get(), weight);
+			}
+			expression(index->index.get(), weight);
+		} else if (const MemberCallExpr* member = dynamic_cast<const MemberCallExpr*>(expr)) {
+			const std::string* name = variable_name(member->object.get());
+			if (name != nullptr && member->is_method_call && !member->safe &&
+				member->arguments.empty() &&
+				(member->member_name == "size" || member->member_name == "is_empty")) {
+				use(*name);
+			} else {
+				expression(member->object.get(), weight);
+			}
+			for (const ExprPtr& argument : member->arguments) {
+				expression(argument.get(), weight);
+			}
+		} else if (const CallExpr* call = dynamic_cast<const CallExpr*>(expr)) {
+			// A Callable local called by name.
+			use(call->function_name).escapes = true;
+			for (const ExprPtr& argument : call->arguments) {
+				expression(argument.get(), weight);
+			}
+		} else if (const BinaryExpr* binary = dynamic_cast<const BinaryExpr*>(expr)) {
+			expression(binary->left.get(), weight);
+			expression(binary->right.get(), weight);
+		} else if (const UnaryExpr* unary = dynamic_cast<const UnaryExpr*>(expr)) {
+			expression(unary->operand.get(), weight);
+		} else if (const TernaryExpr* ternary = dynamic_cast<const TernaryExpr*>(expr)) {
+			expression(ternary->condition.get(), weight);
+			expression(ternary->true_value.get(), weight);
+			expression(ternary->false_value.get(), weight);
+		} else if (const CastExpr* cast = dynamic_cast<const CastExpr*>(expr)) {
+			expression(cast->value.get(), weight);
+		} else if (const TypeTestExpr* test = dynamic_cast<const TypeTestExpr*>(expr)) {
+			expression(test->value.get(), weight);
+		} else if (const ArrayLiteralExpr* array = dynamic_cast<const ArrayLiteralExpr*>(expr)) {
+			for (const ExprPtr& element : array->elements) {
+				expression(element.get(), weight);
+			}
+		} else if (const DictionaryLiteralExpr* dictionary = dynamic_cast<const DictionaryLiteralExpr*>(expr)) {
+			for (const std::pair<ExprPtr, ExprPtr>& entry : dictionary->elements) {
+				expression(entry.first.get(), weight);
+				expression(entry.second.get(), weight);
+			}
+		} else if (dynamic_cast<const LiteralExpr*>(expr) == nullptr) {
+			// await (a suspension), a lambda (lowered once per attempt, and it may
+			// capture), and any expression added later: no region.
+			refused = true;
+		}
+	};
+
+	pattern = [&](const MatchPattern* match_pattern, int64_t weight) {
+		if (match_pattern == nullptr) {
+			return;
+		}
+		if (match_pattern->kind == MatchPattern::Kind::BIND) {
+			declared.insert(match_pattern->name);
+		}
+		expression(match_pattern->value.get(), weight);
+		for (const MatchPatternPtr& element : match_pattern->elements) {
+			pattern(element.get(), weight);
+		}
+		for (const MatchPattern::Entry& entry : match_pattern->entries) {
+			expression(entry.key.get(), weight);
+			pattern(entry.value.get(), weight);
+		}
+		for (const MatchPattern::StructEntry& entry : match_pattern->struct_entries) {
+			pattern(entry.value.get(), weight);
+		}
+	};
+
+	statement = [&](const Stmt* stmt, int64_t weight) {
+		if (stmt == nullptr || refused) {
+			return;
+		}
+		if (const ExprStmt* expr_stmt = dynamic_cast<const ExprStmt*>(stmt)) {
+			expression(expr_stmt->expression.get(), weight);
+		} else if (const VarDeclStmt* declaration = dynamic_cast<const VarDeclStmt*>(stmt)) {
+			declared.insert(declaration->name);
+			expression(declaration->initializer.get(), weight);
+		} else if (const AssignStmt* assignment = dynamic_cast<const AssignStmt*>(stmt)) {
+			if (!assignment->name.empty()) {
+				use(assignment->name).escapes = true;
+			} else if (const IndexExpr* index = dynamic_cast<const IndexExpr*>(assignment->target.get());
+				index != nullptr && variable_name(index->object.get()) != nullptr) {
+				Use& target = use(*variable_name(index->object.get()));
+				target.accesses += weight;
+				target.written = true;
+				expression(index->index.get(), weight);
+			} else {
+				expression(assignment->target.get(), weight);
+			}
+			expression(assignment->value.get(), weight);
+		} else if (const ReturnStmt* returned = dynamic_cast<const ReturnStmt*>(stmt)) {
+			expression(returned->value.get(), weight);
+		} else if (const IfStmt* branch = dynamic_cast<const IfStmt*>(stmt)) {
+			expression(branch->condition.get(), weight);
+			if (branch->binding) {
+				declared.insert(branch->binding->name);
+				expression(branch->binding->initializer.get(), weight);
+			}
+			statements(branch->then_branch, weight);
+			statements(branch->else_branch, weight);
+		} else if (const WhileStmt* while_loop = dynamic_cast<const WhileStmt*>(stmt)) {
+			unknown_trip = true;
+			expression(while_loop->condition.get(), weight);
+			statements(while_loop->body, weight);
+		} else if (const ForStmt* for_loop = dynamic_cast<const ForStmt*>(stmt)) {
+			declared.insert(for_loop->variable);
+			int64_t trip = -1;
+			if (const LiteralExpr* literal = dynamic_cast<const LiteralExpr*>(for_loop->iterable.get());
+				literal != nullptr && literal->lit_type == LiteralExpr::Type::INTEGER) {
+				trip = std::max<int64_t>(0, std::get<int64_t>(literal->value));
+			} else {
+				unknown_trip = true;
+			}
+			iterable(for_loop->iterable.get(), weight);
+			statements(for_loop->body, trip >= 0 ? times(weight, trip) : weight);
+		} else if (const MatchStmt* match = dynamic_cast<const MatchStmt*>(stmt)) {
+			expression(match->subject.get(), weight);
+			for (const MatchStmt::Branch& arm : match->branches) {
+				for (const MatchPatternPtr& arm_pattern : arm.patterns) {
+					pattern(arm_pattern.get(), weight);
+				}
+				expression(arm.guard.get(), weight);
+				statements(arm.body, weight);
+			}
+		} else if (dynamic_cast<const BreakStmt*>(stmt) == nullptr &&
+			dynamic_cast<const ContinueStmt*>(stmt) == nullptr &&
+			dynamic_cast<const PassStmt*>(stmt) == nullptr &&
+			dynamic_cast<const BreakpointStmt*>(stmt) == nullptr) {
+			refused = true;
+		}
+	};
+
+	if (const ForStmt* for_loop = dynamic_cast<const ForStmt*>(loop)) {
+		declared.insert(for_loop->variable);
+		if (variable_name(for_loop->iterable.get()) != nullptr) {
+			use(*variable_name(for_loop->iterable.get())).accesses += 1;
+		} else {
+			expression(for_loop->iterable.get(), 1);
+		}
+		statements(for_loop->body, 1);
+	} else if (const WhileStmt* while_loop = dynamic_cast<const WhileStmt*>(loop)) {
+		expression(while_loop->condition.get(), 1);
+		statements(while_loop->body, 1);
+	}
+
+	PackedScan scan;
+	if (refused) {
+		return scan;
+	}
+	std::vector<std::pair<size_t, FunctionContext::PackedCandidate>> ordered;
+	int64_t accesses = 0;
+	for (const std::pair<const std::string, Use>& entry : uses) {
+		const std::string& name = entry.first;
+		const Use& name_use = entry.second;
+		if (name_use.escapes || name_use.accesses == 0 || declared.count(name) != 0) {
+			continue;
+		}
+		Variable* local = find_variable(func, name);
+		if (local == nullptr) {
+			continue;
+		}
+		const IRInstruction::TypeHint type = get_register_type(func, local->register_num);
+		if (!packed_region_supports(type)) {
+			continue;
+		}
+		FunctionContext::PackedCandidate candidate;
+		candidate.name = name;
+		candidate.reg = local->register_num;
+		candidate.type = type;
+		candidate.written = name_use.written;
+		ordered.emplace_back(name_use.order, std::move(candidate));
+		accesses += name_use.accesses;
+	}
+	std::sort(ordered.begin(), ordered.end(),
+		[](const std::pair<size_t, FunctionContext::PackedCandidate>& a,
+			const std::pair<size_t, FunctionContext::PackedCandidate>& b) { return a.first < b.first; });
+	for (std::pair<size_t, FunctionContext::PackedCandidate>& entry : ordered) {
+		scan.candidates.push_back(std::move(entry.second));
+	}
+	scan.accesses_per_pass = unknown_trip ? -1 : accesses;
+	return scan;
+}
+
+// The accesses the region expects, for the acquire's cost test: the trip count
+// of `for i in n` (n an int literal or local) times the accesses of one pass.
+// -1, "always copy", when either is unknown.
+int CodeGenerator::gen_packed_trip_count(const Stmt* loop, int64_t accesses_per_pass,
+	FunctionContext& func)
+{
+	const Expr* bound = nullptr;
+	if (const ForStmt* for_loop = dynamic_cast<const ForStmt*>(loop)) {
+		bound = for_loop->iterable.get();
+		if (const CallExpr* call = dynamic_cast<const CallExpr*>(bound);
+			call != nullptr && call->function_name == "range" && call->arguments.size() == 1) {
+			bound = call->arguments[0].get();
+		}
+	}
+	if (accesses_per_pass > 0 && bound != nullptr) {
+		if (const LiteralExpr* literal = dynamic_cast<const LiteralExpr*>(bound);
+			literal != nullptr && literal->lit_type == LiteralExpr::Type::INTEGER) {
+			const int64_t trip = std::max<int64_t>(0, std::get<int64_t>(literal->value));
+			const int64_t cap = int64_t(1) << 40;
+			return gen_int_immediate(trip > cap / accesses_per_pass ? cap : trip * accesses_per_pass, func);
+		}
+		if (const VariableExpr* variable = dynamic_cast<const VariableExpr*>(bound)) {
+			if (Variable* local = find_variable(func, variable->name);
+				local != nullptr && get_register_type(func, local->register_num) == Variant::INT) {
+				const int per_pass = gen_int_immediate(accesses_per_pass, func);
+				const int expected = alloc_register(func);
+				IRInstruction& multiply = func.ir.instructions.emplace_back(IROpcode::MUL, IRValue::reg(expected),
+					IRValue::reg(local->register_num), IRValue::reg(per_pass));
+				multiply.type_hint = Variant::INT;
+				set_register_type(func, expected, Variant::INT);
+				return expected;
+			}
+		}
+	}
+	return gen_int_immediate(-1, func);
+}
+
+void CodeGenerator::gen_loop_statement(const Stmt* loop, FunctionContext& func) {
+	if (const ForStmt* for_loop = dynamic_cast<const ForStmt*>(loop)) {
+		gen_for(for_loop, func);
+	} else {
+		gen_while(static_cast<const WhileStmt*>(loop), func);
+	}
+}
+
+// `written`: the region may have written this copy (PACKED_WRITTEN), so the
+// release stores it back. A bail before the loop releases without it.
+void CodeGenerator::emit_packed_release(const FunctionContext::PackedCandidate& candidate, bool written,
+	FunctionContext& func)
+{
+	const int status = alloc_register(func);
+	IRInstruction release(IROpcode::CALL_SYSCALL);
+	release.operands.push_back(IRValue::reg(status));
+	release.operands.push_back(IRValue::imm(ECALL_PACKED_RELEASE));
+	release.operands.push_back(IRValue::reg(candidate.reg));
+	release.operands.push_back(IRValue::imm(int64_t(candidate.type) |
+		(written && candidate.written ? PACKED_WRITTEN : 0)));
+	release.operands.push_back(IRValue::imm(candidate.token));
+	release.type_hint = Variant::INT;
+	func.ir.instructions.push_back(release);
+	set_register_type(func, status, Variant::INT);
+}
+
+void CodeGenerator::emit_packed_region_exit(FunctionContext& func) {
+	if (func.packed_region == nullptr) {
+		return;
+	}
+	const std::vector<FunctionContext::PackedCandidate>& candidates = func.packed_region->candidates;
+	for (std::vector<FunctionContext::PackedCandidate>::const_reverse_iterator it = candidates.rbegin();
+		it != candidates.rend(); ++it) {
+		emit_packed_release(*it, true, func);
+	}
+}
+
+bool CodeGenerator::try_packed_region(const Stmt* loop, FunctionContext& func) {
+	if (!m_fast_arrays || func.ir.is_coroutine || func.packed_region != nullptr ||
+		func.packed_fallback_depth > 0) {
+		return false;
+	}
+	PackedScan scan = scan_packed_region(loop, func);
+	std::vector<FunctionContext::PackedCandidate> candidates = std::move(scan.candidates);
+	if (candidates.empty()) {
+		return false;
+	}
+	const std::string where = m_current_function + " line " + std::to_string(loop->line) + ": ";
+
+	const FunctionContext entry = func;
+	while (!candidates.empty()) {
+		FunctionContext::PackedRegion region;
+		region.candidates = candidates;
+		for (FunctionContext::PackedCandidate& candidate : region.candidates) {
+			candidate.token = func.next_packed_token++;
+		}
+		const size_t count = region.candidates.size();
+		const std::string fallback_label = make_label("packed_fallback");
+		const std::string end_label = make_label("packed_end");
+		// bail[i] releases candidates i-1 .. 0 and falls into the fallback.
+		std::vector<std::string> bail { fallback_label };
+		for (size_t i = 1; i <= count; i++) {
+			bail.push_back(make_label("packed_bail"));
+		}
+
+		const int expected = gen_packed_trip_count(loop, scan.accesses_per_pass, func);
+		// Registers are slots by number; the entry's are reused, not one per candidate.
+		const int status = alloc_register(func);
+		for (size_t i = 0; i < count; i++) {
+			const FunctionContext::PackedCandidate& candidate = region.candidates[i];
+			IRInstruction acquire(IROpcode::CALL_SYSCALL);
+			acquire.operands.push_back(IRValue::reg(status));
+			acquire.operands.push_back(IRValue::imm(ECALL_PACKED_ACQUIRE));
+			acquire.operands.push_back(IRValue::reg(candidate.reg));
+			acquire.operands.push_back(IRValue::imm(int64_t(candidate.type) |
+				(candidate.written ? PACKED_WRITTEN : 0)));
+			acquire.operands.push_back(IRValue::imm(candidate.token));
+			acquire.operands.push_back(IRValue::reg(expected));
+			acquire.type_hint = Variant::INT;
+			func.ir.instructions.push_back(acquire);
+			set_register_type(func, status, Variant::INT);
+			emit_conditional_branch(IROpcode::BRANCH_NOT_ZERO, status, bail[i], func);
+		}
+		// Two copies of one array would disagree: a written candidate must not share
+		// its array with any other candidate of its type.
+		const int left = alloc_register(func);
+		const int right = alloc_register(func);
+		const int same = alloc_register(func);
+		for (size_t w = 0; w < count; w++) {
+			const FunctionContext::PackedCandidate& written = region.candidates[w];
+			if (!written.written) {
+				continue;
+			}
+			for (size_t o = 0; o < count; o++) {
+				const FunctionContext::PackedCandidate& other = region.candidates[o];
+				if (o == w || other.type != written.type || (other.written && o < w)) {
+					continue;
+				}
+				func.ir.instructions.emplace_back(IROpcode::PACKED_IDENTITY, IRValue::reg(left),
+					IRValue::imm(written.token)).type_hint = Variant::INT;
+				func.ir.instructions.emplace_back(IROpcode::PACKED_IDENTITY, IRValue::reg(right),
+					IRValue::imm(other.token)).type_hint = Variant::INT;
+				set_register_type(func, left, Variant::INT);
+				set_register_type(func, right, Variant::INT);
+				func.ir.instructions.emplace_back(IROpcode::CMP_EQ, IRValue::reg(same),
+					IRValue::reg(left), IRValue::reg(right)).type_hint = Variant::INT;
+				set_register_type(func, same, Variant::BOOL);
+				emit_conditional_branch(IROpcode::BRANCH_NOT_ZERO, same, bail[count], func);
+			}
+		}
+
+		// Neither the data pointer nor the size of a copy changes inside the region.
+		for (FunctionContext::PackedCandidate& candidate : region.candidates) {
+			candidate.data_reg = alloc_register(func);
+			func.ir.instructions.emplace_back(IROpcode::PACKED_DATA, IRValue::reg(candidate.data_reg),
+				IRValue::imm(candidate.token)).type_hint = Variant::INT;
+			set_register_type(func, candidate.data_reg, Variant::INT);
+			candidate.size_reg = alloc_register(func);
+			func.ir.instructions.emplace_back(IROpcode::PACKED_SIZE, IRValue::reg(candidate.size_reg),
+				IRValue::imm(candidate.token)).type_hint = Variant::INT;
+			set_register_type(func, candidate.size_reg, Variant::INT);
+		}
+
+		const size_t loop_begin = func.ir.instructions.size();
+		const int first_new = func.next_register;
+		const std::unordered_map<int, IRInstruction::TypeHint> entry_types = func.register_types;
+		std::vector<FunctionContext::TypeLogEntry> log;
+		func.packed_region = &region;
+		func.type_log = &log;
+		gen_loop_statement(loop, func);
+		func.packed_region = nullptr;
+		func.type_log = nullptr;
+		const size_t loop_end = func.ir.instructions.size();
+
+		// Which candidates the copy loop lets the host reach behind the copy.
+		std::unordered_set<std::string> dropped = region.unsupported;
+		const std::unordered_set<int> plain = plain_registers(func.ir.instructions, loop_begin, loop_end,
+			region.cold, first_new, entry_types, log, m_strings);
+		std::unordered_map<int, IRInstruction::TypeHint> types = entry_types;
+		size_t next_log = 0;
+		size_t next_cold = 0;
+		PackedEffects effects;
+		for (size_t i = loop_begin; i < loop_end; i++) {
+			while (next_log < log.size() && log[next_log].at <= i) {
+				types[log[next_log].reg] = log[next_log].type;
+				next_log++;
+			}
+			while (next_cold < region.cold.size() && region.cold[next_cold].second <= i) {
+				next_cold++;
+			}
+			if (next_cold < region.cold.size() && region.cold[next_cold].first <= i) {
+				continue;
+			}
+			const PackedEffects one = packed_effects(func.ir.instructions[i], m_strings,
+				[&](int reg) {
+					if (plain.count(reg) != 0) {
+						return PACKED_INERT_CONTAINER;
+					}
+					const std::unordered_map<int, IRInstruction::TypeHint>::const_iterator it = types.find(reg);
+					return it != types.end() ? it->second : IRInstruction::TypeHint_NONE;
+				});
+			effects.reads |= one.reads;
+			effects.writes |= one.writes;
+		}
+		for (const FunctionContext::PackedCandidate& candidate : region.candidates) {
+			const uint32_t own = packed_reach(candidate.type) | PACKED_REACH_ALL;
+			if ((effects.writes & own) != 0 || (candidate.written && (effects.reads & own) != 0)) {
+				dropped.insert(candidate.name);
+			}
+		}
+
+		if (dropped.empty()) {
+			std::string note = where + "copies";
+			for (const FunctionContext::PackedCandidate& candidate : region.candidates) {
+				note += " " + candidate.name + (candidate.written ? " (written)" : "");
+			}
+			m_packed_notes.push_back(note);
+			for (std::vector<FunctionContext::PackedCandidate>::reverse_iterator it = region.candidates.rbegin();
+				it != region.candidates.rend(); ++it) {
+				emit_packed_release(*it, true, func);
+			}
+			func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(end_label));
+			emit_packed_oob_blocks(region, end_label, func);
+			for (size_t i = count; i >= 1; i--) {
+				func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(bail[i]));
+				emit_packed_release(region.candidates[i - 1], false, func);
+			}
+			func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(fallback_label));
+			func.packed_fallback_depth++;
+			gen_loop_statement(loop, func);
+			func.packed_fallback_depth--;
+			func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(end_label));
+			return true;
+		}
+
+		std::vector<std::string> names(dropped.begin(), dropped.end());
+		std::sort(names.begin(), names.end());
+		std::string note = where + "drops";
+		for (const std::string& name : names) {
+			note += " " + name + (region.unsupported.count(name) ? " (an access the copy cannot make)"
+				: " (the host may reach it)");
+		}
+		m_packed_notes.push_back(note);
+
+		func = entry;
+		candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+			[&](const FunctionContext::PackedCandidate& candidate) {
+				return dropped.count(candidate.name) != 0;
+			}), candidates.end());
+	}
+	return false;
+}
+
+CodeGenerator::FunctionContext::PackedCandidate* CodeGenerator::packed_candidate(const Expr* object,
+	FunctionContext& func)
+{
+	if (func.packed_region == nullptr) {
+		return nullptr;
+	}
+	const VariableExpr* variable = dynamic_cast<const VariableExpr*>(object);
+	if (variable == nullptr) {
+		return nullptr;
+	}
+	Variable* local = find_variable(func, variable->name);
+	if (local == nullptr) {
+		return nullptr;
+	}
+	for (FunctionContext::PackedCandidate& candidate : func.packed_region->candidates) {
+		if (candidate.reg == local->register_num && candidate.name == variable->name) {
+			return &candidate;
+		}
+	}
+	return nullptr;
+}
+
+// The element of the copy that GDScript index `index_reg` names: a negative
+// index counts from the end, as the Packed*Array operator counts it. Anything
+// still outside the copy branches to `oob_label`.
+int CodeGenerator::emit_packed_index(const FunctionContext::PackedCandidate& candidate, int index_reg,
+	const std::string& oob_label, FunctionContext& func)
+{
+	const int index = alloc_register(func);
+	IRInstruction check(IROpcode::PACKED_INDEX, IRValue::reg(index), IRValue::reg(candidate.size_reg),
+		IRValue::reg(index_reg));
+	check.operands.push_back(ir_label(oob_label));
+	check.type_hint = Variant::INT;
+	func.ir.instructions.push_back(std::move(check));
+	set_register_type(func, index, Variant::INT);
+	return index;
+}
+
+// An index outside the copy. The access is repeated through the host on the
+// array itself, which reports it exactly as element by element access reports
+// it -- and its exception stores the copies. The blocks are emitted after the
+// copy loop (emit_packed_oob_blocks), stamped with the line of the access.
+void CodeGenerator::emit_packed_oob(const FunctionContext::PackedCandidate& candidate, int index_reg,
+	int value_reg, const std::string& oob_label, FunctionContext& func)
+{
+	func.packed_region->oob.push_back({ oob_label, candidate.reg, index_reg, value_reg, func.stmt_line });
+}
+
+void CodeGenerator::emit_packed_oob_blocks(const FunctionContext::PackedRegion& region,
+	const std::string& end_label, FunctionContext& func)
+{
+	for (const FunctionContext::PackedRegion::PendingOob& pending : region.oob) {
+		const size_t begin = func.ir.instructions.size();
+		func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(pending.label));
+		if (pending.value < 0) {
+			gen_variant_get(alloc_register(func), pending.subject, pending.index, func);
+		} else {
+			func.ir.instructions.emplace_back(IROpcode::VARIANT_SET, IRValue::reg(pending.subject),
+				IRValue::reg(pending.index), IRValue::reg(pending.value));
+		}
+		// Not reached: the host access raised. If it ever answered, stop anyway.
+		IRInstruction stop(IROpcode::THROW, ir_str("IndexError"),
+			ir_str("Out of bounds access to a packed array"));
+		stop.operands.push_back(IRValue::imm(0));
+		func.ir.instructions.push_back(stop);
+		// THROW is not a terminator to the IR: say where control would go.
+		func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(end_label));
+		for (size_t i = begin; i < func.ir.instructions.size(); i++) {
+			func.ir.instructions[i].line = pending.line;
+		}
+	}
+}
+
+int CodeGenerator::gen_packed_read(FunctionContext::PackedCandidate& candidate, const IndexExpr* expr,
+	FunctionContext& func)
+{
+	const int index_reg = gen_expr(expr->index.get(), func);
+	const IRInstruction::TypeHint element = packed_element_type(candidate.type);
+	const int result = alloc_register(func);
+	if (get_register_type(func, index_reg) != Variant::INT) {
+		// Only an int indexes the copy; this attempt is discarded without the array.
+		func.packed_region->unsupported.insert(candidate.name);
+		gen_variant_get(result, candidate.reg, index_reg, func);
+		set_register_type(func, result, element);
+		return result;
+	}
+	const std::string oob_label = make_label("packed_oob");
+	const int index = emit_packed_index(candidate, index_reg, oob_label, func);
+	emit_four(func.ir.instructions, IROpcode::PACKED_GET, IRValue::reg(result),
+		IRValue::imm(candidate.type), IRValue::reg(candidate.data_reg),
+		IRValue::reg(index)).type_hint = element;
+	emit_packed_oob(candidate, index_reg, -1, oob_label, func);
+	set_register_type(func, result, element);
+	return result;
+}
+
+void CodeGenerator::gen_packed_store(FunctionContext::PackedCandidate& candidate, const IndexExpr* target,
+	int value_reg, FunctionContext& func)
+{
+	const int index_reg = gen_expr(target->index.get(), func);
+	const IRInstruction::TypeHint element = packed_element_type(candidate.type);
+	const IRInstruction::TypeHint value_type = get_register_type(func, value_reg);
+	// What the copy holds exactly as the host would store it: the element type, or
+	// an int into a float array (converted once, int64 to float or double, as the
+	// engine converts it). A value of unknown type is sorted out at run time. A
+	// value known to be of another type -- a float into an int array, a String --
+	// stays with the host, and so does a store the scan did not see, since the
+	// identity guards were chosen from what it saw.
+	const bool unknown = value_type == IRInstruction::TypeHint_NONE;
+	const bool storable = unknown || value_type == element ||
+		(element == Variant::FLOAT && value_type == Variant::INT);
+	if (get_register_type(func, index_reg) != Variant::INT || !storable || !candidate.written) {
+		func.packed_region->unsupported.insert(candidate.name);
+		func.ir.instructions.emplace_back(IROpcode::VARIANT_SET, IRValue::reg(candidate.reg),
+			IRValue::reg(index_reg), IRValue::reg(value_reg));
+		return;
+	}
+	const std::string oob_label = make_label("packed_oob");
+	const int index = emit_packed_index(candidate, index_reg, oob_label, func);
+	emit_packed_oob(candidate, index_reg, value_reg, oob_label, func);
+	const std::function<void(int, IRInstruction::TypeHint)> store = [&](int value, IRInstruction::TypeHint type) {
+		emit_four(func.ir.instructions, IROpcode::PACKED_SET, IRValue::imm(candidate.type),
+			IRValue::reg(candidate.data_reg), IRValue::reg(index), IRValue::reg(value)).type_hint = type;
+	};
+	if (!unknown) {
+		store(value_reg, value_type);
+		return;
+	}
+
+	// The tag decides: the element type (or an int, into a float array) goes
+	// straight into the copy. Anything else is the host's to convert or refuse;
+	// what it stored is read back into the copy, which stays in step.
+	const std::string slow_label = make_label("packed_store_host");
+	const std::string done_label = make_label("packed_stored");
+	const std::function<int(IRInstruction::TypeHint)> tag_is = [&](IRInstruction::TypeHint type) -> int {
+		const int test = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::TYPE_TEST, IRValue::reg(test), IRValue::reg(value_reg),
+			IRValue::imm(int64_t(type)));
+		set_register_type(func, test, Variant::BOOL);
+		return test;
+	};
+	if (element == Variant::FLOAT) {
+		const std::string not_float_label = make_label("packed_store_not_float");
+		emit_conditional_branch(IROpcode::BRANCH_ZERO, tag_is(Variant::FLOAT), not_float_label, func);
+		store(value_reg, Variant::FLOAT);
+		func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(done_label));
+		func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(not_float_label));
+		emit_conditional_branch(IROpcode::BRANCH_ZERO, tag_is(Variant::INT), slow_label, func);
+		store(value_reg, Variant::INT);
+	} else {
+		emit_conditional_branch(IROpcode::BRANCH_ZERO, tag_is(element), slow_label, func);
+		store(value_reg, element);
+	}
+	func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(done_label));
+	const size_t cold_begin = func.ir.instructions.size();
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(slow_label));
+	func.ir.instructions.emplace_back(IROpcode::VARIANT_SET, IRValue::reg(candidate.reg),
+		IRValue::reg(index_reg), IRValue::reg(value_reg));
+	const int stored = alloc_register(func);
+	gen_variant_get(stored, candidate.reg, index_reg, func);
+	store(stored, element);
+	func.packed_region->cold.emplace_back(cold_begin, func.ir.instructions.size());
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(done_label));
+}
+
+int CodeGenerator::gen_packed_size(FunctionContext::PackedCandidate& candidate, bool empty_test,
+	FunctionContext& func)
+{
+	// A copy: the caller may make the register a variable's own.
+	const int size = alloc_register(func);
+	func.ir.instructions.emplace_back(IROpcode::MOVE, IRValue::reg(size), IRValue::reg(candidate.size_reg));
+	set_register_type(func, size, Variant::INT);
+	if (!empty_test) {
+		return size;
+	}
+	const int zero = gen_int_immediate(0, func);
+	const int empty = alloc_register(func);
+	func.ir.instructions.emplace_back(IROpcode::CMP_EQ, IRValue::reg(empty), IRValue::reg(size),
+		IRValue::reg(zero)).type_hint = Variant::INT;
+	set_register_type(func, empty, Variant::BOOL);
+	return empty;
+}
+
+// `for x in v` over a candidate: the index walk the engine makes, on the copy.
+// The size is read again each pass, as the engine reads it.
+void CodeGenerator::gen_packed_walk(const ForStmt* stmt, FunctionContext::PackedCandidate& candidate,
+	FunctionContext& func)
+{
+	const std::string loop_label = make_label("packed_walk");
+	const std::string continue_label = make_label("packed_walk_continue");
+	const std::string end_label = make_label("packed_walk_end");
+	func.loops.push_back({ end_label, continue_label });
+	push_scope(func);
+
+	const int index = gen_int_immediate(0, func);
+	const int one = gen_int_immediate(1, func);
+	const int scope_id = open_scope(func);
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(loop_label));
+	emit_scope_release(scope_id, func);
+	const int more = alloc_register(func);
+	func.ir.instructions.emplace_back(IROpcode::CMP_LT, IRValue::reg(more), IRValue::reg(index),
+		IRValue::reg(candidate.size_reg)).type_hint = Variant::INT;
+	set_register_type(func, more, Variant::BOOL);
+	emit_conditional_branch(IROpcode::BRANCH_ZERO, more, end_label, func);
+
+	const IRInstruction::TypeHint element_type = packed_element_type(candidate.type);
+	const int element = alloc_register(func);
+	emit_four(func.ir.instructions, IROpcode::PACKED_GET, IRValue::reg(element),
+		IRValue::imm(candidate.type), IRValue::reg(candidate.data_reg),
+		IRValue::reg(index)).type_hint = element_type;
+	set_register_type(func, element, element_type);
+	declare_variable(func, stmt->variable, element, false, stmt);
+
+	push_scope(func);
+	for (const StmtPtr& body_stmt : stmt->body) {
+		gen_stmt(body_stmt.get(), func);
+	}
+	pop_scope(func);
+
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(continue_label));
+	func.ir.instructions.emplace_back(IROpcode::ADD, IRValue::reg(index), IRValue::reg(index),
+		IRValue::reg(one)).type_hint = Variant::INT;
+	func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(loop_label));
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(end_label));
+	emit_scope_release(scope_id, func);
+	pop_scope(func);
+	func.loops.pop_back();
 }
 
 // `for c in <String>`: the characters come in batches, so the walk costs one
@@ -4689,11 +6225,28 @@ int CodeGenerator::gen_variable(const VariableExpr* expr, FunctionContext& func,
 
 	if (is_global_variable(expr->name)) {
 		size_t global_idx = m_global_variables.at(expr->name);
-		// Forward reference: global not yet initialized, still NIL.
+		// Forward reference from an earlier global's initializer. GDScript runs member
+		// initializers in declaration order, so the later member still holds its type's
+		// default here: 0, 0.0, false, or null. That value, not an error, is what Godot gives.
 		if (global_idx >= m_globals_lowered) {
-			error_at("Global variable '" + expr->name + "' is used in the initializer of a global "
-				"declared before it", expr,
-				"Move the declaration of '" + expr->name + "' above that global");
+			const IRInstruction::TypeHint declared = global_idx < m_global_types.size()
+				? m_global_types[global_idx] : IRInstruction::TypeHint_NONE;
+			if (declared == Variant::INT) {
+				return gen_int_immediate(0, func);
+			}
+			if (declared == Variant::FLOAT) {
+				return gen_float_immediate(0.0, func);
+			}
+			const int reg = alloc_register(func);
+			if (declared == Variant::BOOL) {
+				IRInstruction instr(IROpcode::LOAD_BOOL, IRValue::reg(reg), IRValue::imm(0));
+				instr.type_hint = Variant::BOOL;
+				func.ir.instructions.push_back(instr);
+				set_register_type(func, reg, Variant::BOOL);
+			} else {
+				func.ir.instructions.emplace_back(IROpcode::LOAD_NIL, IRValue::reg(reg));
+			}
+			return reg;
 		}
 		if (!m_members_in_scope && global_idx < m_global_is_member.size()
 			&& m_global_is_member[global_idx]) {
@@ -4750,6 +6303,15 @@ int CodeGenerator::gen_variable(const VariableExpr* expr, FunctionContext& func,
 	}
 
 	if (const StructDecl* decl = find_struct(expr->name)) {
+		const std::unordered_map<std::string, int>::const_iterator value = m_class_value_globals.find(decl->name);
+		if (decl->is_class && value != m_class_value_globals.end()) {
+			m_class_values_used.insert(value->second);
+			int result_reg = alloc_register(func);
+			func.ir.instructions.emplace_back(IROpcode::LOAD_GLOBAL, IRValue::reg(result_reg),
+				IRValue::imm(int64_t(value->second)));
+			set_register_type(func, result_reg, Variant::OBJECT);
+			return result_reg;
+		}
 		error_at("Struct '" + decl->name + "' is a type, not a value", expr,
 			"Create an instance with '" + decl->name + ".new()'");
 	}
@@ -4769,6 +6331,21 @@ int CodeGenerator::gen_variable(const VariableExpr* expr, FunctionContext& func,
 	if (is_local_function(expr->name) || m_test_functions.count(expr->name)) {
 		reject_test_reference(expr->name, expr);
 		return gen_make_callable(expr->name, -1, func);
+	}
+
+	// A method of the enclosing class by bare name is a Callable bound to this instance, the
+	// way a lambda binds its captures; a static one binds nothing.
+	if (m_current_class != nullptr) {
+		const StructDecl* owner = nullptr;
+		if (const FunctionDecl* method = find_class_method(*m_current_class, expr->name, &owner)) {
+			Variable* self = find_variable(func, "self");
+			if (method->is_static) {
+				return gen_make_callable(lifted_method_name(*owner, expr->name), -1, func);
+			}
+			if (self != nullptr) {
+				return gen_make_callable(lifted_method_name(*owner, expr->name), self->register_num, func);
+			}
+		}
 	}
 
 	// A global class name is its Script resource.  Static methods and constants
@@ -5767,6 +7344,212 @@ int CodeGenerator::gen_binary(const BinaryExpr* expr, FunctionContext& func) {
 // The name a class instance was made from, so a Dictionary can answer `is`.
 static constexpr const char* CLASS_NAME_KEY = "@class";
 
+// The `@class` name of a Dictionary known to be one, or null unless its `@seal` is this
+// program's own seal object: a forged `@class` key names no class.
+int CodeGenerator::gen_sealed_class_tag(int value_reg, FunctionContext& func) {
+	int tag_reg = gen_dict_get(value_reg, CLASS_NAME_KEY, func);
+	if (m_seal_global < 0) {
+		return tag_reg;
+	}
+	m_seal_used = true;
+	const std::string sealed_label = make_label("sealed");
+	int seal_reg = gen_dict_get(value_reg, SEAL_KEY, func);
+	int expected_reg = alloc_register(func);
+	func.ir.instructions.emplace_back(IROpcode::LOAD_GLOBAL, IRValue::reg(expected_reg),
+		IRValue::imm(int64_t(m_seal_global)));
+	set_register_type(func, expected_reg, Variant::OBJECT);
+	int same_reg = alloc_register(func);
+	func.ir.instructions.emplace_back(IROpcode::CMP_EQ, IRValue::reg(same_reg),
+		IRValue::reg(seal_reg), IRValue::reg(expected_reg));
+	set_register_type(func, same_reg, Variant::BOOL);
+	emit_conditional_branch(IROpcode::BRANCH_NOT_ZERO, same_reg, sealed_label, func);
+	func.ir.instructions.emplace_back(IROpcode::LOAD_NIL, IRValue::reg(tag_reg));
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(sealed_label));
+	set_register_type(func, tag_reg, IRInstruction::TypeHint_NONE);
+	free_register(func, same_reg);
+	free_register(func, expected_reg);
+	free_register(func, seal_reg);
+	return tag_reg;
+}
+
+// `obj.m(args)` on an untyped receiver: a sealed class instance calls the `m` its class
+// resolves to, anything else takes the generic VCALL. Arguments are evaluated once.
+int CodeGenerator::gen_class_dispatch(const MemberCallExpr* expr, int obj_reg, FunctionContext& func) {
+	return gen_class_dispatch(expr->member_name, expr->arguments, obj_reg, func,
+		[&](const std::vector<int>& arg_regs) {
+			int result_reg = alloc_register(func);
+			IRInstruction vcall(IROpcode::VCALL);
+			vcall.operands.push_back(IRValue::reg(result_reg));
+			vcall.operands.push_back(IRValue::reg(obj_reg));
+			vcall.operands.push_back(ir_str(expr->member_name));
+			vcall.operands.push_back(IRValue::imm(int64_t(arg_regs.size())));
+			for (int reg : arg_regs) vcall.operands.push_back(IRValue::reg(reg));
+			func.ir.instructions.push_back(std::move(vcall));
+			return result_reg;
+		});
+}
+
+int CodeGenerator::gen_class_dispatch(const std::string& method_name, const std::vector<ExprPtr>& arguments,
+	int obj_reg, FunctionContext& func, const std::function<int(const std::vector<int>&)>& fallback) {
+	struct Arm {
+		const StructDecl* decl;
+		const FunctionDecl* method;
+		const StructDecl* owner;
+	};
+	std::vector<std::string> names;
+	for (const std::unordered_map<std::string, const StructDecl*>::value_type& entry : m_structs) {
+		if (entry.second->is_class) names.push_back(entry.first);
+	}
+	std::sort(names.begin(), names.end());
+	std::vector<Arm> arms;
+	for (const std::string& name : names) {
+		const StructDecl* decl = find_struct(name);
+		const StructDecl* owner = nullptr;
+		const FunctionDecl* method = find_class_method(*decl, method_name, &owner);
+		if (method == nullptr || method->is_coroutine || arguments.size() > method->parameters.size()) {
+			continue;
+		}
+		bool defaults_cover = true;
+		for (size_t i = arguments.size(); i < method->parameters.size(); i++) {
+			defaults_cover = defaults_cover && method->parameters[i].default_value != nullptr;
+		}
+		if (defaults_cover) arms.push_back({decl, method, owner});
+	}
+	if (arms.empty()) {
+		return -1;
+	}
+
+	std::vector<int> arg_regs;
+	for (const ExprPtr& argument : arguments) {
+		arg_regs.push_back(gen_expr(argument.get(), func));
+	}
+	int result_reg = alloc_register(func);
+	const std::string fallback_label = make_label("dispatch_fallback");
+	const std::string end_label = make_label("dispatch_end");
+
+	if (get_register_type(func, obj_reg) != Variant::DICTIONARY) {
+		int is_dict_reg = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::TYPE_TEST, IRValue::reg(is_dict_reg),
+			IRValue::reg(obj_reg), IRValue::imm(int64_t(Variant::DICTIONARY)));
+		set_register_type(func, is_dict_reg, Variant::BOOL);
+		emit_conditional_branch(IROpcode::BRANCH_ZERO, is_dict_reg, fallback_label, func);
+		free_register(func, is_dict_reg);
+	}
+	int tag_reg = gen_sealed_class_tag(obj_reg, func);
+	for (const Arm& arm : arms) {
+		const std::string next_label = make_label("dispatch_next");
+		int name_reg = gen_string_value(arm.decl->name, func);
+		int match_reg = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::CMP_EQ, IRValue::reg(match_reg),
+			IRValue::reg(tag_reg), IRValue::reg(name_reg));
+		set_register_type(func, match_reg, Variant::BOOL);
+		free_register(func, name_reg);
+		emit_conditional_branch(IROpcode::BRANCH_ZERO, match_reg, next_label, func);
+		free_register(func, match_reg);
+
+		std::vector<int> call_regs;
+		if (!arm.method->is_static) call_regs.push_back(obj_reg);
+		call_regs.insert(call_regs.end(), arg_regs.begin(), arg_regs.end());
+		std::vector<int> default_regs;
+		for (size_t i = arguments.size(); i < arm.method->parameters.size(); i++) {
+			default_regs.push_back(gen_expr(arm.method->parameters[i].default_value.get(), func));
+		}
+		call_regs.insert(call_regs.end(), default_regs.begin(), default_regs.end());
+		IRInstruction call(IROpcode::CALL);
+		call.operands.push_back(ir_str(lifted_method_name(*arm.owner, arm.method->name)));
+		call.operands.push_back(IRValue::reg(result_reg));
+		call.operands.push_back(IRValue::imm(int64_t(call_regs.size())));
+		for (int reg : call_regs) call.operands.push_back(IRValue::reg(reg));
+		func.ir.instructions.push_back(std::move(call));
+		for (int reg : default_regs) free_register(func, reg);
+		func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(end_label));
+		func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(next_label));
+	}
+	free_register(func, tag_reg);
+
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(fallback_label));
+	int fallback_reg = fallback(arg_regs);
+	func.ir.instructions.emplace_back(IROpcode::MOVE, IRValue::reg(result_reg), IRValue::reg(fallback_reg));
+	free_register(func, fallback_reg);
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(end_label));
+	for (int reg : arg_regs) free_register(func, reg);
+	set_register_type(func, result_reg, IRInstruction::TypeHint_NONE);
+	return result_reg;
+}
+
+// `c.new(args)` where c may be a class used as a value: compare c against each class's
+// object and construct that class; anything else (a Script, say) takes the generic call.
+int CodeGenerator::gen_class_value_new(const MemberCallExpr* expr, int obj_reg, FunctionContext& func) {
+	std::vector<std::pair<std::string, int>> classes(m_class_value_globals.begin(), m_class_value_globals.end());
+	std::sort(classes.begin(), classes.end());
+	std::vector<int> arg_regs;
+	for (const ExprPtr& argument : expr->arguments) {
+		arg_regs.push_back(gen_expr(argument.get(), func));
+	}
+	int result_reg = alloc_register(func);
+	const std::string fallback_label = make_label("class_new_fallback");
+	const std::string end_label = make_label("class_new_end");
+	if (get_register_type(func, obj_reg) != Variant::OBJECT) {
+		int is_object_reg = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::TYPE_TEST, IRValue::reg(is_object_reg),
+			IRValue::reg(obj_reg), IRValue::imm(int64_t(Variant::OBJECT)));
+		set_register_type(func, is_object_reg, Variant::BOOL);
+		emit_conditional_branch(IROpcode::BRANCH_ZERO, is_object_reg, fallback_label, func);
+		free_register(func, is_object_reg);
+	}
+	for (const std::pair<std::string, int>& entry : classes) {
+		const StructDecl* owner = nullptr;
+		const FunctionDecl* init = find_class_method(*find_struct(entry.first), "_init", &owner);
+		const size_t declared = init != nullptr ? init->parameters.size() : 0;
+		bool accepts = arg_regs.size() <= declared;
+		for (size_t i = arg_regs.size(); accepts && i < declared; i++) {
+			accepts = init->parameters[i].default_value != nullptr;
+		}
+		if (!accepts) {
+			continue;
+		}
+		const std::string next_label = make_label("class_new_next");
+		m_class_values_used.insert(entry.second);
+		int class_reg = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::LOAD_GLOBAL, IRValue::reg(class_reg),
+			IRValue::imm(int64_t(entry.second)));
+		set_register_type(func, class_reg, Variant::OBJECT);
+		int same_reg = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::CMP_EQ, IRValue::reg(same_reg),
+			IRValue::reg(obj_reg), IRValue::reg(class_reg));
+		set_register_type(func, same_reg, Variant::BOOL);
+		free_register(func, class_reg);
+		emit_conditional_branch(IROpcode::BRANCH_ZERO, same_reg, next_label, func);
+		free_register(func, same_reg);
+
+		const std::pair<std::string, size_t> wanted(entry.first, arg_regs.size());
+		if (std::find(m_pending_constructors.begin(), m_pending_constructors.end(), wanted) ==
+			m_pending_constructors.end()) {
+			m_pending_constructors.push_back(wanted);
+		}
+		IRInstruction call(IROpcode::CALL);
+		call.operands.push_back(ir_str(class_value_constructor_name(entry.first, arg_regs.size())));
+		call.operands.push_back(IRValue::reg(result_reg));
+		call.operands.push_back(IRValue::imm(int64_t(arg_regs.size())));
+		for (int reg : arg_regs) call.operands.push_back(IRValue::reg(reg));
+		func.ir.instructions.push_back(std::move(call));
+		func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(end_label));
+		func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(next_label));
+	}
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(fallback_label));
+	IRInstruction vcall(IROpcode::VCALL);
+	vcall.operands.push_back(IRValue::reg(result_reg));
+	vcall.operands.push_back(IRValue::reg(obj_reg));
+	vcall.operands.push_back(ir_str("new"));
+	vcall.operands.push_back(IRValue::imm(int64_t(arg_regs.size())));
+	for (int reg : arg_regs) vcall.operands.push_back(IRValue::reg(reg));
+	func.ir.instructions.push_back(std::move(vcall));
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(end_label));
+	for (int reg : arg_regs) free_register(func, reg);
+	set_register_type(func, result_reg, IRInstruction::TypeHint_NONE);
+	return result_reg;
+}
+
 // `x is Declared` where x is a Dictionary of unknown provenance: compare the
 // `@class` the constructor wrote against every class in the file that derives
 // from the one asked about. Answers -1 when the name is not one of them, which
@@ -5814,7 +7597,7 @@ int CodeGenerator::gen_instance_class_test(int value_reg, const std::string& cla
 	}
 
 	// One get: a missing key answers null, which matches no name.
-	int tag_reg = gen_dict_get(value_reg, CLASS_NAME_KEY, func);
+	int tag_reg = gen_sealed_class_tag(value_reg, func);
 	for (const std::string& name : names) {
 		int name_reg = alloc_register(func);
 		IRInstruction load_name(IROpcode::LOAD_STRING, IRValue::reg(name_reg),
@@ -6208,7 +7991,7 @@ int CodeGenerator::gen_trait_test(int value_reg, const TraitDecl& iface,
 	}
 	if (known != Variant::OBJECT) {
 		if (!class_names.empty()) {
-			int tag = gen_dict_get(value_reg, CLASS_NAME_KEY, func);
+			int tag = gen_sealed_class_tag(value_reg, func);
 			for (const std::string& name : class_names) {
 				int expected = gen_string_value(name, func);
 				func.ir.instructions.emplace_back(IROpcode::CMP_EQ, IRValue::reg(result),
@@ -6827,6 +8610,12 @@ void CodeGenerator::gen_builtin_method(const BuiltinMethod& method, int result_r
 static constexpr const char* NATIVE_BASE_KEY = "@base";
 
 int CodeGenerator::gen_member_call(const MemberCallExpr* expr, FunctionContext& func) {
+	if (func.packed_region != nullptr && expr->is_method_call && !expr->safe &&
+		expr->arguments.empty() && (expr->member_name == "size" || expr->member_name == "is_empty")) {
+		if (FunctionContext::PackedCandidate* candidate = packed_candidate(expr->object.get(), func)) {
+			return gen_packed_size(*candidate, expr->member_name == "is_empty", func);
+		}
+	}
 	VariableExpr chain_object("");
 	const Expr* object_expr = expr->object.get();
 	if (expr->safe) {
@@ -7214,6 +9003,16 @@ int CodeGenerator::gen_member_call(const MemberCallExpr* expr, FunctionContext& 
 		emit_safe_guard(obj_reg, func, expr);
 	}
 
+	if (expr->is_method_call && expr->member_name == "new" && get_register_struct(func, obj_reg) == nullptr &&
+		!m_class_value_globals.empty()) {
+		const IRInstruction::TypeHint receiver = get_register_type(func, obj_reg);
+		if (receiver == IRInstruction::TypeHint_NONE || receiver == Variant::OBJECT) {
+			int result = gen_class_value_new(expr, obj_reg, func);
+			free_register(func, obj_reg);
+			return result;
+		}
+	}
+
 	if (expr->is_method_call && expr->member_name == "copy" && expr->arguments.empty()) {
 		if (const StructDecl* structure = get_register_struct(func, obj_reg);
 			structure != nullptr && !structure->is_class) {
@@ -7256,6 +9055,11 @@ int CodeGenerator::gen_member_call(const MemberCallExpr* expr, FunctionContext& 
 						expr->member_name + "()' on an untyped value", expr,
 						"Declare the receiver as '" + structure->name + "'");
 				}
+			}
+			int dispatched = gen_class_dispatch(expr, obj_reg, func);
+			if (dispatched >= 0) {
+				free_register(func, obj_reg);
+				return dispatched;
 			}
 		}
 	}
@@ -7487,6 +9291,16 @@ int CodeGenerator::gen_member_call(const MemberCallExpr* expr, FunctionContext& 
 		vcall_instr.operands.push_back(IRValue::reg(arg_reg));
 	}
 	func.ir.instructions.push_back(std::move(vcall_instr));
+	// A typed Packed*Array's size() is an int and is_empty() a bool, whichever
+	// path asked (the region's copy answers them typed).
+	if (m_fast_arrays && expr->is_method_call && arg_regs.empty() &&
+		is_packed_array_type(get_register_type(func, obj_reg))) {
+		if (expr->member_name == "size") {
+			set_register_type(func, result_reg, Variant::INT);
+		} else if (expr->member_name == "is_empty") {
+			set_register_type(func, result_reg, Variant::BOOL);
+		}
+	}
 
 	free_register(func, obj_reg);
 	for (int reg : arg_regs) {
@@ -7503,6 +9317,9 @@ bool CodeGenerator::is_array_element_access(int obj_reg, int idx_reg, FunctionCo
 }
 
 int CodeGenerator::gen_index(const IndexExpr* expr, FunctionContext& func) {
+	if (FunctionContext::PackedCandidate* candidate = packed_candidate(expr->object.get(), func)) {
+		return gen_packed_read(*candidate, expr, func);
+	}
 	int obj_reg = gen_expr(expr->object.get(), func);
 	const StructDecl* element_struct = nullptr;
 	const TraitDecl* element_trait = nullptr;
@@ -7559,6 +9376,10 @@ int CodeGenerator::gen_array_literal(const ArrayLiteralExpr* expr, FunctionConte
 
 	func.ir.instructions.push_back(instr);
 	set_register_type(func, result_reg, Variant::ARRAY);
+	if (func.type_log != nullptr && std::all_of(elem_regs.begin(), elem_regs.end(),
+			[&](int reg) { return packed_reach(get_register_type(func, reg)) == 0; })) {
+		func.type_log->push_back({ func.ir.instructions.size(), result_reg, PACKED_INERT_CONTAINER });
+	}
 
 	for (int reg : elem_regs) {
 		free_register(func, reg);
@@ -7589,6 +9410,12 @@ int CodeGenerator::gen_dictionary_literal(const DictionaryLiteralExpr* expr, Fun
 
 	func.ir.instructions.push_back(instr);
 	set_register_type(func, result_reg, Variant::DICTIONARY);
+	if (func.type_log != nullptr && std::all_of(key_regs.begin(), key_regs.end(),
+			[&](int reg) { return packed_reach(get_register_type(func, reg)) == 0; }) &&
+		std::all_of(value_regs.begin(), value_regs.end(),
+			[&](int reg) { return packed_reach(get_register_type(func, reg)) == 0; })) {
+		func.type_log->push_back({ func.ir.instructions.size(), result_reg, PACKED_INERT_CONTAINER });
+	}
 
 	for (int reg : key_regs) {
 		free_register(func, reg);
@@ -8100,6 +9927,14 @@ void CodeGenerator::register_class_constants(const Program& program, IRProgram& 
 			}
 			if (!fold_global_initializer(constant.default_value.get(), folded, nullptr, &decl)
 				|| folded.init_type == IRGlobalVar::InitType::RUNTIME) {
+				// Besides the preloads above, GDScript allows `const O: Vector3 = Vector3(...)` and
+				// read-only container literals in a class; they are evaluated where they are read.
+				const Expr* value = constant.default_value.get();
+				if (!m_extensions && (dynamic_cast<const CallExpr*>(value) != nullptr || dynamic_cast<const ArrayLiteralExpr*>(value) != nullptr ||
+					dynamic_cast<const DictionaryLiteralExpr*>(value) != nullptr)) {
+					m_call_class_constants[folded.name] = { &decl, &constant };
+					continue;
+				}
 				error_at("The constant '" + decl.name + "." + constant.name +
 					"' is not a compile-time value", constant.line, constant.column,
 					"A struct or class holds no storage of its own, so its constants have to fold. "
@@ -8132,6 +9967,16 @@ int CodeGenerator::gen_class_constant(const StructDecl& decl, const std::string&
 		auto it = m_class_constants.find(at->name + "." + name);
 		if (it != m_class_constants.end()) {
 			return gen_folded_const(it->second, func);
+		}
+		const std::unordered_map<std::string, std::pair<const StructDecl*, const StructField*>>::const_iterator call =
+			m_call_class_constants.find(at->name + "." + name);
+		if (call != m_call_class_constants.end()) {
+			const StructDecl* enclosing = m_current_class;
+			m_current_class = call->second.first;
+			int reg = gen_expr(call->second.second->default_value.get(), func);
+			m_current_class = enclosing;
+			apply_declared_type(reg, call->second.second->type_hint, func);
+			return reg;
 		}
 	}
 	return -1;
@@ -8942,8 +10787,19 @@ int CodeGenerator::gen_class_construct(const StructDecl& decl, const std::vector
 		set_register_type(func, class_reg, Variant::STRING);
 	}
 
+	int seal_key_reg = -1;
+	int seal_reg = -1;
+	if (class_reg >= 0 && m_seal_global >= 0) {
+		m_seal_used = true;
+		seal_key_reg = gen_string_value(SEAL_KEY, func);
+		seal_reg = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::LOAD_GLOBAL, IRValue::reg(seal_reg),
+			IRValue::imm(int64_t(m_seal_global)));
+		set_register_type(func, seal_reg, Variant::OBJECT);
+	}
+
 	const size_t entries = fields.size() + (base_class != nullptr ? 1 : 0)
-		+ (class_reg >= 0 ? 1 : 0);
+		+ (class_reg >= 0 ? 1 : 0) + (seal_reg >= 0 ? 1 : 0);
 	int result_reg = alloc_register(func);
 	IRInstruction make(IROpcode::MAKE_DICTIONARY);
 	make.operands.push_back(IRValue::reg(result_reg));
@@ -8953,6 +10809,10 @@ int CodeGenerator::gen_class_construct(const StructDecl& decl, const std::vector
 	if (class_reg >= 0) {
 		make.operands.push_back(IRValue::reg(class_key_reg));
 		make.operands.push_back(IRValue::reg(class_reg));
+	}
+	if (seal_reg >= 0) {
+		make.operands.push_back(IRValue::reg(seal_key_reg));
+		make.operands.push_back(IRValue::reg(seal_reg));
 	}
 	if (base_class != nullptr) {
 		base_key_reg = alloc_register(func);
@@ -8999,6 +10859,10 @@ int CodeGenerator::gen_class_construct(const StructDecl& decl, const std::vector
 	}
 	if (class_reg >= 0) {
 		free_register(func, class_reg);
+	}
+	if (seal_reg >= 0) {
+		free_register(func, seal_key_reg);
+		free_register(func, seal_reg);
 	}
 
 	// Before _init(), so the class is a script instance while _init() runs, the
@@ -9513,6 +11377,9 @@ void CodeGenerator::declare_variable(FunctionContext& func, const std::string& n
 
 void CodeGenerator::set_register_type(FunctionContext& func, int reg, IRInstruction::TypeHint type) {
 	func.register_types[reg] = type;
+	if (func.type_log != nullptr) {
+		func.type_log->push_back({ func.ir.instructions.size(), reg, type });
+	}
 	for (IRFunction::DebugLocal &local : func.ir.debug_locals) {
 		if (local.register_num == reg && local.end_instruction == SIZE_MAX) {
 			local.type_hint = type;
@@ -10465,6 +12332,12 @@ int CodeGenerator::gen_member_read(int obj_reg, const std::string& member, Funct
 
 	// Struct field: validate and apply declared type.
 	if (const StructDecl* decl = get_register_struct(func, obj_reg)) {
+		const std::string getter_name = "@" + member + "_getter";
+		const StructDecl* getter_owner = nullptr;
+		const FunctionDecl* getter = decl->is_class ? find_class_method(*decl, getter_name, &getter_owner) : nullptr;
+		if (getter != nullptr && func.ir.name != lifted_method_name(*getter_owner, getter_name)) {
+			return gen_class_method_call(*decl, *getter, *getter_owner, obj_reg, {}, NamedArguments{}, func, site);
+		}
 		if (find_struct_field(*decl, member) == nullptr && native_base(*decl) != nullptr) {
 			int base_reg = gen_native_base_load(obj_reg, func);
 			int result_reg = gen_vget(base_reg, member, func);
@@ -10476,6 +12349,18 @@ int CodeGenerator::gen_member_read(int obj_reg, const std::string& member, Funct
 		int result_reg = gen_dict_get(obj_reg, member, func);
 		apply_declared_type(result_reg, field.type_hint, func);
 		return result_reg;
+	}
+
+	// A class getter on a value the compiler cannot type goes through the sealed dispatch.
+	if (obj_type == Variant::DICTIONARY || obj_type == IRInstruction::TypeHint_NONE) {
+		int dispatched = gen_class_dispatch("@" + member + "_getter", {}, obj_reg, func,
+			[&](const std::vector<int>&) {
+				return obj_type == Variant::DICTIONARY ? gen_dict_get(obj_reg, member, func)
+					: gen_dynamic_member_get(obj_reg, member, func);
+			});
+		if (dispatched >= 0) {
+			return dispatched;
+		}
 	}
 
 	// Dictionary: element read, not VGET (Object-only).
@@ -10605,6 +12490,7 @@ int CodeGenerator::gen_element_read(int obj_reg, int idx_reg, FunctionContext& f
 	int result_reg = alloc_register(func);
 	gen_variant_get(result_reg, obj_reg, idx_reg, func);
 	set_register_type(func, result_reg, IRInstruction::TypeHint_NONE);
+	type_packed_element(obj_reg, result_reg, func);
 	return result_reg;
 }
 

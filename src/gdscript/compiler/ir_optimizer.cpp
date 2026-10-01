@@ -899,6 +899,12 @@ void IROptimizer::fold_instruction(const IRInstruction& instr, std::vector<IRIns
 		case IROpcode::MAKE_SCOPED:
 		case IROpcode::BATCH_GET:
 		case IROpcode::CODEPOINT_GET:
+		case IROpcode::PACKED_GET:
+		case IROpcode::PACKED_SET:
+		case IROpcode::PACKED_SIZE:
+		case IROpcode::PACKED_DATA:
+		case IROpcode::PACKED_IDENTITY:
+		case IROpcode::PACKED_INDEX:
 		case IROpcode::SWITCH:
 		case IROpcode::VGET_INLINE:
 		case IROpcode::VSET_INLINE:
@@ -1224,8 +1230,9 @@ bool IROptimizer::try_remove_branch_to_next(const IRFunction& func, size_t& i, s
 	if (instr.opcode != IROpcode::JUMP && !ir_has_effect(instr.opcode, IR_BRANCH)) {
 		return false;
 	}
-	// SWITCH fall-through is out-of-range behaviour, not redundancy.
-	if (instr.opcode == IROpcode::SWITCH) {
+	// SWITCH fall-through is out-of-range behaviour, not redundancy; PACKED_INDEX
+	// defines its destination on the way through.
+	if (instr.opcode == IROpcode::SWITCH || instr.opcode == IROpcode::PACKED_INDEX) {
 		return false;
 	}
 

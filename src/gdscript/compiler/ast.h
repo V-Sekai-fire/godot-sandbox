@@ -258,6 +258,8 @@ struct VarDeclStmt : Stmt {
 	bool is_property = false;
 	bool is_static = false;
 	bool is_onready = false;
+	// `var x := v`: the type is inferred from v and fixed, unlike `var x = v`.
+	bool inferred = false;
 	std::string trait_origin;
 	std::string doc_comment;
 	int chain_link = 0;

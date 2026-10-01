@@ -1,9 +1,9 @@
 #include "../elf_builder.h"
 #include "../riscv_codegen.h"
-#include <libriscv/machine.hpp>
-#include <cassert>
+#include "witness/doctest.h"
 #include <cstring>
 #include <iostream>
+#include <libriscv/machine.hpp>
 
 using namespace gdscript;
 using machine_t = riscv::Machine<riscv::RISCV64>;
@@ -14,19 +14,19 @@ static IRInstruction load(int reg, int64_t value) {
 	return instr;
 }
 
-static void pad(IRFunction& fn) {
+static void pad(IRFunction &fn) {
 	fn.instructions.insert(fn.instructions.end(), 140000, load(1, 0x12345678));
 }
 
-static void return_value(IRFunction& fn, int64_t value) {
+static void return_value(IRFunction &fn, int64_t value) {
 	fn.instructions.push_back(load(0, value));
 	fn.instructions.emplace_back(IROpcode::RETURN);
 }
 
 static IRProgram program_with_long_jumps() {
 	IRProgram program;
-	auto label = [&](const char* name) { return IRValue::label(program.strings.intern(name)); };
-	auto function = [](const char* name, bool parameter = false) {
+	auto label = [&](const char *name) { return IRValue::label(program.strings.intern(name)); };
+	auto function = [](const char *name, bool parameter = false) {
 		IRFunction fn;
 		fn.name = name;
 		fn.max_registers = 2;
@@ -35,7 +35,7 @@ static IRProgram program_with_long_jumps() {
 		}
 		return fn;
 	};
-	auto branch = [&](IROpcode opcode, const char* target) {
+	auto branch = [&](IROpcode opcode, const char *target) {
 		IRInstruction instr(opcode, IRValue::reg(0), label(target));
 		instr.type_hint = Variant::INT;
 		return instr;
@@ -47,7 +47,7 @@ static IRProgram program_with_long_jumps() {
 
 	auto forward = function("forward");
 	forward.instructions.emplace_back(IROpcode::CALL, IRValue::str(program.strings.intern("late")),
-		IRValue::reg(0), IRValue::imm(0));
+									  IRValue::reg(0), IRValue::imm(0));
 	forward.instructions.emplace_back(IROpcode::RETURN);
 	program.functions.push_back(std::move(forward));
 
@@ -88,14 +88,14 @@ static IRProgram program_with_long_jumps() {
 
 	auto late = function("late");
 	late.instructions.emplace_back(IROpcode::CALL, IRValue::str(program.strings.intern("early")),
-		IRValue::reg(0), IRValue::imm(0));
+								   IRValue::reg(0), IRValue::imm(0));
 	late.instructions.emplace_back(IROpcode::RETURN);
 	program.functions.push_back(std::move(late));
 	return program;
 }
 
-static int64_t call(machine_t& machine, const char* name, int64_t argument = 0) {
-	auto& sp = machine.cpu.reg(riscv::REG_SP);
+static int64_t call(machine_t &machine, const char *name, int64_t argument = 0) {
+	auto &sp = machine.cpu.reg(riscv::REG_SP);
 	sp = machine.memory.stack_initial() - 128;
 	const uint64_t result = sp;
 	const uint64_t parameter = sp + 64;
@@ -114,21 +114,21 @@ static int64_t call(machine_t& machine, const char* name, int64_t argument = 0) 
 	if (result_type != Variant::INT) {
 		std::cerr << name << " returned type " << result_type << " and payload " << value << '\n';
 	}
-	assert(result_type == Variant::INT);
+	REQUIRE(result_type == Variant::INT);
 	return value;
 }
 
-static uint32_t word_at(const std::vector<uint8_t>& code, size_t offset) {
+static uint32_t word_at(const std::vector<uint8_t> &code, size_t offset) {
 	uint32_t word;
 	std::memcpy(&word, code.data() + offset, sizeof(word));
 	return word;
 }
 
-int main() {
+TEST_CASE("a jump past a megabyte still lands") {
 	const auto program = program_with_long_jumps();
 	RISCVCodeGen codegen;
 	const auto code = codegen.generate(program);
-	assert(codegen.get_function_offsets().at("late") - codegen.get_function_offsets().at("forward") > (1u << 20));
+	REQUIRE(codegen.get_function_offsets().at("late") - codegen.get_function_offsets().at("forward") > (1u << 20));
 	size_t forward_calls = 0, backward_calls = 0, forward_jumps = 0, backward_jumps = 0;
 	for (size_t pc = 0; pc + 8 <= code.size(); pc += 4) {
 		const uint32_t upper = word_at(code, pc);
@@ -136,8 +136,8 @@ int main() {
 		if ((upper & 0x7F) != 0x17 || (lower & 0x7F) != 0x67) {
 			continue;
 		}
-		assert(((upper >> 7) & 31) == RISCVCodeGen::REG_WIDE_SCRATCH);
-		assert(((lower >> 15) & 31) == RISCVCodeGen::REG_WIDE_SCRATCH);
+		REQUIRE(((upper >> 7) & 31) == RISCVCodeGen::REG_WIDE_SCRATCH);
+		REQUIRE(((lower >> 15) & 31) == RISCVCodeGen::REG_WIDE_SCRATCH);
 		const int64_t displacement = int64_t(int32_t(upper & 0xFFFFF000)) + (int32_t(lower) >> 20);
 		const bool is_call = ((lower >> 7) & 31) != 0;
 		if (displacement >= (1 << 20)) {
@@ -146,21 +146,20 @@ int main() {
 			(is_call ? backward_calls : backward_jumps)++;
 		}
 	}
-	assert(forward_calls > 0 && backward_calls > 0 && forward_jumps > 0 && backward_jumps > 0);
+	REQUIRE((forward_calls > 0 && backward_calls > 0 && forward_jumps > 0 && backward_jumps > 0));
 
 	ElfBuilder builder;
 	const auto elf = builder.build(program);
-	machine_t machine(elf, riscv::MachineOptions<riscv::RISCV64>{.memory_max = 64ull << 20});
+	machine_t machine(elf, riscv::MachineOptions<riscv::RISCV64>{ .memory_max = 64ull << 20 });
 	machine.simulate(1000000ull);
-	assert(call(machine, "forward") == 11);
-	assert(call(machine, "late") == 11);
-	assert(call(machine, "flow", 0) == 17);
-	assert(call(machine, "flow", 1) == 17);
-	assert(call(machine, "backward", 0) == 19);
-	assert(call(machine, "backward", 1) == 19);
-	assert(call(machine, "table", -1) == 23);
-	assert(call(machine, "table", 0) == 29);
-	assert(call(machine, "table", 1) == 31);
-	assert(call(machine, "table", 2) == 23);
-	std::cout << "Long jumps, calls, branches and dense tables passed (" << code.size() << " bytes)\n";
+	REQUIRE(call(machine, "forward") == 11);
+	REQUIRE(call(machine, "late") == 11);
+	REQUIRE(call(machine, "flow", 0) == 17);
+	REQUIRE(call(machine, "flow", 1) == 17);
+	REQUIRE(call(machine, "backward", 0) == 19);
+	REQUIRE(call(machine, "backward", 1) == 19);
+	REQUIRE(call(machine, "table", -1) == 23);
+	REQUIRE(call(machine, "table", 0) == 29);
+	REQUIRE(call(machine, "table", 1) == 31);
+	REQUIRE(call(machine, "table", 2) == 23);
 }

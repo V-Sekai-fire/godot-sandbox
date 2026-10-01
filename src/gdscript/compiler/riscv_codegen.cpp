@@ -726,6 +726,29 @@ void RISCVCodeGen::plan_frame(const IRFunction& func) {
 		m_fn.omits_frame = false;
 	}
 
+	// Packed array regions: one 32-byte descriptor per token, in the raw space.
+	std::vector<int64_t> packed_tokens;
+	for (const IRInstruction& instr : func.instructions) {
+		int64_t token = -1;
+		if (instr.opcode == IROpcode::CALL_SYSCALL && instr.operands.size() >= 5 &&
+			instr.operands[1].type == IRValue::Type::IMMEDIATE &&
+			(instr.operands[1].immediate() == ECALL_PACKED_ACQUIRE ||
+			 instr.operands[1].immediate() == ECALL_PACKED_RELEASE)) {
+			token = instr.operands[4].immediate();
+		} else if (instr.opcode == IROpcode::PACKED_DATA || instr.opcode == IROpcode::PACKED_SIZE ||
+			instr.opcode == IROpcode::PACKED_IDENTITY) {
+			token = instr.operands[1].immediate();
+		}
+		if (token >= 0 && std::find(packed_tokens.begin(), packed_tokens.end(), token) == packed_tokens.end()) {
+			packed_tokens.push_back(token);
+		}
+	}
+	if (!packed_tokens.empty()) {
+		m_fn.omits_frame = false;
+	}
+	constexpr int PACKED_DESCRIPTOR_SIZE = 32;
+	const int packed_space = int(packed_tokens.size()) * PACKED_DESCRIPTOR_SIZE;
+
 	const int saved_reg_space = m_fn.saved_reg_space;
 
 	// Offsets are by vreg number, not visit order, so optimizer reordering is safe.
@@ -733,6 +756,7 @@ void RISCVCodeGen::plan_frame(const IRFunction& func) {
 	m_fn.array_batch_offsets.clear();
 	m_fn.array_batch_releases.clear();
 	m_fn.codepoint_batch_offsets.clear();
+	m_fn.packed_offsets.clear();
 	std::vector<int64_t> array_batch_tokens;
 	std::vector<int64_t> codepoint_batch_tokens;
 	std::unordered_map<int64_t, std::vector<int64_t>> array_batch_scopes;
@@ -790,30 +814,42 @@ void RISCVCodeGen::plan_frame(const IRFunction& func) {
 	const int codepoint_batch_space = int(codepoint_batch_tokens.size()) *
 		CODEPOINT_BATCH_SIZE * int(sizeof(char32_t));
 
+	// The Variant slots (all a scope release hands the host) start right above the
+	// saved registers. The packed array descriptors go last: a region reads them
+	// at its entry and exits only, and they must not push hot slots past the
+	// 12-bit offsets a load reaches directly.
+	m_fn.variant_base = saved_reg_space;
+	// By vreg number: a run of consecutive vregs is a run of consecutive slots,
+	// which argument staging relies on (MAKE_ARRAY's direct elements).
 	for (int vreg = 0; vreg < max_variants; vreg++) {
 		const int slot = vreg < int(m_fn.scalar_aliases.size())
 			? m_fn.scalar_aliases[size_t(vreg)] : vreg;
-		int offset = saved_reg_space + (slot * variant_size());
+		int offset = m_fn.variant_base + (slot * variant_size());
 		m_fn.variant_offsets[vreg] = offset;
 	}
 	m_fn.scratch_slot_base = max_variants;
 	const int batch_slot_base = max_variants + SCRATCH_VARIANT_SLOTS;
 	for (size_t i = 0; i < array_batch_tokens.size(); i++) {
-		m_fn.array_batch_offsets[array_batch_tokens[i]] = saved_reg_space +
+		m_fn.array_batch_offsets[array_batch_tokens[i]] = m_fn.variant_base +
 			(batch_slot_base + int(i) * ARRAY_BATCH_SIZE) * variant_size();
 	}
 	for (size_t i = 0; i < codepoint_batch_tokens.size(); i++) {
-		m_fn.codepoint_batch_offsets[codepoint_batch_tokens[i]] = saved_reg_space + variant_space +
+		m_fn.codepoint_batch_offsets[codepoint_batch_tokens[i]] = m_fn.variant_base + variant_space +
 			int(i) * CODEPOINT_BATCH_SIZE * int(sizeof(char32_t));
 	}
 	m_fn.next_variant_slot = max_variants + SCRATCH_VARIANT_SLOTS + batch_slots;
 	m_fn.variant_space = variant_space;
 
-	m_fn.scope_slot_base = saved_reg_space + variant_space + codepoint_batch_space;
+	for (size_t i = 0; i < packed_tokens.size(); i++) {
+		m_fn.packed_offsets[packed_tokens[i]] = m_fn.variant_base + variant_space + codepoint_batch_space +
+			int(i) * PACKED_DESCRIPTOR_SIZE;
+	}
+
+	m_fn.scope_slot_base = m_fn.variant_base + variant_space + codepoint_batch_space + packed_space;
 
 	m_fn.stack_frame_size = m_fn.omits_frame
 		? 0
-		: saved_reg_space + variant_space + codepoint_batch_space + m_fn.scope_slot_count * 8;
+		: m_fn.variant_base + variant_space + codepoint_batch_space + packed_space + m_fn.scope_slot_count * 8;
 
 	m_fn.stack_frame_size = (m_fn.stack_frame_size + 15) & ~15; // RISC-V ABI: 16-byte aligned
 
@@ -852,6 +888,10 @@ void RISCVCodeGen::plan_numeric_loop_modes(const IRFunction& func) {
 		if (std::find(m_fn.used_int_resident_regs.begin(),
 			m_fn.used_int_resident_regs.end(), preg) == m_fn.used_int_resident_regs.end())
 			free_regs.push_back(preg);
+	}
+	// The loop scopes' dirty registers (plan_scalar_residency) come first.
+	for (size_t keep = loop_scope_dirty_demand(func, 2); keep > 0 && !free_regs.empty(); keep--) {
+		free_regs.erase(free_regs.begin());
 	}
 
 	// A cached operation writes the carried value's slot only, so its own
@@ -1185,6 +1225,10 @@ void RISCVCodeGen::plan_scalar_residency(const IRFunction& func) {
 	});
 	static constexpr std::array<uint8_t, 11> INT_REGS {{ 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 }};
 	static constexpr std::array<uint8_t, 12> FLOAT_REGS {{ 8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27 }};
+	// A loop scope that may allocate is released every pass: through the host,
+	// unless a dirty bit says nothing was made. Its register is worth more than
+	// one more resident, so keep it free for plan_scopes.
+	const size_t int_limit = INT_REGS.size() - loop_scope_dirty_demand(func, 2);
 	size_t next_int = 0;
 	size_t next_float = 0;
 	for (int root : groups) {
@@ -1211,7 +1255,7 @@ void RISCVCodeGen::plan_scalar_residency(const IRFunction& func) {
 			m_fn.used_float_resident_regs.push_back(preg);
 			for (int r : group_members[size_t(root)])
 				m_fn.resident_float_regs[size_t(r)] = int8_t(preg);
-		} else if (type != Variant::FLOAT && next_int < INT_REGS.size()) {
+		} else if (type != Variant::FLOAT && next_int < int_limit) {
 			const uint8_t preg = INT_REGS[next_int++];
 			m_fn.used_int_resident_regs.push_back(preg);
 			for (int r : group_members[size_t(root)])
@@ -1452,6 +1496,12 @@ bool RISCVCodeGen::instruction_reads_residents_directly(const IRInstruction& ins
 		case IROpcode::RETURN:
 		case IROpcode::BATCH_GET:
 		case IROpcode::CODEPOINT_GET:
+		case IROpcode::PACKED_GET:
+		case IROpcode::PACKED_SET:
+		case IROpcode::PACKED_SIZE:
+		case IROpcode::PACKED_DATA:
+		case IROpcode::PACKED_IDENTITY:
+		case IROpcode::PACKED_INDEX:
 		case IROpcode::CONVERT:
 			return true;
 		case IROpcode::MOVE: {
@@ -1519,7 +1569,7 @@ void RISCVCodeGen::emit_zero_variant_slots() {
 		}
 	};
 	for (int i = 0; i < m_fn.next_variant_slot; i++) {
-		store_zero(m_fn.saved_reg_space + i * vsize, false);
+		store_zero(m_fn.variant_base + i * vsize, false);
 	}
 	for (int i = 0; i < m_fn.scope_slot_count; i++) {
 		store_zero(m_fn.scope_slot_base + i * 8, true);
@@ -1803,6 +1853,373 @@ void RISCVCodeGen::gen_syscall_array_batch(const IRInstruction& instr, int resul
 	emit_add_offset(REG_A3, REG_SP, buffer->second);
 	emit_syscall(ECALL_ARRAY_BATCH);
 	emit_syscall_result(result_vreg, REG_A0, result_offset, Variant::INT);
+}
+
+// -= Packed array regions =-
+//
+// codegen.cpp acquires a Packed*Array into guest memory once per region with
+// ECALL_PACKED_ACQUIRE, accesses the copy with PACKED_GET/SET/SIZE, and writes
+// it back with ECALL_PACKED_RELEASE. The descriptor the acquire fills lives in
+// the frame: +0 data pointer, +8 element count, +16 identity, +24 dirty flag.
+
+int RISCVCodeGen::packed_descriptor_offset(int64_t token) const {
+	const std::unordered_map<int64_t, int>::const_iterator it = m_fn.packed_offsets.find(token);
+	if (it == m_fn.packed_offsets.end()) {
+		throw CompilerException(ErrorType::RISCV_codegen_ERROR,
+			"A packed array access refers to an unknown descriptor");
+	}
+	return it->second;
+}
+
+// a0 = subject GuestVariant*, a1 = Packed*Array type, a2 = descriptor, a3 = how
+// many element accesses the region expects (negative: unknown). a0 answers 0
+// when the descriptor holds the copy; anything else leaves the region unentered.
+void RISCVCodeGen::gen_syscall_packed_acquire(const IRInstruction& instr, int result_vreg) {
+	if (instr.operands.size() != 6) {
+		throw CompilerException(ErrorType::RISCV_codegen_ERROR, "ECALL_PACKED_ACQUIRE requires 6 operands");
+	}
+	const int subject_vreg = instr.operands[2].reg_index();
+	const int64_t type = instr.operands[3].immediate();
+	const int descriptor = packed_descriptor_offset(instr.operands[4].immediate());
+	const int expected_vreg = instr.operands[5].reg_index();
+	const int result_offset = get_variant_stack_offset(result_vreg);
+
+	spill_around_syscall({ REG_A0, REG_A1, REG_A2, REG_A3 });
+	const uint8_t expected = emit_int_operand(REG_A3, expected_vreg, get_variant_stack_offset(expected_vreg));
+	if (expected != REG_A3) {
+		emit_mv(REG_A3, expected);
+	}
+	emit_load_stack_offset(REG_A0, get_variant_stack_offset(subject_vreg));
+	emit_li(REG_A1, type);
+	emit_add_offset(REG_A2, REG_SP, descriptor);
+	emit_syscall(ECALL_PACKED_ACQUIRE);
+	emit_syscall_result(result_vreg, REG_A0, result_offset, Variant::INT);
+}
+
+// a0 = subject GuestVariant*, a1 = Packed*Array type, a2 = descriptor. The host
+// writes a dirty copy back into the subject's own array and frees the copy.
+void RISCVCodeGen::gen_syscall_packed_release(const IRInstruction& instr, int result_vreg) {
+	if (instr.operands.size() != 5) {
+		throw CompilerException(ErrorType::RISCV_codegen_ERROR, "ECALL_PACKED_RELEASE requires 5 operands");
+	}
+	const int subject_vreg = instr.operands[2].reg_index();
+	const int64_t type = instr.operands[3].immediate();
+	const int descriptor = packed_descriptor_offset(instr.operands[4].immediate());
+	const int result_offset = get_variant_stack_offset(result_vreg);
+
+	spill_around_syscall({ REG_A0, REG_A1, REG_A2 });
+	emit_load_stack_offset(REG_A0, get_variant_stack_offset(subject_vreg));
+	emit_li(REG_A1, type);
+	emit_add_offset(REG_A2, REG_SP, descriptor);
+	emit_syscall(ECALL_PACKED_RELEASE);
+	emit_syscall_result(result_vreg, REG_A0, result_offset, Variant::INT);
+}
+
+int RISCVCodeGen::packed_element_bytes(int64_t type) const {
+	switch (type) {
+		case Variant::PACKED_BYTE_ARRAY: return 1;
+		case Variant::PACKED_INT32_ARRAY: return 4;
+		case Variant::PACKED_FLOAT32_ARRAY: return 4;
+		case Variant::PACKED_INT64_ARRAY: return 8;
+		case Variant::PACKED_FLOAT64_ARRAY: return 8;
+		case Variant::PACKED_VECTOR2_ARRAY: return 2 * real_size();
+		case Variant::PACKED_VECTOR3_ARRAY: return 3 * real_size();
+		case Variant::PACKED_VECTOR4_ARRAY: return 4 * real_size();
+		case Variant::PACKED_COLOR_ARRAY: return 16;
+		default: return 0;
+	}
+}
+
+// t1 = the address of element `index_vreg` (in bounds: PACKED_INDEX) of the copy
+// whose data pointer `data_vreg` holds. Clobbers t0.
+uint8_t RISCVCodeGen::emit_packed_element_address(int64_t type, int data_vreg, int index_vreg) {
+	const int bytes = packed_element_bytes(type);
+	if (bytes == 0) {
+		throw CompilerException(ErrorType::RISCV_codegen_ERROR, "Unsupported packed array element type");
+	}
+	const uint8_t index = emit_int_operand(REG_T2, index_vreg, get_variant_stack_offset(index_vreg));
+	const uint8_t data = emit_int_operand(REG_T1, data_vreg, get_variant_stack_offset(data_vreg));
+	// Every element size is a power of two or three times one (Vector3: 12 or 24),
+	// so the offset is one shift, or two shifts and an add.
+	int shift = 0;
+	while ((1 << (shift + 1)) <= bytes) {
+		shift++;
+	}
+	if (shift == 0) {
+		emit_add(REG_T1, data, index);
+	} else {
+		emit_slli(REG_T0, index, uint8_t(shift));
+		emit_add(REG_T1, data, REG_T0);
+	}
+	if (bytes != (1 << shift)) {
+		emit_slli(REG_T0, index, uint8_t(shift - 1));
+		emit_add(REG_T1, REG_T1, REG_T0);
+	}
+	return REG_T1;
+}
+
+static int packed_element_variant_type(int64_t type) {
+	switch (type) {
+		case Variant::PACKED_VECTOR2_ARRAY: return Variant::VECTOR2;
+		case Variant::PACKED_VECTOR3_ARRAY: return Variant::VECTOR3;
+		case Variant::PACKED_VECTOR4_ARRAY: return Variant::VECTOR4;
+		case Variant::PACKED_COLOR_ARRAY: return Variant::COLOR;
+		default: return Variant::NIL;
+	}
+}
+
+void RISCVCodeGen::gen_packed_get(const IRInstruction& instr) {
+	const int dst_vreg = instr.operands[0].reg_index();
+	const int64_t type = instr.operands[1].immediate();
+	const int data_vreg = instr.operands[2].reg_index();
+	const int index_vreg = instr.operands[3].reg_index();
+	const int dst_offset = get_variant_stack_offset(dst_vreg);
+	const uint8_t address = emit_packed_element_address(type, data_vreg, index_vreg);
+	switch (type) {
+		case Variant::PACKED_BYTE_ARRAY:
+			emit_lbu(REG_T0, address, 0);
+			emit_typed_int_result(dst_vreg, dst_offset, REG_T0);
+			return;
+		case Variant::PACKED_INT32_ARRAY:
+			emit_lw(REG_T0, address, 0);
+			emit_typed_int_result(dst_vreg, dst_offset, REG_T0);
+			return;
+		case Variant::PACKED_INT64_ARRAY:
+			emit_ld(REG_T0, address, 0);
+			emit_typed_int_result(dst_vreg, dst_offset, REG_T0);
+			return;
+		case Variant::PACKED_FLOAT64_ARRAY:
+			emit_fld(REG_FA2, address, 0);
+			emit_typed_float_result(dst_vreg, dst_offset, REG_FA2);
+			return;
+		case Variant::PACKED_FLOAT32_ARRAY:
+			emit_packed_float_widen(REG_FA2, address, 0);
+			emit_typed_float_result(dst_vreg, dst_offset, REG_FA2);
+			return;
+		case Variant::PACKED_COLOR_ARRAY:
+			if (real_size() == 8) {
+				// The element is four floats, the Variant four doubles (real_t).
+				const std::pair<uint8_t, int> destination = value_destination(dst_vreg);
+				for (int i = 0; i < 4; i++) {
+					emit_packed_float_widen(REG_FA2, address, i * 4);
+					emit_fsd(REG_FA2, destination.first, destination.second + VARIANT_DATA_OFFSET + i * 8);
+				}
+				emit_li(REG_T0, Variant::COLOR);
+				emit_store_variant_type(REG_T0, destination.first, destination.second);
+				if (!m_fn.forward_return) {
+					note_known_tag(dst_vreg, Variant::COLOR);
+				}
+				return;
+			}
+			[[fallthrough]];
+		default: {
+			// A vector, or a Color when real_t is float: the element is laid out
+			// exactly as the Variant payload holds it.
+			const int bytes = packed_element_bytes(type);
+			if (bytes == 0 || packed_element_variant_type(type) == Variant::NIL) {
+				throw CompilerException(ErrorType::RISCV_codegen_ERROR, "Unsupported packed array element type");
+			}
+			const std::pair<uint8_t, int> destination = value_destination(dst_vreg);
+			const uint8_t base = destination.first;
+			const int offset = destination.second;
+			for (int at = 0; at + 8 <= bytes; at += 8) {
+				emit_ld(REG_T0, address, at);
+				emit_sd(REG_T0, base, offset + VARIANT_DATA_OFFSET + at);
+			}
+			if (bytes % 8 != 0) {
+				emit_lw(REG_T0, address, bytes - 4);
+				emit_sw(REG_T0, base, offset + VARIANT_DATA_OFFSET + bytes - 4);
+			}
+			emit_li(REG_T0, packed_element_variant_type(type));
+			emit_store_variant_type(REG_T0, base, offset);
+			if (!m_fn.forward_return) {
+				note_known_tag(dst_vreg, packed_element_variant_type(type));
+			}
+			return;
+		}
+	}
+}
+
+void RISCVCodeGen::gen_packed_set(const IRInstruction& instr) {
+	const int64_t type = instr.operands[0].immediate();
+	const int data_vreg = instr.operands[1].reg_index();
+	const int index_vreg = instr.operands[2].reg_index();
+	const int value_vreg = instr.operands[3].reg_index();
+	const int value_offset = get_variant_stack_offset(value_vreg);
+	const uint8_t address = emit_packed_element_address(type, data_vreg, index_vreg);
+	switch (type) {
+		case Variant::PACKED_BYTE_ARRAY: {
+			const uint8_t value = emit_int_operand(REG_T0, value_vreg, value_offset);
+			emit_sb(value, address, 0);
+			break;
+		}
+		case Variant::PACKED_INT32_ARRAY: {
+			const uint8_t value = emit_int_operand(REG_T0, value_vreg, value_offset);
+			emit_sw(value, address, 0);
+			break;
+		}
+		case Variant::PACKED_INT64_ARRAY: {
+			const uint8_t value = emit_int_operand(REG_T0, value_vreg, value_offset);
+			emit_sd(value, address, 0);
+			break;
+		}
+		case Variant::PACKED_FLOAT64_ARRAY: {
+			if (instr.type_hint == Variant::INT) {
+				// (double)int64, rounded once to nearest even as the host converts it.
+				const uint8_t value = emit_int_operand(REG_T0, value_vreg, value_offset);
+				emit_fcvt_d_l(REG_FA2, value);
+				emit_fsd(REG_FA2, address, 0);
+				break;
+			}
+			const uint8_t value = emit_float_operand(REG_FA2, value_vreg, value_offset);
+			emit_fsd(value, address, 0);
+			break;
+		}
+		case Variant::PACKED_FLOAT32_ARRAY: {
+			if (instr.type_hint == Variant::INT) {
+				// (float)int64: one rounding, not two through double.
+				const uint8_t value = emit_int_operand(REG_T0, value_vreg, value_offset);
+				emit_r4_type(0b1010011, REG_FA1, 0, value, 2, 0b11010, 0); // fcvt.s.l, rne
+				emit_fsw(REG_FA1, address, 0);
+				break;
+			}
+			const uint8_t value = emit_float_operand(REG_FA2, value_vreg, value_offset);
+			emit_packed_float_narrow(value, address, 0);
+			break;
+		}
+		case Variant::PACKED_COLOR_ARRAY:
+			if (real_size() == 8) {
+				for (int i = 0; i < 4; i++) {
+					emit_fld(REG_FA2, REG_SP, value_offset + VARIANT_DATA_OFFSET + i * 8);
+					emit_packed_float_narrow(REG_FA2, address, i * 4);
+				}
+				break;
+			}
+			[[fallthrough]];
+		default: {
+			const int bytes = packed_element_bytes(type);
+			if (bytes == 0 || packed_element_variant_type(type) == Variant::NIL) {
+				throw CompilerException(ErrorType::RISCV_codegen_ERROR, "Unsupported packed array element type");
+			}
+			emit_add_offset(REG_T2, REG_SP, value_offset);
+			for (int at = 0; at + 8 <= bytes; at += 8) {
+				emit_ld(REG_T0, REG_T2, VARIANT_DATA_OFFSET + at);
+				emit_sd(REG_T0, address, at);
+			}
+			if (bytes % 8 != 0) {
+				emit_lw(REG_T0, REG_T2, VARIANT_DATA_OFFSET + bytes - 4);
+				emit_sw(REG_T0, address, bytes - 4);
+			}
+			break;
+		}
+	}
+	// No dirty word to set: the acquire and release of an array the region writes
+	// carry PACKED_WRITTEN.
+}
+
+// Widened as the host widens it: a NaN keeps its sign and payload and comes back
+// quiet, where fcvt.d.s would answer the canonical NaN.
+void RISCVCodeGen::emit_packed_float_widen(uint8_t dst, uint8_t address, int offset) {
+	const std::string nan = gen_local_label(".packed_load_nan");
+	const std::string done = gen_local_label(".packed_load_done");
+	emit_flw(dst, address, offset);
+	emit_r_type(0x53, REG_T0, 0b010, dst, dst, 0b1010000); // feq.s
+	mark_label_use(nan, m_code.size());
+	emit_beq(REG_T0, REG_ZERO, 0);
+	emit_fcvt_d_s(dst, dst);
+	mark_label_use(done, m_code.size());
+	emit_jal(REG_ZERO, 0);
+	define_label(nan);
+	emit_lwu(REG_T0, address, offset);
+	emit_slli(REG_T2, REG_T0, 42); // (bits & 0x3fffff) << 29
+	emit_srli(REG_T2, REG_T2, 13);
+	emit_srli(REG_T0, REG_T0, 31); // the sign, to bit 63
+	emit_slli(REG_T0, REG_T0, 63);
+	emit_or(REG_T2, REG_T2, REG_T0);
+	emit_li(REG_T0, int64_t(0x7ff8000000000000ull));
+	emit_or(REG_T2, REG_T2, REG_T0);
+	emit_fmv_d_x(dst, REG_T2);
+	define_label(done);
+}
+
+// Narrowed as the host narrows it: round to nearest even, and a NaN keeps its sign
+// and the top of its payload, quiet.
+void RISCVCodeGen::emit_packed_float_narrow(uint8_t value, uint8_t address, int offset) {
+	const std::string nan = gen_local_label(".packed_store_nan");
+	const std::string done = gen_local_label(".packed_store_done");
+	emit_feq_d(REG_T0, value, value);
+	mark_label_use(nan, m_code.size());
+	emit_beq(REG_T0, REG_ZERO, 0);
+	emit_fcvt_s_d(REG_FA1, value);
+	emit_fsw(REG_FA1, address, offset);
+	mark_label_use(done, m_code.size());
+	emit_jal(REG_ZERO, 0);
+	define_label(nan);
+	emit_r_type(0x53, REG_T0, 0, value, 0, 0b1110001); // fmv.x.d
+	emit_slli(REG_T2, REG_T0, 13); // mantissa bits 50..29 -> 21..0
+	emit_srli(REG_T2, REG_T2, 42);
+	emit_srli(REG_T0, REG_T0, 63); // the sign, to bit 31
+	emit_slli(REG_T0, REG_T0, 31);
+	emit_or(REG_T2, REG_T2, REG_T0);
+	emit_li(REG_T0, 0x7fc00000);
+	emit_or(REG_T2, REG_T2, REG_T0);
+	emit_sw(REG_T2, address, offset);
+	define_label(done);
+}
+
+// PACKED_DATA (word 0), PACKED_SIZE (word 1), PACKED_IDENTITY (word 2): one
+// descriptor word as an INT.
+void RISCVCodeGen::gen_packed_descriptor_word(const IRInstruction& instr, int word) {
+	const int dst_vreg = instr.operands[0].reg_index();
+	emit_ld(REG_T0, REG_SP, packed_descriptor_offset(instr.operands[1].immediate()) + word * 8);
+	emit_typed_int_result(dst_vreg, get_variant_stack_offset(dst_vreg), REG_T0);
+}
+
+// PACKED_INDEX dst, size, index, oob: a negative index counts from the end, then
+// one unsigned compare against the size covers both ends.
+void RISCVCodeGen::gen_packed_index(const IRInstruction& instr) {
+	const int dst_vreg = instr.operands[0].reg_index();
+	const int size_vreg = instr.operands[1].reg_index();
+	const int index_vreg = instr.operands[2].reg_index();
+	const uint8_t index = emit_int_operand(REG_T2, index_vreg, get_variant_stack_offset(index_vreg));
+	const uint8_t size = emit_int_operand(REG_T0, size_vreg, get_variant_stack_offset(size_vreg));
+	if (size != REG_T0) {
+		emit_mv(REG_T0, size);
+	}
+	if (index != REG_T1) {
+		emit_mv(REG_T1, index);
+	}
+	const std::string counted = gen_local_label(".packed_counted");
+	mark_label_use(counted, m_code.size());
+	emit_bge(REG_T1, REG_ZERO, 0);
+	emit_add(REG_T1, REG_T1, REG_T0);
+	define_label(counted);
+	mark_label_use(instr.operands[3], m_code.size());
+	emit_bgeu(REG_T1, REG_T0, 0);
+	emit_typed_int_result(dst_vreg, get_variant_stack_offset(dst_vreg), REG_T1);
+}
+
+void RISCVCodeGen::emit_typed_float_result(int result_vreg, int result_offset, uint8_t source) {
+	if (m_fn.forward_return) {
+		const std::pair<uint8_t, int> destination = value_destination(result_vreg);
+		const uint8_t base = destination.first;
+		const int offset = destination.second;
+		emit_li(REG_T0, Variant::FLOAT);
+		emit_store_variant_type(REG_T0, base, offset);
+		emit_fsd(source, base, offset + VARIANT_DATA_OFFSET);
+		return;
+	}
+	const int resident = resident_float_register(result_vreg);
+	if (resident >= 0) {
+		if (uint8_t(resident) != source) {
+			emit_fmv_d(uint8_t(resident), source);
+		}
+		m_fn.resident_result_written = true;
+		return;
+	}
+	emit_known_variant_type(result_vreg, result_offset, Variant::FLOAT);
+	emit_fsd(source, REG_SP, result_offset + VARIANT_DATA_OFFSET);
+	cache_float_result(result_vreg, source);
 }
 
 // Keyed ops pass key in a2, result in a3; keyless (GET_KEYS, GET_VALUES) take result in a2.
@@ -2091,6 +2508,10 @@ void RISCVCodeGen::gen_call_syscall(const IRInstruction& instr) {
 		gen_syscall_string_codepoint_batch(instr, result_vreg);
 	} else if (syscall_num == ECALL_ARRAY_BATCH) {
 		gen_syscall_array_batch(instr, result_vreg);
+	} else if (syscall_num == ECALL_PACKED_ACQUIRE) {
+		gen_syscall_packed_acquire(instr, result_vreg);
+	} else if (syscall_num == ECALL_PACKED_RELEASE) {
+		gen_syscall_packed_release(instr, result_vreg);
 	} else if (syscall_num == ECALL_DICTIONARY_OPS) {
 		gen_syscall_dictionary_ops(instr, result_vreg);
 	} else {
@@ -2679,11 +3100,11 @@ void RISCVCodeGen::gen_await(const IRInstruction& instr) {
 	m_fn.await_states.push_back(state_label);
 
 	emit_add_offset(REG_A0, REG_SP, operand_offset);
-	emit_add_offset(REG_A1, REG_SP, m_fn.saved_reg_space);
+	emit_add_offset(REG_A1, REG_SP, m_fn.variant_base);
 	emit_li(REG_A2, m_fn.variant_space);
 	emit_li(REG_A3, int64_t(m_fn.await_states.size()) - 1);
 	emit_la(REG_A4, m_fn.resume_label);
-	emit_li(REG_A5, result_offset - m_fn.saved_reg_space);
+	emit_li(REG_A5, result_offset - m_fn.variant_base);
 	emit_syscall(ECALL_AWAIT);
 
 	// a0 == 0: not awaitable, result slot already written. Fall through.
@@ -2732,7 +3153,7 @@ void RISCVCodeGen::emit_coroutine_resume_entry(const IRFunction& func) {
 	emit_save_resident_registers();
 
 	// ECALL_AWAIT_RESTORE: host copies frame back, length-checked against suspension.
-	emit_add_offset(REG_A0, REG_SP, m_fn.saved_reg_space);
+	emit_add_offset(REG_A0, REG_SP, m_fn.variant_base);
 	emit_li(REG_A1, m_fn.variant_space);
 	emit_syscall(ECALL_AWAIT_RESTORE);
 	for (size_t vreg = 0; vreg < m_fn.fixed_scalar_types.size(); vreg++) {
@@ -3735,6 +4156,25 @@ void RISCVCodeGen::gen_instruction(const IRInstruction& instr) {
 			break;
 		}
 
+		case IROpcode::PACKED_GET:
+			gen_packed_get(instr);
+			break;
+		case IROpcode::PACKED_SET:
+			gen_packed_set(instr);
+			break;
+		case IROpcode::PACKED_DATA:
+			gen_packed_descriptor_word(instr, 0);
+			break;
+		case IROpcode::PACKED_SIZE:
+			gen_packed_descriptor_word(instr, 1);
+			break;
+		case IROpcode::PACKED_IDENTITY:
+			gen_packed_descriptor_word(instr, 2);
+			break;
+		case IROpcode::PACKED_INDEX:
+			gen_packed_index(instr);
+			break;
+
 		case IROpcode::CODEPOINT_GET: {
 			const int dst_vreg = instr.operands[0].reg_index();
 			const int64_t token = instr.operands[1].immediate();
@@ -4463,9 +4903,10 @@ void RISCVCodeGen::gen_function(const IRFunction& func) {
 		gen_instruction(instr);
 		m_fn.ecall_refused = false;
 		// Calls that write a Variant into a loop scope classify the returned tag
-		// while it is still in the frame.  Tags below STRING are scalar; treating
-		// the remaining inline tags conservatively as dirty is harmless, while
-		// numeric Array elements avoid the release ecall entirely.
+		// while it is still in the frame. A value held inline (a number, a vector,
+		// a Color: is_complex_variant_type) leaves nothing to release, so neither
+		// numeric Array elements nor a Color.lerp() answer cost the release ecall.
+		// An Object stays dirty: its handle may still have been scoped.
 		if (instruction_dst >= 0) {
 			auto dirty = m_fn.scope_dirty_updates.find(instr_idx);
 			if (dirty != m_fn.scope_dirty_updates.end()) {
@@ -4475,9 +4916,26 @@ void RISCVCodeGen::gen_function(const IRFunction& func) {
 					emit_lw(REG_T0, REG_SP, get_variant_stack_offset(instruction_dst) +
 						VARIANT_TYPE_OFFSET);
 				}
+				static const int64_t inline_tags = [] {
+					int64_t mask = 0;
+					for (int type = 0; type < 64; type++) {
+						if (type != Variant::OBJECT && !is_complex_variant_type(type)) {
+							mask |= int64_t(1) << type;
+						}
+					}
+					return mask;
+				}();
+				// A scalar, the common answer, is tested and skipped in two instructions.
+				const std::string clean = gen_local_label(".scope_clean");
 				emit_i_type(0x13, REG_T0, 3, tag, Variant::STRING); // sltiu
-				emit_xori(REG_T0, REG_T0, 1);
+				mark_label_use(clean, m_code.size());
+				emit_bne(REG_T0, REG_ZERO, 0);
+				emit_li(REG_T1, inline_tags);
+				emit_srl(REG_T1, REG_T1, tag); // tags are below 64
+				emit_andi(REG_T1, REG_T1, 1);
+				emit_xori(REG_T0, REG_T1, 1);
 				for (uint8_t preg : dirty->second) emit_or(preg, preg, REG_T0);
+				define_label(clean);
 			}
 		}
 		{
@@ -4720,6 +5178,12 @@ bool RISCVCodeGen::opcode_clobbers_abi_registers(IROpcode op) {
 		case IROpcode::MAKE_SCOPED:
 		case IROpcode::BATCH_GET:
 		case IROpcode::CODEPOINT_GET:
+		case IROpcode::PACKED_GET:
+		case IROpcode::PACKED_SET:
+		case IROpcode::PACKED_SIZE:
+		case IROpcode::PACKED_DATA:
+		case IROpcode::PACKED_IDENTITY:
+		case IROpcode::PACKED_INDEX:
 		case IROpcode::LABEL:
 		case IROpcode::SWITCH:
 		case IROpcode::JUMP:
@@ -5975,7 +6439,7 @@ int RISCVCodeGen::get_scratch_variant_offset(int index) {
 		throw CompilerException(ErrorType::RISCV_codegen_ERROR,
 				"Scratch Variant slot " + std::to_string(index) + " is out of range");
 	}
-	return m_fn.saved_reg_space + ((m_fn.scratch_slot_base + index) * variant_size());
+	return m_fn.variant_base + ((m_fn.scratch_slot_base + index) * variant_size());
 }
 
 void RISCVCodeGen::emit_variant_create_int(int stack_offset, int64_t value, uint8_t base_reg) {
@@ -7352,6 +7816,10 @@ void RISCVCodeGen::emit_srai(uint8_t rd, uint8_t rs, uint8_t shamt) {
 	emit_i_type(0x13, rd, 5, rs, (0b010000 << 6) | (shamt & 0x3F));
 }
 
+void RISCVCodeGen::emit_srli(uint8_t rd, uint8_t rs, uint8_t shamt) {
+	emit_i_type(0x13, rd, 5, rs, shamt & 0x3F);
+}
+
 void RISCVCodeGen::emit_slli(uint8_t rd, uint8_t rs, uint8_t shamt) {
 	emit_i_type(0x13, rd, 1, rs, shamt);
 }
@@ -7525,6 +7993,21 @@ static bool scoped_allocation_is_the_destination(const IRInstruction& instr) {
 
 static bool leaves_nothing_scoped(const IRInstruction& instr) {
 	switch (instr.opcode) {
+		// Built or read in guest memory: no host call, so nothing to scope. They
+		// count as clobbering (fa0, t0-t2), not as allocating.
+		case IROpcode::MAKE_VECTOR2:
+		case IROpcode::MAKE_VECTOR3:
+		case IROpcode::MAKE_VECTOR4:
+		case IROpcode::MAKE_VECTOR2I:
+		case IROpcode::MAKE_VECTOR3I:
+		case IROpcode::MAKE_VECTOR4I:
+		case IROpcode::MAKE_COLOR:
+		case IROpcode::MAKE_RECT2:
+		case IROpcode::MAKE_RECT2I:
+		case IROpcode::MAKE_PLANE:
+		case IROpcode::VGET_INLINE:
+		case IROpcode::VSET_INLINE:
+			return true;
 		case IROpcode::ARRAY_SET:
 		case IROpcode::ARRAY_APPEND:
 		case IROpcode::DICT_SET:
@@ -7650,6 +8133,24 @@ bool RISCVCodeGen::scope_body_may_allocate(const IRFunction& func, size_t mark_i
 		}
 	}
 	return false;
+}
+
+size_t RISCVCodeGen::loop_scope_dirty_demand(const IRFunction& func, size_t cap) const {
+	std::unordered_map<int64_t, int> releases;
+	for (const IRInstruction& instr : func.instructions) {
+		if (instr.opcode == IROpcode::SCOPE_RELEASE) {
+			releases[instr.operands[0].immediate()]++;
+		}
+	}
+	size_t demand = 0;
+	for (size_t i = 0; i < func.instructions.size() && demand < cap; i++) {
+		const IRInstruction& instr = func.instructions[i];
+		if (instr.opcode == IROpcode::SCOPE_MARK && releases[instr.operands[0].immediate()] >= 2 &&
+			scope_body_may_allocate(func, i)) {
+			demand++;
+		}
+	}
+	return demand;
 }
 
 // Registers nothing will read again at each SCOPE_RELEASE.
@@ -7965,7 +8466,7 @@ void RISCVCodeGen::gen_scope_release(const IRInstruction& instr) {
 	}
 
 	emit_ld(REG_A1, REG_SP, offset);
-	emit_add_offset(REG_A2, REG_SP, m_fn.saved_reg_space);
+	emit_add_offset(REG_A2, REG_SP, m_fn.variant_base);
 	emit_li(REG_A3, m_fn.variant_space);
 	if (m_data_global_count > 0) {
 		emit_address_of_global_area(REG_A4);

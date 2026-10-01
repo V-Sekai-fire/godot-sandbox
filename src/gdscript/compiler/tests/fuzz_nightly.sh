@@ -7,10 +7,11 @@
 # from. It is meant for a nightly job rather than a commit hook.
 #
 # Any failure prints the seed it came from, and re-running the named binary with
-# that seed reproduces it exactly:
+# that seed reproduces it exactly. doctest owns argv, so the seeds are passed in
+# the environment:
 #
-#   ./test_fuzz --seed <n> --count 1
-#   ./test_differential --fuzz --seed <n> --count 1
+#   GDSC_FUZZ_SEED=<n> GDSC_FUZZ_COUNT=1 ./test_fuzz
+#   GDSC_DIFF_FUZZ=1 GDSC_DIFF_SEED=<n> GDSC_DIFF_COUNT=1 ./test_differential
 #
 # Usage: tests/fuzz_nightly.sh [build-dir] [minutes]
 set -u
@@ -28,7 +29,8 @@ status=0
 
 echo
 echo "=== Verifier and optimization invariance ==="
-timeout "${SECONDS_PER_STAGE}" "${BUILD}/test_fuzz" --seed "${BASE_SEED}" --count 1000000
+GDSC_FUZZ_SEED="${BASE_SEED}" GDSC_FUZZ_COUNT=1000000 \
+	timeout "${SECONDS_PER_STAGE}" "${BUILD}/test_fuzz"
 case $? in
 	0)   echo "(completed the whole count)" ;;
 	124) echo "(stopped at the time limit, nothing found)" ;;
@@ -38,8 +40,8 @@ esac
 if [ -x "${BUILD}/test_differential" ]; then
 	echo
 	echo "=== Interpreter against a real RISC-V machine ==="
-	timeout "${SECONDS_PER_STAGE}" "${BUILD}/test_differential" --fuzz \
-		--seed "$(( BASE_SEED + 1000000 ))" --count 1000000
+	GDSC_DIFF_FUZZ=1 GDSC_DIFF_SEED="$(( BASE_SEED + 1000000 ))" GDSC_DIFF_COUNT=1000000 \
+		timeout "${SECONDS_PER_STAGE}" "${BUILD}/test_differential"
 	case $? in
 		0)   echo "(completed the whole count)" ;;
 		124) echo "(stopped at the time limit, nothing found)" ;;

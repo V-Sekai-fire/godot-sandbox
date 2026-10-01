@@ -1,10 +1,11 @@
 #include "dyncall_shim.h"
+#include "witness/doctest.h"
 // Runs profiled ELFs on a real libriscv machine and checks the accounting:
 // self excludes callees, total includes them, entry/exit balance across
 // recursion past MAX_DEPTH. INSTRUCTIONS clock throughout for determinism.
 #include "../compiler.h"
-#include "scope_stub.h"
 #include "../profiling_layout.h"
+#include "scope_stub.h"
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -18,34 +19,28 @@ using machine_t = riscv::Machine<riscv::RISCV64>;
 
 namespace {
 
-int failures = 0;
-
-void check(bool condition, const std::string& what) {
+void check(bool condition, const std::string &what) {
 	if (!condition) {
-		std::cerr << "FAILED: " << what << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: ", what);
 	}
 }
 
 template <typename T>
-void check_eq(T actual, T expected, const std::string& what) {
+void check_eq(T actual, T expected, const std::string &what) {
 	if (actual != expected) {
-		std::cerr << "FAILED: " << what << ": expected " << expected
-			<< ", got " << actual << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: ", what, ": expected ", expected, ", got ", actual);
 	}
 }
 
-std::vector<uint8_t> compile(const std::string& source, bool profiling,
-	ProfilingClock clock = ProfilingClock::INSTRUCTIONS) {
+std::vector<uint8_t> compile(const std::string &source, bool profiling,
+							 ProfilingClock clock = ProfilingClock::INSTRUCTIONS) {
 	Compiler compiler;
 	CompilerOptions options;
 	options.profiling = profiling;
 	options.profiling_clock = clock;
 	std::vector<uint8_t> elf = compiler.compile(source, options);
 	if (elf.empty()) {
-		std::cerr << "FAILED to compile: " << compiler.get_error() << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED to compile: ", compiler.get_error());
 	}
 	return elf;
 }
@@ -72,13 +67,13 @@ struct Area {
 };
 
 template <typename T>
-T read(machine_t& machine, uint64_t address) {
-	T value {};
+T read(machine_t &machine, uint64_t address) {
+	T value{};
 	machine.copy_from_guest(&value, address, sizeof(T));
 	return value;
 }
 
-Area read_area(machine_t& machine) {
+Area read_area(machine_t &machine) {
 	Area area;
 	area.address = machine.address_of(PROFILING_SYMBOL);
 	if (area.address == 0) {
@@ -106,14 +101,13 @@ Area read_area(machine_t& machine) {
 
 // The Sandbox ABI, reduced to what a program with no arguments needs: a0 points
 // at a Variant the callee writes its return value into.
-bool run(machine_t& machine, const std::string& function) {
+bool run(machine_t &machine, const std::string &function) {
 	const uint64_t address = machine.address_of(function);
 	if (address == 0) {
-		std::cerr << "FAILED: no symbol for " << function << "()" << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: no symbol for ", function, "()");
 		return false;
 	}
-	auto& sp = machine.cpu.reg(riscv::REG_SP);
+	auto &sp = machine.cpu.reg(riscv::REG_SP);
 	sp = machine.memory.stack_initial();
 	sp -= 64;
 	machine.cpu.reg(riscv::REG_RA) = machine.memory.exit_address();
@@ -126,18 +120,16 @@ bool run(machine_t& machine, const std::string& function) {
 // The corpus below is written to need no host: no strings, no containers, and
 // no untyped arithmetic, so nothing reaches a syscall. Anything that does is a
 // test bug, and says so rather than being answered with a zero.
-void fail_on_syscall(machine_t& machine) {
-	std::cerr << "FAILED: the test program made syscall "
-		<< machine.cpu.reg(riscv::REG_ARG7) << std::endl;
-	failures++;
+void fail_on_syscall(machine_t &machine) {
+	FAIL_CHECK("FAILED: the test program made syscall ", machine.cpu.reg(riscv::REG_ARG7));
 	machine.stop();
 }
 
-std::unique_ptr<machine_t> boot(const std::vector<uint8_t>& elf) {
-	auto machine = std::make_unique<machine_t>(elf, riscv::MachineOptions<riscv::RISCV64> {
-		.memory_max = 32ull << 20,
-		.stack_size = 4ull << 20,
-	});
+std::unique_ptr<machine_t> boot(const std::vector<uint8_t> &elf) {
+	auto machine = std::make_unique<machine_t>(elf, riscv::MachineOptions<riscv::RISCV64>{
+															.memory_max = 32ull << 20,
+															.stack_size = 4ull << 20,
+													});
 	for (int number = 500; number < 560; number++) {
 		machine_t::install_syscall_handler(number, fail_on_syscall);
 	}
@@ -149,12 +141,19 @@ std::unique_ptr<machine_t> boot(const std::vector<uint8_t>& elf) {
 
 // -= The tests =-
 
-void test_off_by_default() {
+// Upstream installed the dyncall handlers at the top of main(). A doctest
+// binary has no main of its own, so they go in once here, before any case.
+const bool SETUP_ONCE = [] {
+	sgd_install_test_dyncalls();
+	return true;
+}();
+
+TEST_CASE("off by default") {
 	const std::string source =
-		"func leaf():\n"
-		"\treturn 1\n"
-		"func test():\n"
-		"\treturn leaf()\n";
+			"func leaf():\n"
+			"\treturn 1\n"
+			"func test():\n"
+			"\treturn leaf()\n";
 
 	Compiler compiler;
 	CompilerOptions options;
@@ -166,7 +165,7 @@ void test_off_by_default() {
 	}
 	auto machine = boot(elf);
 	check_eq(machine->address_of(PROFILING_SYMBOL), uint64_t(0),
-		"an unprofiled build exports no profiling symbol");
+			 "an unprofiled build exports no profiling symbol");
 
 	// Nothing reads a CSR unless the instrumentation is emitted, so the whole
 	// text is searchable for one: csrrs rd, csr, x0 is opcode 0x73 funct3 2.
@@ -181,14 +180,14 @@ void test_off_by_default() {
 	check_eq(csr_reads, size_t(0), "an unprofiled build reads no clock");
 }
 
-void test_header() {
+TEST_CASE("header") {
 	const std::string source =
-		"func a():\n"
-		"\treturn 1\n"
-		"func b():\n"
-		"\treturn 2\n"
-		"func test():\n"
-		"\treturn 3\n";
+			"func a():\n"
+			"\treturn 1\n"
+			"func b():\n"
+			"\treturn 2\n"
+			"func test():\n"
+			"\treturn 3\n";
 
 	const std::vector<uint8_t> elf = compile(source, true);
 	if (elf.empty()) {
@@ -213,7 +212,7 @@ void test_header() {
 	check_eq(read<uint64_t>(*machine, last), uint64_t(0), "the shadow stack is mapped to its end");
 
 	// A record is untouched until its function runs.
-	for (const Record& record : area.records) {
+	for (const Record &record : area.records) {
 		check_eq(record.call_count, uint64_t(0), "no calls recorded before the program runs");
 	}
 
@@ -222,25 +221,25 @@ void test_header() {
 	if (!timed.empty()) {
 		auto timed_machine = boot(timed);
 		check_eq(read_area(*timed_machine).clock, uint32_t(ProfilingClock::TIME),
-			"the header names the clock the code reads");
+				 "the header names the clock the code reads");
 		check_eq(timed.size(), elf.size(), "the clock choice does not change the code size");
 	}
 }
 
-void test_call_counts_and_nesting() {
+TEST_CASE("call counts and nesting") {
 	// leaf is called twice per mid, mid three times by test.
 	const std::string source =
-		"func leaf():\n"
-		"\treturn 1\n"
-		"func mid():\n"
-		"\tleaf()\n"
-		"\tleaf()\n"
-		"\treturn 2\n"
-		"func test():\n"
-		"\tmid()\n"
-		"\tmid()\n"
-		"\tmid()\n"
-		"\treturn 3\n";
+			"func leaf():\n"
+			"\treturn 1\n"
+			"func mid():\n"
+			"\tleaf()\n"
+			"\tleaf()\n"
+			"\treturn 2\n"
+			"func test():\n"
+			"\tmid()\n"
+			"\tmid()\n"
+			"\tmid()\n"
+			"\treturn 3\n";
 
 	const std::vector<uint8_t> elf = compile(source, true);
 	if (elf.empty()) {
@@ -255,9 +254,9 @@ void test_call_counts_and_nesting() {
 		check(false, "three records");
 		return;
 	}
-	const Record& leaf = area.records[0];
-	const Record& mid = area.records[1];
-	const Record& test = area.records[2];
+	const Record &leaf = area.records[0];
+	const Record &mid = area.records[1];
+	const Record &test = area.records[2];
 
 	check_eq(leaf.call_count, uint64_t(6), "leaf() called six times");
 	check_eq(mid.call_count, uint64_t(3), "mid() called three times");
@@ -277,27 +276,27 @@ void test_call_counts_and_nesting() {
 	check(test.self < test.total, "test() spends most of its span in mid()");
 	check(mid.self < mid.total, "mid() spends part of its span in leaf()");
 	check(test.total >= test.self + mid.total,
-		"test()'s total covers its own work and all of mid()'s");
+		  "test()'s total covers its own work and all of mid()'s");
 	check(mid.total >= mid.self + leaf.total,
-		"mid()'s total covers its own work and all of leaf()'s");
+		  "mid()'s total covers its own work and all of leaf()'s");
 
 	// Nothing is charged twice: the three spans partition the outermost one.
 	check_eq(test.self + mid.self + leaf.self, test.total,
-		"self times partition the outermost total");
+			 "self times partition the outermost total");
 }
 
-void test_recursion_overflows_the_shadow_stack() {
+TEST_CASE("recursion overflows the shadow stack") {
 	// Deeper than MAX_DEPTH, so the frames past the cap are counted and skipped
 	// while the ones below keep their timings -- and depth still comes back to
 	// zero, which is the property that makes the cap safe.
 	const std::string source =
-		"func down(n: int):\n"
-		"\tif n > 0:\n"
-		"\t\tdown(n - 1)\n"
-		"\treturn n\n"
-		"func test():\n"
-		"\tdown(400)\n"
-		"\treturn 0\n";
+			"func down(n: int):\n"
+			"\tif n > 0:\n"
+			"\t\tdown(n - 1)\n"
+			"\treturn n\n"
+			"func test():\n"
+			"\tdown(400)\n"
+			"\treturn 0\n";
 
 	const std::vector<uint8_t> elf = compile(source, true);
 	if (elf.empty()) {
@@ -312,8 +311,8 @@ void test_recursion_overflows_the_shadow_stack() {
 		check(false, "two records");
 		return;
 	}
-	const Record& down = area.records[0];
-	const Record& test = area.records[1];
+	const Record &down = area.records[0];
+	const Record &test = area.records[1];
 
 	check_eq(area.depth, uint64_t(0), "depth returns to zero past the cap");
 
@@ -333,22 +332,7 @@ void test_recursion_overflows_the_shadow_stack() {
 	// unrecorded frame's work lands in the self time of the recorded frame
 	// below it, rather than being lost.
 	check_eq(down.self + test.self, test.total,
-		"self times partition the outermost total even past the cap");
+			 "self times partition the outermost total even past the cap");
 }
 
 } // namespace
-
-int main() {
-	sgd_install_test_dyncalls();
-	test_off_by_default();
-	test_header();
-	test_call_counts_and_nesting();
-	test_recursion_overflows_the_shadow_stack();
-
-	if (failures > 0) {
-		std::cerr << failures << " profiling test(s) failed" << std::endl;
-		return 1;
-	}
-	std::cout << "All profiling tests passed" << std::endl;
-	return 0;
-}

@@ -38,6 +38,10 @@ PackedByteArray to_packed(const std::vector<uint8_t> &p_bytes) {
 
 class DirectCompilerBackend final : public GDScriptCompilerBackend {
 public:
+	// The extracted compiler lexes SafeGDScript's additions (struct, trait, uses, switch, `?`,
+	// unions, @test) only behind this gate; the addon is that dialect, so it stays open here.
+	DirectCompilerBackend() { m_options.extensions = true; }
+
 	const char *name() const override { return "direct"; }
 	bool available() override { return true; }
 

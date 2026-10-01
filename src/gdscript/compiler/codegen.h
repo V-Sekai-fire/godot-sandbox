@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include "ast.h"
 #include "builtin_members.h"
 #include "builtin_methods.h"
@@ -41,9 +42,21 @@ public:
 	}
 
 	void set_native_classes(bool enabled) { m_native_classes = enabled; }
+	// Off: plain GDScript, where an untyped `var x = v` is a Variant that may change type.
+	void set_extensions(bool enabled) { m_extensions = enabled; }
+	// Packed array regions (codegen.cpp, "Packed array regions"): a loop that indexes
+	// typed Packed*Array locals copies each into guest memory once, works on the copy
+	// and stores it back in place. Also types packed element reads and size(). Off:
+	// one host call per element, as before.
+	void set_fast_arrays(bool enabled) { m_fast_arrays = enabled; }
+	// One line per loop that had candidates: what it copies, or what it drops and why.
+	const std::vector<std::string>& packed_notes() const { return m_packed_notes; }
 
 private:
 	bool m_native_classes = false;
+	bool m_extensions = true;
+	bool m_fast_arrays = true;
+	std::vector<std::string> m_packed_notes;
 	// Per-function state. Value type: lives on the stack for one function's
 	// lowering, so new fields are automatically fresh. Program-wide state
 	// (string constants, globals, label counter) stays on CodeGenerator.
@@ -109,6 +122,53 @@ private:
 		int next_scope_id = 0;
 		int next_array_batch_id = 0;
 		int next_codepoint_batch_id = 0;
+
+		// -= Packed array regions =-
+		struct PackedCandidate {
+			std::string name;
+			int reg = -1;
+			IRInstruction::TypeHint type = IRInstruction::TypeHint_NONE;
+			int64_t token = -1;
+			bool written = false;
+			// The copy's data pointer and element count, read once at the entry.
+			int data_reg = -1;
+			int size_reg = -1;
+		};
+		struct PackedRegion {
+			std::vector<PackedCandidate> candidates;
+			// Candidates an access could not lower (an index that is not an int, a
+			// value the copy cannot hold): the next attempt leaves them out.
+			std::unordered_set<std::string> unsupported;
+			// Instruction ranges in the copy loop that reach a candidate through the
+			// host on purpose -- a stored value the copy cannot hold is converted
+			// by the host and read back -- which the observer scan must not count
+			// against it.
+			std::vector<std::pair<size_t, size_t>> cold;
+			// Out-of-range exits, emitted after the copy loop.
+			struct PendingOob {
+				std::string label;
+				int subject;
+				int index;
+				int value; // -1 for a read
+				int line;
+			};
+			std::vector<PendingOob> oob;
+		};
+		// The region whose fast copy is being lowered, or null.
+		PackedRegion* packed_region = nullptr;
+		// Inside a region's fallback loop: no nested regions there.
+		int packed_fallback_depth = 0;
+		int next_packed_token = 0;
+		// While a region is lowered: every register type change, stamped with the
+		// instruction count, so the observer scan knows each operand's type.
+		struct TypeLogEntry {
+			size_t at;
+			int reg;
+			IRInstruction::TypeHint type;
+		};
+		std::vector<TypeLogEntry>* type_log = nullptr;
+		// Line of the statement being lowered, for code emitted out of line.
+		int stmt_line = 0;
 	};
 
 	IRFunction generate_function(const FunctionDecl& func, const StructDecl* owner = nullptr);
@@ -200,6 +260,10 @@ private:
 	int gen_range(const CallExpr* expr, FunctionContext& func);
 	int gen_color8(const CallExpr* expr, FunctionContext& func);
 	int gen_class_test(int value_reg, const std::string& class_name, FunctionContext& func);
+	int gen_sealed_class_tag(int value_reg, FunctionContext& func);
+	int gen_class_dispatch(const MemberCallExpr* expr, int obj_reg, FunctionContext& func);
+	int gen_class_dispatch(const std::string& method_name, const std::vector<ExprPtr>& arguments, int obj_reg,
+		FunctionContext& func, const std::function<int(const std::vector<int>&)>& fallback);
 	int gen_instance_class_test(int value_reg, const std::string& class_name, int result_reg,
 		FunctionContext& func);
 	int gen_cast(const CastExpr* expr, FunctionContext& func);
@@ -215,6 +279,41 @@ private:
 	// `for c in <String>`: batched character walk, see codegen.cpp.
 	void gen_string_walk(const ForStmt* stmt, int string_reg, FunctionContext& func);
 	bool string_walk_uses_only_codepoints(const ForStmt* stmt) const;
+
+	// -= Packed array regions =-
+	struct PackedScan {
+		std::vector<FunctionContext::PackedCandidate> candidates;
+		// Element accesses one pass of the loop makes, counting a nested loop with a
+		// constant trip count that many times; negative when a nested loop's is unknown.
+		int64_t accesses_per_pass = 0;
+	};
+	PackedScan scan_packed_region(const Stmt* loop, FunctionContext& func);
+	bool try_packed_region(const Stmt* loop, FunctionContext& func);
+	void gen_loop_statement(const Stmt* loop, FunctionContext& func);
+	int gen_packed_trip_count(const Stmt* loop, int64_t accesses_per_pass, FunctionContext& func);
+	FunctionContext::PackedCandidate* packed_candidate(const Expr* object, FunctionContext& func);
+	int emit_packed_index(const FunctionContext::PackedCandidate& candidate, int index_reg,
+		const std::string& oob_label, FunctionContext& func);
+	int gen_packed_read(FunctionContext::PackedCandidate& candidate, const IndexExpr* expr,
+		FunctionContext& func);
+	void gen_packed_store(FunctionContext::PackedCandidate& candidate, const IndexExpr* target,
+		int value_reg, FunctionContext& func);
+	int gen_packed_size(FunctionContext::PackedCandidate& candidate, bool empty_test,
+		FunctionContext& func);
+	void gen_packed_walk(const ForStmt* stmt, FunctionContext::PackedCandidate& candidate,
+		FunctionContext& func);
+	void emit_packed_release(const FunctionContext::PackedCandidate& candidate, bool written,
+		FunctionContext& func);
+	// Before a return inside a region: store and free every copy.
+	void emit_packed_region_exit(FunctionContext& func);
+	void emit_packed_oob(const FunctionContext::PackedCandidate& candidate, int index_reg,
+		int value_reg, const std::string& oob_label, FunctionContext& func);
+	void emit_packed_oob_blocks(const FunctionContext::PackedRegion& region,
+		const std::string& end_label, FunctionContext& func);
+	static IRInstruction::TypeHint packed_element_type(IRInstruction::TypeHint packed);
+	static bool packed_region_supports(IRInstruction::TypeHint packed);
+	// Typed element reads and size() under fast arrays.
+	void type_packed_element(int obj_reg, int result_reg, FunctionContext& func);
 	// `for v in <Array>`: ECALL_ARRAY_BATCH fills sixteen guest Variant slots.
 	void gen_array_walk(const ForStmt* stmt, int array_reg, FunctionContext& func,
 		const StructDecl* element_struct, const TraitDecl* element_trait);
@@ -634,6 +733,21 @@ private:
 	std::vector<const TraitDecl*> m_global_array_element_traits;
 	std::vector<const TraitDecl*> m_global_dictionary_value_traits;
 	std::vector<bool> m_global_holds_object;
+	// Index of the hidden `@seal` global, or -1 when the program declares no class.
+	int m_seal_global = -1;
+	// Whether any code reads the seal; only then does global init create it.
+	bool m_seal_used = false;
+	void prepend_global_object(IRProgram& ir_program, int global_index, const char* class_name);
+	// Class name -> hidden global holding the object that class evaluates to as a value.
+	std::unordered_map<std::string, int> m_class_value_globals;
+	// The class value globals some code reads; only those are created at startup.
+	std::unordered_set<int> m_class_values_used;
+	// Class constants that do not fold (a call, a container literal), keyed 'Class.NAME'; evaluated at each read.
+	std::unordered_map<std::string, std::pair<const StructDecl*, const StructField*>> m_call_class_constants;
+	int gen_class_value_new(const MemberCallExpr* expr, int obj_reg, FunctionContext& func);
+	std::vector<std::pair<std::string, size_t>> m_pending_constructors;
+	static std::string class_value_constructor_name(const std::string& class_name, size_t arity);
+	IRFunction generate_class_value_constructor(const StructDecl& decl, size_t arity);
 
 	bool type_hint_names_a_class(const std::string& type_hint) const;
 	void mark_global_holds_object(int64_t global_idx);

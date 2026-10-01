@@ -95,16 +95,16 @@ struct GeneratedProgram {
 
 	std::string source() const {
 		std::string out;
-		for (const auto& declaration : declarations) {
+		for (const auto &declaration : declarations) {
 			out += declaration;
 			out += "\n";
 		}
-		for (const auto& function : functions) {
+		for (const auto &function : functions) {
 			out += function;
 			out += "\n";
 		}
 		out += "func test():\n";
-		for (const auto& statement : statements) {
+		for (const auto &statement : statements) {
 			out += statement;
 		}
 		out += "\treturn " + result_expression + "\n";
@@ -114,8 +114,7 @@ struct GeneratedProgram {
 
 class Generator {
 public:
-	Generator(uint64_t seed, GenOptions options = {})
-		: m_random(seed), m_seed(seed), m_options(options) {}
+	Generator(uint64_t seed, GenOptions options = {}) : m_random(seed), m_seed(seed), m_options(options) {}
 
 	GeneratedProgram generate() {
 		GeneratedProgram program;
@@ -123,24 +122,24 @@ public:
 		m_has_struct = m_options.allow_structs && m_random.chance(50);
 		if (m_has_struct) {
 			program.declarations.push_back(
-				"struct FuzzPoint:\n"
-				"\tvar x: int = 0\n"
-				"\tvar y: int = 0\n"
-				"\tfunc total() -> int:\n"
-				"\t\treturn self.x + self.y\n"
-				"\n"
-				"func fuzz_point_round_trip(point: FuzzPoint) -> FuzzPoint:\n"
-				"\treturn point\n");
+					"struct FuzzPoint:\n"
+					"\tvar x: int = 0\n"
+					"\tvar y: int = 0\n"
+					"\tfunc total() -> int:\n"
+					"\t\treturn self.x + self.y\n"
+					"\n"
+					"func fuzz_point_round_trip(point: FuzzPoint) -> FuzzPoint:\n"
+					"\treturn point\n");
 		}
 		m_has_trait = m_options.allow_traits && (m_seed % 4 == 0);
 		if (m_has_trait) {
 			program.declarations.insert(program.declarations.begin(),
-				"uses FuzzAccumulator\n"
-				"trait FuzzAccumulator:\n"
-				"\tvar fuzz_trait_total: int = 0\n"
-				"\tfunc fuzz_trait_add(left: int, right: int) -> int:\n"
-				"\t\tfuzz_trait_total += left + right\n"
-				"\t\treturn fuzz_trait_total\n");
+										"uses FuzzAccumulator\n"
+										"trait FuzzAccumulator:\n"
+										"\tvar fuzz_trait_total: int = 0\n"
+										"\tfunc fuzz_trait_add(left: int, right: int) -> int:\n"
+										"\t\tfuzz_trait_total += left + right\n"
+										"\t\treturn fuzz_trait_total\n");
 		}
 
 		if (m_options.allow_functions && m_random.chance(50)) {
@@ -201,9 +200,12 @@ private:
 
 	GenType pick_type() {
 		switch (m_random.below(3)) {
-			case 0: return GenType::INT;
-			case 1: return GenType::FLOAT;
-			default: return GenType::BOOL;
+			case 0:
+				return GenType::INT;
+			case 1:
+				return GenType::FLOAT;
+			default:
+				return GenType::BOOL;
 		}
 	}
 
@@ -212,8 +214,8 @@ private:
 	// resolve to the innermost declaration.
 	std::vector<std::string> variables_of_type(GenType type, bool assignable_only = false) const {
 		std::vector<std::string> found;
-		for (const auto& scope : m_scopes) {
-			for (const auto& variable : scope) {
+		for (const auto &scope : m_scopes) {
+			for (const auto &variable : scope) {
 				if (variable.type != type) {
 					continue;
 				}
@@ -245,7 +247,9 @@ private:
 		// decimal that neither side promised to round the same way.
 		const uint32_t whole = m_random.below(static_cast<uint32_t>(m_options.max_int_literal) + 1);
 		const uint32_t quarters = m_random.below(4);
-		return std::to_string(whole) + "." + (quarters == 0 ? "0" : quarters == 1 ? "25" : quarters == 2 ? "5" : "75");
+		return std::to_string(whole) + "." + (quarters == 0 ? "0" : quarters == 1 ? "25"
+													  : quarters == 2			  ? "5"
+																				  : "75");
 	}
 
 	// A non-zero integer, for the right-hand side of / and %. GDScript reports
@@ -276,9 +280,12 @@ private:
 			return candidates[m_random.below(static_cast<uint32_t>(candidates.size()))];
 		}
 		switch (type) {
-			case GenType::INT: return int_literal();
-			case GenType::FLOAT: return float_literal();
-			case GenType::BOOL: return m_random.chance(50) ? "true" : "false";
+			case GenType::INT:
+				return int_literal();
+			case GenType::FLOAT:
+				return float_literal();
+			case GenType::BOOL:
+				return m_random.chance(50) ? "true" : "false";
 		}
 		return "0";
 	}
@@ -330,7 +337,8 @@ private:
 			return "(" + left + " % " + nonzero_int_literal() + ")";
 		}
 
-		const char* symbol = (op == 0) ? " + " : (op == 1) ? " - " : " * ";
+		const char *symbol = (op == 0) ? " + " : (op == 1) ? " - "
+														   : " * ";
 		const std::string left = generate_expression(left_type, depth - 1);
 		const std::string right = generate_expression(right_type, depth - 1);
 		return "(" + left + symbol + right + ")";
@@ -348,7 +356,7 @@ private:
 			return "(not " + operand + ")";
 		}
 		if (choice == 1 || choice == 2) {
-			const char* symbol = (choice == 1) ? " and " : " or ";
+			const char *symbol = (choice == 1) ? " and " : " or ";
 			const std::string left = generate_expression(GenType::BOOL, depth - 1);
 			const std::string right = generate_expression(GenType::BOOL, depth - 1);
 			return "(" + left + symbol + right + ")";
@@ -359,11 +367,11 @@ private:
 
 		// A comparison, over ints or over floats. Comparing an int with a float
 		// is legal GDScript and worth generating.
-		static const char* const comparisons[] = { "==", "!=", "<", "<=", ">", ">=" };
-		const char* comparison = comparisons[m_random.below(6)];
+		static const char *const comparisons[] = { "==", "!=", "<", "<=", ">", ">=" };
+		const char *comparison = comparisons[m_random.below(6)];
 		const GenType left_type = m_random.chance(60) ? GenType::INT : GenType::FLOAT;
 		const GenType right_type = m_random.chance(70) ? left_type
-			: (left_type == GenType::INT ? GenType::FLOAT : GenType::INT);
+													   : (left_type == GenType::INT ? GenType::FLOAT : GenType::INT);
 		const std::string left = generate_expression(left_type, depth - 1);
 		const std::string right = generate_expression(right_type, depth - 1);
 		return "(" + left + " " + comparison + " " + right + ")";
@@ -380,7 +388,7 @@ private:
 		std::string hint;
 		if (m_random.chance(15)) {
 			hint = type == GenType::BOOL ? ": bool | int"
-				: ": int | float";
+										 : ": int | float";
 			m_scopes.back().back().union_hint = true;
 		}
 		return indent(depth) + "var " + name + hint + " = " + value + "\n";
@@ -388,24 +396,26 @@ private:
 
 	std::string exercise_nullable(GenType type, int depth) {
 		const std::string name = "maybe" + std::to_string(m_next_variable++);
-		const char* type_name = type == GenType::BOOL ? "bool"
-			: type == GenType::FLOAT ? "float" : "int";
+		const char *type_name = type == GenType::BOOL ? "bool"
+				: type == GenType::FLOAT			  ? "float"
+													  : "int";
 		// Both the value and the fallback land in slots declared `T?` and `T`.
 		const bool enclosing_proven = m_proven_types_only;
 		m_proven_types_only = true;
 		const std::string value = m_random.chance(40)
-			? "null" : generate_expression(type, m_options.max_expression_depth - 1);
+				? "null"
+				: generate_expression(type, m_options.max_expression_depth - 1);
 		std::string out = indent(depth) + "var " + name + ": " + type_name + "? = " + value + "\n";
 		if (m_random.chance(40)) {
 			// `??` is that same null check written as a value, so the fallback
 			// runs exactly when the branch below would not be entered.
 			const std::string fallback =
-				generate_expression(type, m_options.max_expression_depth - 1);
+					generate_expression(type, m_options.max_expression_depth - 1);
 			m_proven_types_only = enclosing_proven;
 			const std::string sink = "v" + std::to_string(m_next_variable++);
 			m_scopes.back().push_back({ sink, type, /*assignable=*/true });
 			return out + indent(depth) + "var " + sink + ": " + type_name + " = " +
-				name + " ?? (" + fallback + ")\n";
+					name + " ?? (" + fallback + ")\n";
 		}
 		m_proven_types_only = enclosing_proven;
 		out += indent(depth) + "if " + name + " != null:\n";
@@ -413,7 +423,7 @@ private:
 			out += indent(depth + 1) + name + " = not " + name + "\n";
 		} else {
 			out += indent(depth + 1) + name + " = " + name +
-				(type == GenType::FLOAT ? " + 1.0\n" : " + 1\n");
+					(type == GenType::FLOAT ? " + 1.0\n" : " + 1\n");
 		}
 		return out;
 	}
@@ -464,14 +474,14 @@ private:
 		const std::string point = "point" + suffix;
 		const std::string copy = "point_copy" + suffix;
 		const std::string x = generate_expression(GenType::INT,
-			m_options.max_expression_depth - 1);
+												  m_options.max_expression_depth - 1);
 		const std::string y = generate_expression(GenType::INT,
-			m_options.max_expression_depth - 1);
+												  m_options.max_expression_depth - 1);
 		std::string out = indent(depth) + "var " + point + ": FuzzPoint = FuzzPoint(" +
-			x + ", " + y + ")\n";
+				x + ", " + y + ")\n";
 		out += indent(depth) + point + ".x += " + nonzero_int_literal() + "\n";
 		out += indent(depth) + "var " + copy + " = fuzz_point_round_trip(" +
-			point + ".copy())\n";
+				point + ".copy())\n";
 		out += indent(depth) + "if " + copy + " is FuzzPoint:\n";
 		out += indent(depth + 1) + point + ".y = " + copy + ".total()\n";
 		return out;
@@ -479,7 +489,7 @@ private:
 
 	std::string generate_if(int depth, int nesting) {
 		std::string out = indent(depth) + "if " +
-			generate_expression(GenType::BOOL, m_options.max_expression_depth - 1) + ":\n";
+				generate_expression(GenType::BOOL, m_options.max_expression_depth - 1) + ":\n";
 
 		push_scope();
 		const int body = 1 + static_cast<int>(m_random.below(2));
@@ -567,7 +577,7 @@ private:
 
 // `still_fails` returns true when a source still reproduces the failure.
 template <typename Predicate>
-GeneratedProgram shrink(const GeneratedProgram& original, Predicate still_fails) {
+GeneratedProgram shrink(const GeneratedProgram &original, Predicate still_fails) {
 	GeneratedProgram best = original;
 
 	bool progress = true;
@@ -577,7 +587,7 @@ GeneratedProgram shrink(const GeneratedProgram& original, Predicate still_fails)
 		// Delete one statement at a time, from the back, so that a deletion
 		// which removes a declaration a later statement needs is tried before
 		// the statement that needs it.
-		for (size_t i = best.statements.size(); i-- > 0; ) {
+		for (size_t i = best.statements.size(); i-- > 0;) {
 			GeneratedProgram candidate = best;
 			candidate.statements.erase(candidate.statements.begin() + static_cast<long>(i));
 			if (still_fails(candidate.source())) {
@@ -598,7 +608,7 @@ GeneratedProgram shrink(const GeneratedProgram& original, Predicate still_fails)
 		}
 
 		// Drop helper functions.
-		for (size_t i = best.functions.size(); i-- > 0; ) {
+		for (size_t i = best.functions.size(); i-- > 0;) {
 			GeneratedProgram candidate = best;
 			candidate.functions.erase(candidate.functions.begin() + static_cast<long>(i));
 			if (still_fails(candidate.source())) {
