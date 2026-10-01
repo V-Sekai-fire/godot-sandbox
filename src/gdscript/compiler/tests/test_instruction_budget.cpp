@@ -1,4 +1,5 @@
 #include "dyncall_shim.h"
+#include "witness/doctest.h"
 // Deterministic code-quality guardrail for the interpreter hot path. Wall-clock
 // benchmarks are machine-dependent; the libriscv instruction counter is not.
 #include "../compiler.h"
@@ -18,7 +19,7 @@ using Machine = riscv::Machine<riscv::RISCV64>;
 
 namespace {
 
-const char* SOURCE = R"(
+const char *SOURCE = R"(
 func loop_int(n : int) -> int:
 	var acc : int = 0
 	var i : int = 0
@@ -61,9 +62,8 @@ func untyped_float_compare(n : int) -> int:
 	return acc
 )";
 
-void write_variant(Machine& machine, uint64_t address, const VariantLayout& layout,
-	int32_t type, int64_t payload)
-{
+void write_variant(Machine &machine, uint64_t address, const VariantLayout &layout,
+				   int32_t type, int64_t payload) {
 	std::vector<uint8_t> bytes(size_t(layout.variant_size()), 0);
 	std::memcpy(bytes.data() + VariantLayout::TYPE_OFFSET, &type, sizeof(type));
 	std::memcpy(bytes.data() + VariantLayout::DATA_OFFSET, &payload, sizeof(payload));
@@ -76,19 +76,19 @@ struct RunResult {
 	uint64_t payload = 0;
 };
 
-RunResult run(const std::vector<uint8_t>& elf, const std::string& function, int64_t n) {
+RunResult run(const std::vector<uint8_t> &elf, const std::string &function, int64_t n) {
 	const VariantLayout layout = native_variant_layout();
-	Machine machine { elf, riscv::MachineOptions<riscv::RISCV64> {
-		.memory_max = 16ull << 20,
-		.stack_size = 1ull << 20,
-	} };
+	Machine machine{ elf, riscv::MachineOptions<riscv::RISCV64>{
+								  .memory_max = 16ull << 20,
+								  .stack_size = 1ull << 20,
+						  } };
 	install_scope_stub<Machine>();
 	// ELF entry initializes globals and exits. These kernels have none.
 	machine.simulate(50'000'000ull);
 	machine.set_instruction_counter(0);
 	machine.set_max_instructions(UINT64_MAX);
 
-	uint64_t& sp = machine.cpu.reg(riscv::REG_SP);
+	uint64_t &sp = machine.cpu.reg(riscv::REG_SP);
 	sp = machine.memory.stack_initial();
 	const uint64_t stride = (uint64_t(layout.variant_size()) + 15u) & ~15u;
 	sp -= stride * 2;
@@ -109,18 +109,17 @@ RunResult run(const std::vector<uint8_t>& elf, const std::string& function, int6
 	return out;
 }
 
-void check_budget(const std::vector<uint8_t>& elf, const std::string& function,
-	uint64_t budget)
-{
+void check_budget(const std::vector<uint8_t> &elf, const std::string &function,
+				  uint64_t budget) {
 	constexpr int64_t SMALL = 200;
 	constexpr int64_t LARGE = 1200;
 	const RunResult small = run(elf, function, SMALL);
 	const RunResult large = run(elf, function, LARGE);
 	const uint64_t per_iteration = (large.instructions - small.instructions) /
-		uint64_t(LARGE - SMALL);
+			uint64_t(LARGE - SMALL);
 	if (per_iteration > budget) {
 		std::cerr << function << " executes " << per_iteration
-			<< " instructions/iteration; budget is " << budget << std::endl;
+				  << " instructions/iteration; budget is " << budget << std::endl;
 		std::exit(1);
 	}
 	std::cout << function << ": " << per_iteration << " instructions/iteration" << std::endl;
@@ -129,7 +128,7 @@ void check_budget(const std::vector<uint8_t>& elf, const std::string& function,
 		std::memcpy(&value, &large.payload, sizeof(value));
 		if (large.type != Variant::FLOAT || value != 1.5 * double(LARGE + 1)) {
 			std::cerr << function << " returned " << value << " instead of "
-				<< 1.5 * double(LARGE + 1) << std::endl;
+					  << 1.5 * double(LARGE + 1) << std::endl;
 			std::exit(1);
 		}
 	} else if (function == "untyped_float_compare") {
@@ -142,17 +141,13 @@ void check_budget(const std::vector<uint8_t>& elf, const std::string& function,
 
 } // namespace
 
-int main() {
+TEST_CASE("the instruction budget holds") {
 	sgd_install_test_dyncalls();
 	Compiler compiler;
 	const std::vector<uint8_t> elf = compiler.compile(SOURCE);
-	if (elf.empty()) {
-		std::cerr << compiler.get_error() << std::endl;
-		return 1;
-	}
+	REQUIRE_MESSAGE(!elf.empty(), compiler.get_error());
 	check_budget(elf, "loop_int", 12);
 	check_budget(elf, "loop_float", 14);
 	check_budget(elf, "untyped_float", 14);
 	check_budget(elf, "untyped_float_compare", 20);
-	return 0;
 }

@@ -81,6 +81,29 @@ IR_OPCODE(BATCH_GET,       "BATCH_GET",       SIG(DST, IMM, SRC),  IR_PURE)
 // identity, so it never consumes a scoped Variant slot.
 IR_OPCODE(CODEPOINT_GET,   "CODEPOINT_GET",   SIG(DST, IMM, SRC),  IR_PURE)
 
+// A Packed*Array acquired into guest memory by ECALL_PACKED_ACQUIRE (see
+// codegen.cpp, "Packed array regions"). The IMM token names the frame
+// descriptor the acquire filled. Neither its data pointer nor its element count
+// changes inside a region, so PACKED_DATA and PACKED_SIZE read them into
+// registers once at the region's entry and the accesses work from those; the
+// type IMM is the Packed*Array's Variant type, which fixes the element layout.
+// None of these is a host call. Side effects: an access must not move across
+// the acquire, the release or a store.
+IR_OPCODE(PACKED_DATA,     "PACKED_DATA",     SIG(DST, IMM),                 IR_SIDE_EFFECTS)
+IR_OPCODE(PACKED_SIZE,     "PACKED_SIZE",     SIG(DST, IMM),                 IR_SIDE_EFFECTS)
+// The acquired array's identity: equal for two Variants sharing one array.
+IR_OPCODE(PACKED_IDENTITY, "PACKED_IDENTITY", SIG(DST, IMM),                 IR_SIDE_EFFECTS)
+// size, index: the element of the copy that GDScript index `index` names, a
+// negative one counting from the end. In bounds: DST is that element number and
+// control falls through. Otherwise control goes to LBL, where DST is not
+// defined. One unsigned compare, in registers.
+IR_OPCODE(PACKED_INDEX,    "PACKED_INDEX",    SIG(DST, SRC, SRC, LBL),       IR_SIDE_EFFECTS | IR_BRANCH)
+// type, data, element (from PACKED_INDEX).
+IR_OPCODE(PACKED_GET,      "PACKED_GET",      SIG(DST, IMM, SRC, SRC),       IR_SIDE_EFFECTS)
+// type, data, element, value. The type hint is the value's: an int stored into a
+// float array converts as the engine converts it.
+IR_OPCODE(PACKED_SET,      "PACKED_SET",      SIG(IMM, SRC, SRC, SRC),       IR_SIDE_EFFECTS)
+
 // Immediate is a scope id (frame slot index), not a register.
 IR_OPCODE(SCOPE_MARK,      "SCOPE_MARK",      SIG(IMM),            IR_SIDE_EFFECTS)
 IR_OPCODE(SCOPE_RELEASE,   "SCOPE_RELEASE",   SIG(IMM),            IR_SIDE_EFFECTS)

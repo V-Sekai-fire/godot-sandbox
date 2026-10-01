@@ -1186,7 +1186,8 @@ bool analyze_with_compiler(const String &p_source, const String &p_path, uint32_
 		const CharString source = p_source.utf8();
 		const CharString path = canonical_path.utf8();
 		r_model = gdscript::analyze_source(std::string(source.get_data(), source.length()),
-				std::string(path.get_data(), path.length()), p_flags, caret_line, caret_column);
+				std::string(path.get_data(), path.length()), p_flags | gdscript::ANALYZE_EXTENSIONS,
+				caret_line, caret_column);
 		return true;
 	};
 	GDScriptCompilerBackend &compiler = gdscript_compiler::backend_for(false);
@@ -1908,7 +1909,7 @@ Dictionary SafeGDScriptLanguage::_validate(const String &p_script, const String 
 		const CharString source = p_script.utf8();
 		const CharString path = p_path.utf8();
 		model = gdscript::analyze_source(std::string(source.get_data(), source.length()),
-				std::string(path.get_data(), path.length()), flags);
+				std::string(path.get_data(), path.length()), flags | gdscript::ANALYZE_EXTENSIONS);
 	}
 
 	// Full compile catches errors the tolerant parse misses.

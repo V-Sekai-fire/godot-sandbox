@@ -1,4 +1,5 @@
 #include "dyncall_shim.h"
+#include "witness/doctest.h"
 // Differential testing: the IR interpreter against the real machine.
 //
 // The IR interpreter and the RISC-V backend are two independent
@@ -28,12 +29,12 @@
 //   GDSC_PASSES=<list>      which optimizer passes to run (see IROptimizer)
 //   GDSC_DIFF_NO_OPT=1      skip the optimizer entirely
 //   GDSC_DIFF_DEBUG=1       print the return Variant's address and payload
-#include "../compiler.h"
 #include "../codegen.h"
+#include "../compiler.h"
 #include "../compiler_exception.h"
 #include "../elf_builder.h"
-#include "../ir_interpreter.h"
 #include "../globals.h"
+#include "../ir_interpreter.h"
 #include "../ir_optimizer.h"
 #include "../lexer.h"
 #include "../parser.h"
@@ -43,8 +44,8 @@
 #include "test_corpus.h"
 #include <cmath>
 #include <cstdlib>
-#include <fstream>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -90,7 +91,7 @@ enum VariantOperator : int {
 // the rest are named so that a skip says which host call was needed.
 struct SyscallName {
 	int number;
-	const char* name;
+	const char *name;
 };
 
 const SyscallName SYSCALL_NAMES[] = {
@@ -110,8 +111,8 @@ const SyscallName SYSCALL_NAMES[] = {
 	{ 549, "ECALL_UTILITY" },
 };
 
-const char* syscall_name(int number) {
-	for (const auto& entry : SYSCALL_NAMES) {
+const char *syscall_name(int number) {
+	for (const auto &entry : SYSCALL_NAMES) {
 		if (entry.number == number) {
 			return entry.name;
 		}
@@ -135,7 +136,7 @@ struct RunState {
 	std::string unsupported;
 };
 
-GuestValue read_variant(machine_t& machine, uint64_t address, const VariantLayout& layout) {
+GuestValue read_variant(machine_t &machine, uint64_t address, const VariantLayout &layout) {
 	GuestValue value;
 	std::vector<uint8_t> bytes(static_cast<size_t>(layout.variant_size()));
 	machine.copy_from_guest(bytes.data(), address, bytes.size());
@@ -153,9 +154,8 @@ GuestValue read_variant(machine_t& machine, uint64_t address, const VariantLayou
 	return value;
 }
 
-void write_variant(machine_t& machine, uint64_t address, const VariantLayout& layout,
-	int32_t type, int64_t payload)
-{
+void write_variant(machine_t &machine, uint64_t address, const VariantLayout &layout,
+				   int32_t type, int64_t payload) {
 	std::vector<uint8_t> bytes(static_cast<size_t>(layout.variant_size()), 0);
 	std::memcpy(bytes.data() + VariantLayout::TYPE_OFFSET, &type, sizeof(int32_t));
 	std::memcpy(bytes.data() + VariantLayout::DATA_OFFSET, &payload, sizeof(int64_t));
@@ -166,24 +166,28 @@ bool is_numeric(int32_t type) {
 	return type == Variant::BOOL || type == Variant::INT || type == Variant::FLOAT;
 }
 
-bool booleanize(const GuestValue& value) {
+bool booleanize(const GuestValue &value) {
 	switch (value.type) {
-		case Variant::NIL: return false;
+		case Variant::NIL:
+			return false;
 		case Variant::BOOL:
-		case Variant::INT: return value.as_int != 0;
-		case Variant::FLOAT: return value.as_float != 0.0;
-		default: return true;
+		case Variant::INT:
+			return value.as_int != 0;
+		case Variant::FLOAT:
+			return value.as_float != 0.0;
+		default:
+			return true;
 	}
 }
 
-int64_t to_int(const GuestValue& value) {
+int64_t to_int(const GuestValue &value) {
 	if (value.type == Variant::FLOAT) {
 		return static_cast<int64_t>(value.as_float);
 	}
 	return value.as_int;
 }
 
-double to_float(const GuestValue& value) {
+double to_float(const GuestValue &value) {
 	if (value.type == Variant::FLOAT) {
 		return value.as_float;
 	}
@@ -193,9 +197,8 @@ double to_float(const GuestValue& value) {
 // Variant::evaluate() for the types the interpreter can represent. Returns
 // false for an operation Godot does not define on these types, which is what
 // evaluate() reports through its `valid` out-parameter.
-bool evaluate(int op, const GuestValue& lhs, const GuestValue& rhs,
-	int32_t& result_type, int64_t& result_payload)
-{
+bool evaluate(int op, const GuestValue &lhs, const GuestValue &rhs,
+			  int32_t &result_type, int64_t &result_payload) {
 	auto set_bool = [&](bool value) {
 		result_type = Variant::BOOL;
 		result_payload = value ? 1 : 0;
@@ -285,16 +288,22 @@ bool evaluate(int op, const GuestValue& lhs, const GuestValue& rhs,
 			set_bool(float_op ? to_float(lhs) >= to_float(rhs) : to_int(lhs) >= to_int(rhs));
 			return true;
 		case OP_ADD:
-			if (float_op) set_float(to_float(lhs) + to_float(rhs));
-			else set_int(to_int(lhs) + to_int(rhs));
+			if (float_op)
+				set_float(to_float(lhs) + to_float(rhs));
+			else
+				set_int(to_int(lhs) + to_int(rhs));
 			return true;
 		case OP_SUBTRACT:
-			if (float_op) set_float(to_float(lhs) - to_float(rhs));
-			else set_int(to_int(lhs) - to_int(rhs));
+			if (float_op)
+				set_float(to_float(lhs) - to_float(rhs));
+			else
+				set_int(to_int(lhs) - to_int(rhs));
 			return true;
 		case OP_MULTIPLY:
-			if (float_op) set_float(to_float(lhs) * to_float(rhs));
-			else set_int(to_int(lhs) * to_int(rhs));
+			if (float_op)
+				set_float(to_float(lhs) * to_float(rhs));
+			else
+				set_int(to_int(lhs) * to_int(rhs));
 			return true;
 		case OP_DIVIDE:
 			if (float_op) {
@@ -316,23 +325,28 @@ bool evaluate(int op, const GuestValue& lhs, const GuestValue& rhs,
 			return true;
 		}
 		case OP_SHIFT_LEFT:
-			if (float_op) return false;
+			if (float_op)
+				return false;
 			set_int(static_cast<int64_t>(static_cast<uint64_t>(to_int(lhs)) << (to_int(rhs) & 63)));
 			return true;
 		case OP_SHIFT_RIGHT:
-			if (float_op) return false;
+			if (float_op)
+				return false;
 			set_int(to_int(lhs) >> (to_int(rhs) & 63));
 			return true;
 		case OP_BIT_AND:
-			if (float_op) return false;
+			if (float_op)
+				return false;
 			set_int(to_int(lhs) & to_int(rhs));
 			return true;
 		case OP_BIT_OR:
-			if (float_op) return false;
+			if (float_op)
+				return false;
 			set_int(to_int(lhs) | to_int(rhs));
 			return true;
 		case OP_BIT_XOR:
-			if (float_op) return false;
+			if (float_op)
+				return false;
 			set_int(to_int(lhs) ^ to_int(rhs));
 			return true;
 		default:
@@ -342,8 +356,8 @@ bool evaluate(int op, const GuestValue& lhs, const GuestValue& rhs,
 
 // -= The syscall shim =-
 
-void syscall_veval(machine_t& machine) {
-	RunState& state = *machine.get_userdata<RunState>();
+void syscall_veval(machine_t &machine) {
+	RunState &state = *machine.get_userdata<RunState>();
 
 	const int op = static_cast<int>(machine.cpu.reg(riscv::REG_ARG0));
 	const uint64_t lhs_addr = machine.cpu.reg(riscv::REG_ARG1);
@@ -379,12 +393,12 @@ void syscall_veval(machine_t& machine) {
 // host implements the same formulas against Godot's Math::.
 //
 // str() and len() are not here: they need Variants this harness cannot make.
-void syscall_utility(machine_t& machine) {
-	RunState& state = *machine.get_userdata<RunState>();
+void syscall_utility(machine_t &machine) {
+	RunState &state = *machine.get_userdata<RunState>();
 
 	const int op = static_cast<int>(machine.cpu.reg(riscv::REG_ARG0));
 	if (op == gdscript::UTILITY_STR || op == gdscript::UTILITY_LEN ||
-	    op == gdscript::UTILITY_RAND_FROM_SEED) {
+		op == gdscript::UTILITY_RAND_FROM_SEED) {
 		state.unsupported = "str() or len(), which need the host Variant API";
 		machine.stop();
 		return;
@@ -398,7 +412,7 @@ void syscall_utility(machine_t& machine) {
 	double result = 0.0;
 	try {
 		result = gdscript::eval_utility_op(static_cast<int16_t>(op), args);
-	} catch (const std::exception& e) {
+	} catch (const std::exception &e) {
 		state.unsupported = std::string("ECALL_UTILITY op ") + std::to_string(op) + ": " + e.what();
 		machine.stop();
 		return;
@@ -408,8 +422,8 @@ void syscall_utility(machine_t& machine) {
 
 // Every other host call: stop and say which one, so a skipped program says why.
 template <int Number>
-void syscall_unsupported(machine_t& machine) {
-	RunState& state = *machine.get_userdata<RunState>();
+void syscall_unsupported(machine_t &machine) {
+	RunState &state = *machine.get_userdata<RunState>();
 	state.unsupported = syscall_name(Number);
 	machine.stop();
 }
@@ -417,13 +431,16 @@ void syscall_unsupported(machine_t& machine) {
 // -= Running a program =-
 
 struct Outcome {
-	enum class Kind { AGREED, DISAGREED, SKIPPED, FAILED };
+	enum class Kind { AGREED,
+					  DISAGREED,
+					  SKIPPED,
+					  FAILED };
 	Kind kind = Kind::AGREED;
 	std::string detail;
 };
 
 // The IR interpreter's answer, expressed the way the machine reports one.
-GuestValue interpreter_value(const IRInterpreter::Value& value) {
+GuestValue interpreter_value(const IRInterpreter::Value &value) {
 	GuestValue result;
 	if (std::holds_alternative<std::monostate>(value)) {
 		result.type = Variant::NIL;
@@ -442,19 +459,23 @@ GuestValue interpreter_value(const IRInterpreter::Value& value) {
 	return result;
 }
 
-std::string describe(const GuestValue& value) {
+std::string describe(const GuestValue &value) {
 	switch (value.type) {
-		case Variant::BOOL: return std::string(value.as_int ? "true" : "false") + " (BOOL)";
-		case Variant::INT: return std::to_string(value.as_int) + " (INT)";
-		case Variant::FLOAT: return std::to_string(value.as_float) + " (FLOAT)";
-		default: return std::string(variant_type_name(value.type));
+		case Variant::BOOL:
+			return std::string(value.as_int ? "true" : "false") + " (BOOL)";
+		case Variant::INT:
+			return std::to_string(value.as_int) + " (INT)";
+		case Variant::FLOAT:
+			return std::to_string(value.as_float) + " (FLOAT)";
+		default:
+			return std::string(variant_type_name(value.type));
 	}
 }
 
 // BOOL and INT are the same answer: the interpreter is free to produce either
 // for a truth value, and so is the backend. FLOAT against INT is a real
 // difference -- GDScript keeps them apart.
-bool agrees(const GuestValue& a, const GuestValue& b) {
+bool agrees(const GuestValue &a, const GuestValue &b) {
 	const bool a_float = a.type == Variant::FLOAT;
 	const bool b_float = b.type == Variant::FLOAT;
 	if (a_float != b_float) {
@@ -469,7 +490,7 @@ bool agrees(const GuestValue& a, const GuestValue& b) {
 	return a.as_int == b.as_int;
 }
 
-Outcome run_source(const std::string& source) {
+Outcome run_source(const std::string &source) {
 	Outcome outcome;
 
 	const VariantLayout layout = native_variant_layout();
@@ -490,7 +511,7 @@ Outcome run_source(const std::string& source) {
 
 		ElfBuilder builder;
 		elf = builder.build(ir, layout);
-	} catch (const std::exception& e) {
+	} catch (const std::exception &e) {
 		outcome.kind = Outcome::Kind::FAILED;
 		outcome.detail = std::string("compilation failed: ") + e.what();
 		return outcome;
@@ -501,7 +522,7 @@ Outcome run_source(const std::string& source) {
 	try {
 		IRInterpreter interpreter(ir);
 		expected = interpreter_value(interpreter.call("test"));
-	} catch (const std::exception& e) {
+	} catch (const std::exception &e) {
 		outcome.kind = Outcome::Kind::SKIPPED;
 		outcome.detail = std::string("the IR interpreter cannot run it: ") + e.what();
 		return outcome;
@@ -513,12 +534,12 @@ Outcome run_source(const std::string& source) {
 	}
 
 	// The machine's answer.
-	RunState state { layout, "" };
+	RunState state{ layout, "" };
 	try {
-		machine_t machine { elf, riscv::MachineOptions<riscv::RISCV64> {
-			.memory_max = 16ull << 20,
-			.stack_size = 1ull << 20,
-		} };
+		machine_t machine{ elf, riscv::MachineOptions<riscv::RISCV64>{
+										.memory_max = 16ull << 20,
+										.stack_size = 1ull << 20,
+								} };
 		machine.set_userdata(&state);
 
 		machine_t::install_syscall_handler(502, syscall_veval);
@@ -554,7 +575,7 @@ Outcome run_source(const std::string& source) {
 
 		// The Godot Sandbox calling convention: a0 points at a Variant the
 		// callee writes its return value into.
-		auto& sp = machine.cpu.reg(riscv::REG_SP);
+		auto &sp = machine.cpu.reg(riscv::REG_SP);
 		sp = machine.memory.stack_initial();
 		sp -= (static_cast<uint64_t>(layout.variant_size()) + 15) & ~15ull;
 		const uint64_t return_variant = sp;
@@ -574,16 +595,16 @@ Outcome run_source(const std::string& source) {
 		const GuestValue actual = read_variant(machine, return_variant, layout);
 		if (std::getenv("GDSC_DIFF_DEBUG") != nullptr) {
 			std::cerr << "    [debug] return variant at 0x" << std::hex << return_variant
-				<< ", stack_initial 0x" << machine.memory.stack_initial()
-				<< ", payload 0x" << actual.as_int << std::dec << std::endl;
+					  << ", stack_initial 0x" << machine.memory.stack_initial()
+					  << ", payload 0x" << actual.as_int << std::dec << std::endl;
 		}
 		if (!agrees(expected, actual)) {
 			outcome.kind = Outcome::Kind::DISAGREED;
 			outcome.detail = "interpreter says " + describe(expected) +
-				", the machine says " + describe(actual);
+					", the machine says " + describe(actual);
 		}
 		return outcome;
-	} catch (const std::exception& e) {
+	} catch (const std::exception &e) {
 		if (!state.unsupported.empty()) {
 			outcome.kind = Outcome::Kind::SKIPPED;
 			outcome.detail = "needs " + state.unsupported;
@@ -597,141 +618,127 @@ Outcome run_source(const std::string& source) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+namespace {
+
+uint64_t env_number(const char *name, uint64_t fallback) {
+	const char *value = std::getenv(name);
+	return value != nullptr ? std::strtoull(value, nullptr, 10) : fallback;
+}
+
+// A skip always says why. A harness that skips silently is a harness that stops
+// testing without anyone noticing.
+void record(const std::string &name, const Outcome &outcome, int &agreed, int &skipped) {
+	switch (outcome.kind) {
+		case Outcome::Kind::AGREED:
+			agreed++;
+			break;
+		case Outcome::Kind::SKIPPED:
+			skipped++;
+			MESSAGE("SKIP " << name << ": " << outcome.detail);
+			break;
+		case Outcome::Kind::DISAGREED:
+		case Outcome::Kind::FAILED:
+			FAIL_CHECK(name, ": ", outcome.detail);
+			break;
+	}
+}
+
+} // namespace
+
+const bool SETUP_ONCE = [] {
 	sgd_install_test_dyncalls();
-	// Two modes. Without arguments it runs the shared corpus, which is what the
-	// test suite does. With --fuzz it runs generated programs instead, which is
-	// what turns this check into a fuzzer: the generator produces programs
-	// nobody wrote, and the machine and the interpreter still have to agree.
-	bool fuzz = false;
-	uint64_t seed = 0;
-	uint64_t count = 200;
-	const char* file = nullptr;
+	return true;
+}();
 
-	for (int i = 1; i < argc; i++) {
-		if (std::strcmp(argv[i], "--fuzz") == 0) {
-			fuzz = true;
-		} else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
-			seed = std::strtoull(argv[++i], nullptr, 10);
-		} else if (std::strcmp(argv[i], "--count") == 0 && i + 1 < argc) {
-			count = std::strtoull(argv[++i], nullptr, 10);
-		} else if (std::strcmp(argv[i], "--file") == 0 && i + 1 < argc) {
-			file = argv[++i];
-		} else {
-			std::cerr << "usage: " << argv[0]
-				<< " [--fuzz [--seed N] [--count N]] [--file program.gd]" << std::endl;
-			return 2;
-		}
+TEST_CASE("the interpreter and a real machine agree on the corpus") {
+	int agreed = 0;
+	int skipped = 0;
+	for (const auto &program : gdscript_test::corpus()) {
+		record(program.name, run_source(program.source), agreed, skipped);
 	}
+	// A run where nothing was actually compared would pass while testing
+	// nothing at all.
+	CHECK_MESSAGE(agreed > 0, "no program was compared: the harness is not testing anything");
+}
 
-	// One program from a file, for reducing a failure by hand.
-	if (file != nullptr) {
-		std::ifstream stream(file);
-		if (!stream) {
-			std::cerr << "cannot read " << file << std::endl;
-			return 2;
-		}
-		const std::string source((std::istreambuf_iterator<char>(stream)),
-			std::istreambuf_iterator<char>());
-		const Outcome outcome = run_source(source);
-		switch (outcome.kind) {
-			case Outcome::Kind::AGREED:
-				std::cout << "agreed" << std::endl;
-				return 0;
-			case Outcome::Kind::SKIPPED:
-				std::cout << "skipped: " << outcome.detail << std::endl;
-				return 0;
-			default:
-				std::cerr << "FAIL: " << outcome.detail << std::endl;
-				return 1;
-		}
-	}
+// The same comparison against programs nobody wrote. This is upstream's --fuzz
+// mode, which the per-commit run never asked for, so it stays opt-in:
+// GDSC_DIFF_FUZZ=1 turns it on, GDSC_DIFF_SEED and GDSC_DIFF_COUNT say where to
+// start and how far to go. The nightly job sets all three.
+TEST_CASE("the interpreter and a real machine agree on generated programs" * doctest::skip(std::getenv("GDSC_DIFF_FUZZ") == nullptr)) {
+	const uint64_t seed = env_number("GDSC_DIFF_SEED", 0);
+	const uint64_t count = env_number("GDSC_DIFF_COUNT", 200);
 
 	int agreed = 0;
 	int skipped = 0;
 	int failures = 0;
+	for (uint64_t i = 0; i < count; i++) {
+		const uint64_t current = seed + i;
+		gdscript_test::GenOptions generator_options;
+		generator_options.allow_structs = false;
+		gdscript_test::Generator generator(current, generator_options);
+		const gdscript_test::GeneratedProgram program = generator.generate();
+		const std::string name = "seed " + std::to_string(current);
 
-	auto record = [&](const std::string& name, const Outcome& outcome) {
-		switch (outcome.kind) {
-			case Outcome::Kind::AGREED:
-				agreed++;
-				break;
-			case Outcome::Kind::SKIPPED:
-				// A skip always says why. A harness that skips silently is a
-				// harness that stops testing without anyone noticing.
-				skipped++;
-				std::cout << "  SKIP " << name << ": " << outcome.detail << std::endl;
-				break;
-			case Outcome::Kind::DISAGREED:
-			case Outcome::Kind::FAILED:
-				failures++;
-				std::cerr << "  FAIL " << name << ": " << outcome.detail << std::endl;
-				break;
-		}
-	};
-
-	if (!fuzz) {
-		std::cout << "=== Differential: IR interpreter against libriscv ===" << std::endl;
-		for (const auto& program : gdscript_test::corpus()) {
-			record(program.name, run_source(program.source));
-		}
-		std::cout << agreed << " agreed, " << skipped << " skipped, " << failures << " failed"
-			<< " (of " << gdscript_test::corpus().size() << " programs)" << std::endl;
-	} else {
-		std::cout << "=== Differential fuzzing: IR interpreter against libriscv ===" << std::endl;
-		std::cout << "Seeds " << seed << ".." << (seed + count - 1) << std::endl;
-
-		for (uint64_t i = 0; i < count; i++) {
-			const uint64_t current = seed + i;
-			gdscript_test::GenOptions generator_options;
-			generator_options.allow_structs = false;
-			gdscript_test::Generator generator(current, generator_options);
-			const gdscript_test::GeneratedProgram program = generator.generate();
-			const std::string name = "seed " + std::to_string(current);
-
-			const Outcome outcome = run_source(program.source());
-			if (outcome.kind == Outcome::Kind::AGREED || outcome.kind == Outcome::Kind::SKIPPED) {
-				record(name, outcome);
-				continue;
-			}
-
-			failures++;
-
-			// Shrink to the smallest program that still disagrees, so what gets
-			// reported is small enough to read.
-			const gdscript_test::GeneratedProgram smallest = gdscript_test::shrink(program,
-				[](const std::string& candidate) {
-					const Outcome result = run_source(candidate);
-					return result.kind == Outcome::Kind::DISAGREED;
-				});
-
-			const Outcome shrunk = run_source(smallest.source());
-			std::cerr << "\nDIFFERENTIAL FAILURE (seed " << current << ")\n"
-				<< "  " << (shrunk.kind == Outcome::Kind::DISAGREED ? shrunk.detail : outcome.detail) << "\n"
-				<< "  Reproduce with: test_differential --fuzz --seed " << current << " --count 1\n"
-				<< "  Shrunk program:\n"
-				<< smallest.source() << std::endl;
-
-			if (failures >= 10) {
-				std::cerr << "Stopping after " << failures << " failures" << std::endl;
-				break;
-			}
+		const Outcome outcome = run_source(program.source());
+		if (outcome.kind == Outcome::Kind::AGREED || outcome.kind == Outcome::Kind::SKIPPED) {
+			record(name, outcome, agreed, skipped);
+			continue;
 		}
 
-		std::cout << agreed << " agreed, " << skipped << " skipped, " << failures << " failed"
-			<< " (of " << count << " generated programs)" << std::endl;
-	}
+		failures++;
 
-	if (failures > 0) {
-		return 1;
-	}
-	// A run where nothing was actually compared would pass while testing
-	// nothing at all.
-	if (agreed == 0) {
-		std::cerr << "No program was compared: the harness is not testing anything" << std::endl;
-		return 1;
-	}
+		// Shrink to the smallest program that still disagrees, so what gets
+		// reported is small enough to read.
+		const gdscript_test::GeneratedProgram smallest = gdscript_test::shrink(program,
+																			   [](const std::string &candidate) {
+																				   const Outcome result = run_source(candidate);
+																				   return result.kind == Outcome::Kind::DISAGREED;
+																			   });
 
-	std::cout << "Interpreter and machine agree!" << std::endl;
-	return 0;
+		const Outcome shrunk = run_source(smallest.source());
+		FAIL_CHECK("differential failure (seed ", current, ")\n  ",
+				   (shrunk.kind == Outcome::Kind::DISAGREED ? shrunk.detail : outcome.detail),
+				   "\n  Reproduce with: GDSC_DIFF_SEED=", current, " GDSC_DIFF_COUNT=1 test_differential",
+				   "\n  Shrunk program:\n", smallest.source());
+
+		// Ten reports is enough to work from; more is noise.
+		if (failures >= 10) {
+			MESSAGE("stopping after " << failures << " failures");
+			break;
+		}
+	}
+	CHECK_MESSAGE(agreed > 0, "no generated program was compared");
+}
+
+// One program from a file, for reducing a failure by hand:
+//   GDSC_DIFF_FILE=program.gd test_differential -ts="*by hand*"
+TEST_CASE("one program named by GDSC_DIFF_FILE" * doctest::skip(std::getenv("GDSC_DIFF_FILE") == nullptr)) {
+	const char *file = std::getenv("GDSC_DIFF_FILE");
+	REQUIRE(file != nullptr);
+	std::ifstream stream(file);
+	REQUIRE_MESSAGE(bool(stream), "cannot read ", file);
+	const std::string source((std::istreambuf_iterator<char>(stream)),
+							 std::istreambuf_iterator<char>());
+	const Outcome outcome = run_source(source);
+	CHECK_MESSAGE(outcome.kind != Outcome::Kind::DISAGREED, outcome.detail);
+	CHECK_MESSAGE(outcome.kind != Outcome::Kind::FAILED, outcome.detail);
+}
+
+// The generated-program case above is opt-in, so this is what says its
+// generator can reach a counterexample at all: a statement that is false on
+// purpose, checked without a machine run, which the ladder has to falsify.
+#include "property_support.h"
+
+TEST_CASE("falsifiability: the generator reaches programs with declarations in them") {
+	PROP_FALSIFIABLE(uint64_t, "every generated program is under forty characters",
+					 ([](witness::RNG &rng, const witness::Level &level) {
+						 return uint64_t(rng.uint_range(0, uint32_t(level.fin_bound)));
+					 }),
+					 ([](const uint64_t &seed) {
+						 gdscript_test::GenOptions options;
+						 options.allow_structs = false;
+						 gdscript_test::Generator generator(seed, options);
+						 return generator.generate().source().size() < 40;
+					 }));
 }

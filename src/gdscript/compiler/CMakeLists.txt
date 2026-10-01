@@ -14,6 +14,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # No-op if a parent project (the sandbox API, godot-cpp) already declared it.
 option(DOUBLE_PRECISION "Enable double precision real_t" OFF)
 
+# Packed array regions (CompilerOptions::fast_arrays) are on by default. OFF
+# builds every tool and test with the per-element default instead, so the whole
+# suite can be run against both lowerings.
+option(GDSCRIPT_FAST_ARRAYS "Packed array regions on by default" ON)
+if (NOT GDSCRIPT_FAST_ARRAYS)
+	add_compile_definitions(GDSCRIPT_FAST_ARRAYS_DEFAULT=0)
+endif()
+# The same for the GDScript rewrite of loops over packed arrays (rewrite.h).
+option(GDSCRIPT_REWRITE "Packed array loop rewrite on by default" ON)
+if (NOT GDSCRIPT_REWRITE)
+	add_compile_definitions(GDSCRIPT_REWRITE_DEFAULT=0)
+endif()
+
 # Compiler sources
 set(FRONTEND_SOURCES
     compiler_exception.cpp
@@ -33,6 +46,7 @@ set(FRONTEND_SOURCES
     ir_optimizer.cpp
     ir_verifier.cpp
     codegen.cpp
+    rewrite.cpp
     compiler.cpp
     c_codegen.cpp
     ir_interpreter.cpp
@@ -72,7 +86,7 @@ option(GDSCRIPT_BUILD_RISCV "Build the RISC-V backend and compiler tools" ON)
 if (BUILD_TESTING)
 	enable_testing()
 	add_executable(test_frontend tests/test_frontend.cpp)
-	target_link_libraries(test_frontend gdscript_frontend)
+	target_link_libraries(test_frontend gdscript_frontend gdscript_test_main)
 	target_compile_options(test_frontend PRIVATE ${GDSC_WARNINGS})
 	add_test(NAME test_frontend COMMAND test_frontend)
 endif()
@@ -100,15 +114,22 @@ add_executable(gdscript_compiler_test test_compiler.cpp)
 target_compile_options(gdscript_compiler_test PRIVATE ${GDSC_WARNINGS})
 target_link_libraries(gdscript_compiler_test gdscript_compiler)
 
+# The suite is doctest, and property tests are witness-cpp. Both are header
+# only and live in ext/ as submodules. gdscript_test_main carries doctest's
+# main() so the implementation is compiled once rather than in each of the 60
+# test binaries. Guarded: a BUILD_TESTING=OFF build has neither submodule
+# target, because the root list file only adds them for a testing build.
+if (BUILD_TESTING)
+	add_library(gdscript_test_main STATIC tests/doctest_main.cpp)
+	target_link_libraries(gdscript_test_main PUBLIC doctest::doctest witness::witness)
+	target_include_directories(gdscript_test_main PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
 function(add_gdscript_test test_name test_source)
 	add_executable(${test_name} ${test_source})
 	target_compile_options(${test_name} PUBLIC -fsanitize=address,undefined)
 	target_compile_options(${test_name} PRIVATE ${GDSC_WARNINGS})
-	# These tests check everything with assert(), so a Release configuration's
-	# -DNDEBUG would compile every check away and leave the suite passing
-	# vacuously -- assert(false) included.
-	target_compile_options(${test_name} PRIVATE -UNDEBUG)
-	target_link_libraries(${test_name} -fsanitize=address,undefined gdscript_compiler)
+	target_link_libraries(${test_name} -fsanitize=address,undefined gdscript_compiler gdscript_test_main)
 	add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 
@@ -146,14 +167,9 @@ endif()
 if (BUILD_TESTING)
 	enable_testing()
 
-	if (NOT CMAKE_CROSSCOMPILING)
-		find_program(GDSC_PYTHON_EXECUTABLE NAMES python3)
-		if (GDSC_PYTHON_EXECUTABLE)
-			add_test(NAME test_api_tables
-				COMMAND ${GDSC_PYTHON_EXECUTABLE}
-					${CMAKE_CURRENT_SOURCE_DIR}/../../../scripts/generate_api_tables.py --check)
-		endif()
-	endif()
+	# Upstream also runs test_api_tables here, which regenerates the .def
+	# tables from ext/godot-cpp/gdextension/extension_api.json. That checkout
+	# is not part of this extraction, so the tables are taken as given.
 
 	add_gdscript_test(test_lexer tests/test_lexer.cpp)
 	add_gdscript_test(test_parser tests/test_parser.cpp)
@@ -193,6 +209,9 @@ if (BUILD_TESTING)
 	add_gdscript_test(test_signals tests/test_signals.cpp)
 	add_gdscript_test(test_test_annotation tests/test_test_annotation.cpp)
 	add_gdscript_test(test_requires_host_hook tests/test_requires_host_hook.cpp)
+	add_gdscript_test(test_extensions_gate tests/test_extensions_gate.cpp)
+	add_gdscript_test(test_gdscript_syntax tests/test_gdscript_syntax.cpp)
+	add_gdscript_test(test_class_dispatch tests/test_class_dispatch.cpp)
 	add_gdscript_test(test_trait_compatibility tests/test_trait_compatibility.cpp)
 	add_gdscript_test(test_line_table tests/test_line_table.cpp)
 	add_gdscript_test(test_diagnostics tests/test_diagnostics.cpp)
@@ -208,6 +227,8 @@ if (BUILD_TESTING)
 	target_compile_definitions(test_variant_api PRIVATE
 		GDSC_VARIANT_BASELINE="${CMAKE_CURRENT_SOURCE_DIR}/tests/variant_api_unsupported.txt")
 	add_gdscript_test(test_nullable_types tests/test_nullable_types.cpp)
+	add_gdscript_test(test_packed_regions tests/test_packed_regions.cpp)
+	add_gdscript_test(test_rewrite tests/test_rewrite.cpp)
 
 	# Differential testing: the same programs through the IR interpreter and
 	# through a real RISC-V machine. libriscv is already a dependency of the
@@ -231,60 +252,60 @@ if (BUILD_TESTING)
 		# No sanitizers on this one: it links libriscv, which is built without
 		# them, and whose interpreter dispatch ASan has opinions about.
 		add_executable(test_differential tests/test_differential.cpp)
-		target_link_libraries(test_differential gdscript_compiler riscv)
+		target_link_libraries(test_differential gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_differential COMMAND test_differential)
 
 		add_executable(test_long_jumps tests/test_long_jumps.cpp)
 		target_compile_options(test_long_jumps PRIVATE ${GDSC_WARNINGS} -UNDEBUG)
-		target_link_libraries(test_long_jumps gdscript_compiler riscv)
+		target_link_libraries(test_long_jumps gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_long_jumps COMMAND test_long_jumps)
 
 		# Codegen performance is pinned by deterministic interpreted instruction
 		# counts rather than wall-clock timing.
 		add_executable(test_instruction_budget tests/test_instruction_budget.cpp)
-		target_link_libraries(test_instruction_budget gdscript_compiler riscv)
+		target_link_libraries(test_instruction_budget gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_instruction_budget COMMAND test_instruction_budget)
 
 		# Same reason for no sanitizers, and the same need for a real machine:
 		# the profiling accounting is only checkable by running the program.
 		add_executable(test_profiling tests/test_profiling.cpp)
-		target_link_libraries(test_profiling gdscript_compiler riscv)
+		target_link_libraries(test_profiling gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_profiling COMMAND test_profiling)
 
 		# The shadow stack is only checkable by running a program and reading
 		# the area back out of the machine it ran on.
 		add_executable(test_debug_info tests/test_debug_info.cpp)
-		target_link_libraries(test_debug_info gdscript_compiler riscv)
+		target_link_libraries(test_debug_info gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_debug_info COMMAND test_debug_info)
 
 		# So is a breakpoint: whether it stopped is a fact about a run.
 		add_executable(test_breakpoints tests/test_breakpoints.cpp)
-		target_link_libraries(test_breakpoints gdscript_compiler riscv)
+		target_link_libraries(test_breakpoints gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_breakpoints COMMAND test_breakpoints)
 
 		# And so is a suspension: what `await` compiles to is only really pinned
 		# by running it against a host that answers the two syscalls.
 		add_executable(test_await tests/test_await.cpp)
-		target_link_libraries(test_await gdscript_compiler riscv)
+		target_link_libraries(test_await gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_await COMMAND test_await)
 
 		# Two instance records only differ when a machine runs them: the
 		# addressing is a fact about what tp held on each call.
 		add_executable(test_instances tests/test_instances.cpp)
-		target_link_libraries(test_instances gdscript_compiler riscv)
+		target_link_libraries(test_instances gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_instances COMMAND test_instances)
 
 		# A Callable is the same kind of fact: the capture contract is that the
 		# host prepends what ECALL_CALLABLE_CREATE was given, which only a run
 		# against a host answering that syscall can pin down.
 		add_executable(test_callables tests/test_callables.cpp)
-		target_link_libraries(test_callables gdscript_compiler riscv)
+		target_link_libraries(test_callables gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_callables COMMAND test_callables)
 
 		# Which globals are known to name an object, and where the retain that
 		# keeps a RefCounted alive between calls is emitted.
 		add_executable(test_object_retain tests/test_object_retain.cpp)
-		target_link_libraries(test_object_retain gdscript_compiler riscv)
+		target_link_libraries(test_object_retain gdscript_compiler riscv gdscript_test_main)
 		add_test(NAME test_object_retain COMMAND test_object_retain)
 	else()
 		message(STATUS "libriscv not found: skipping the differential test")

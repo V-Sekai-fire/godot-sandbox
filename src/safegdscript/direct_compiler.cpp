@@ -38,6 +38,8 @@ PackedByteArray to_packed(const std::vector<uint8_t> &p_bytes) {
 
 class DirectCompilerBackend final : public GDScriptCompilerBackend {
 public:
+	DirectCompilerBackend() { m_options.extensions = true; }
+
 	const char *name() const override { return "direct"; }
 	bool available() override { return true; }
 
@@ -138,8 +140,8 @@ public:
 	bool can_analyze() override { return true; }
 	PackedByteArray analyze(const AnalysisRequest &p_request) override {
 		gdscript::SourceModel model = gdscript::analyze_source(to_utf8(p_request.source),
-				to_utf8(p_request.path), p_request.flags, p_request.caret_line,
-				p_request.caret_column);
+				to_utf8(p_request.path), p_request.flags | gdscript::ANALYZE_EXTENSIONS,
+				p_request.caret_line, p_request.caret_column);
 		if ((p_request.flags & gdscript::ANALYZE_DECLARATIONS) != 0) {
 			gdscript::CompilerOptions options = m_options;
 			options.output_elf = false;

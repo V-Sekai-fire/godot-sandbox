@@ -15,11 +15,11 @@
 namespace gdscript_test {
 
 struct CorpusProgram {
-	const char* name;
-	const char* source;
+	const char *name;
+	const char *source;
 };
 
-inline const std::vector<CorpusProgram>& corpus() {
+inline const std::vector<CorpusProgram> &corpus() {
 	static const std::vector<CorpusProgram> programs = {
 		{ "int_arithmetic", R"(
 func test():

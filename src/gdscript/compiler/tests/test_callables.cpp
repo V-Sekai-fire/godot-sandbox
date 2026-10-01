@@ -1,4 +1,5 @@
 #include "dyncall_shim.h"
+#include "witness/doctest.h"
 // Callables: lambdas, a function name used as a value, and calling a Callable
 // held in a variable.
 //
@@ -7,10 +8,10 @@
 // contract is that ECALL_CALLABLE_CREATE's bound Variant is *prepended* to
 // every call (RiscvCallable::call), which no amount of reading the IR proves.
 #include "../compiler.h"
-#include "scope_stub.h"
 #include "../syscall_numbers.h"
 #include "../variant_layout.h"
 #include "../variant_types.h"
+#include "scope_stub.h"
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -25,49 +26,46 @@ using machine_t = riscv::Machine<riscv::RISCV64>;
 
 namespace {
 
-int failures = 0;
-
-void check(bool condition, const std::string& what) {
+void check(bool condition, const std::string &what) {
 	if (!condition) {
-		std::cerr << "FAILED: " << what << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: ", what);
 	}
 }
 
 template <typename T>
-void check_eq(T actual, T expected, const std::string& what) {
+void check_eq(T actual, T expected, const std::string &what) {
 	if (actual != expected) {
-		std::cerr << "FAILED: " << what << ": expected " << expected
-			<< ", got " << actual << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: ", what, ": expected ", expected, ", got ", actual);
 	}
 }
 
 const VariantLayout LAYOUT = native_variant_layout();
 
-std::vector<uint8_t> compile(const std::string& source) {
+std::vector<uint8_t> compile(const std::string &source) {
 	Compiler compiler;
 	CompilerOptions options;
+	options.extensions = true;
 	std::vector<uint8_t> elf = compiler.compile(source, options);
 	if (elf.empty()) {
-		std::cerr << "FAILED to compile: " << compiler.get_error() << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED to compile: ", compiler.get_error());
 	}
 	return elf;
 }
 
-std::string compile_error(const std::string& source) {
+std::string compile_error(const std::string &source) {
 	Compiler compiler;
 	CompilerOptions options;
+	options.extensions = true;
 	if (!compiler.compile(source, options).empty()) {
 		return "";
 	}
 	return compiler.get_error();
 }
 
-std::string restricted_compile_error(const std::string& source) {
+std::string restricted_compile_error(const std::string &source) {
 	Compiler compiler;
 	CompilerOptions options;
+	options.extensions = true;
 	options.restricted = true;
 	if (!compiler.compile(source, options).empty()) {
 		return "";
@@ -85,7 +83,7 @@ struct HostVariant {
 	int32_t type = Variant::NIL;
 	int64_t integer = 0;
 	std::vector<HostVariant> array;
-	uint64_t address = 0;           // CALLABLE: guest function
+	uint64_t address = 0; // CALLABLE: guest function
 	std::vector<HostVariant> bound; // CALLABLE: prepended to every call
 };
 
@@ -97,7 +95,7 @@ struct Host {
 };
 
 Host g_host;
-machine_t* g_machine = nullptr;
+machine_t *g_machine = nullptr;
 
 unsigned scope(HostVariant value) {
 	g_host.scoped.push_back(std::move(value));
@@ -128,7 +126,7 @@ HostVariant read_variant(uint64_t address) {
 	return out;
 }
 
-void write_variant(uint64_t address, const HostVariant& value) {
+void write_variant(uint64_t address, const HostVariant &value) {
 	int32_t type = value.type;
 	int64_t data = value.integer;
 	if (type != Variant::INT && type != Variant::BOOL && type != Variant::NIL) {
@@ -146,9 +144,9 @@ void write_int(uint64_t address, int64_t value) {
 }
 
 // Sandbox ABI: a0 = return Variant pointer, a1.. = argument Variant pointers.
-HostVariant call_guest(uint64_t address, const std::vector<HostVariant>& args);
+HostVariant call_guest(uint64_t address, const std::vector<HostVariant> &args);
 
-void callable_create_syscall(machine_t& machine) {
+void callable_create_syscall(machine_t &machine) {
 	HostVariant callable;
 	callable.type = Variant::CALLABLE;
 	callable.address = machine.cpu.reg(riscv::REG_ARG0);
@@ -166,7 +164,7 @@ void callable_create_syscall(machine_t& machine) {
 	machine.set_result(scope(std::move(callable)));
 }
 
-void vcall_syscall(machine_t& machine) {
+void vcall_syscall(machine_t &machine) {
 	const uint64_t object = machine.cpu.reg(riscv::REG_ARG0);
 	const uint64_t method_ptr = machine.cpu.reg(riscv::REG_ARG1);
 	const unsigned method_len = unsigned(machine.cpu.reg(riscv::REG_ARG2));
@@ -179,9 +177,7 @@ void vcall_syscall(machine_t& machine) {
 
 	const HostVariant target = read_variant(object);
 	if (target.type != Variant::CALLABLE || method != "call") {
-		std::cerr << "FAILED: unexpected vcall '" << method << "' on type "
-			<< target.type << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: unexpected vcall '", method, "' on type ", target.type);
 		machine.set_result(0);
 		return;
 	}
@@ -202,7 +198,7 @@ void vcall_syscall(machine_t& machine) {
 	}
 }
 
-void vcreate_syscall(machine_t& machine) {
+void vcreate_syscall(machine_t &machine) {
 	const uint64_t result_ptr = machine.cpu.reg(riscv::REG_ARG0);
 	const int32_t type = int32_t(machine.cpu.reg(riscv::REG_ARG1));
 	const int64_t count = int64_t(machine.cpu.reg(riscv::REG_ARG2));
@@ -218,35 +214,42 @@ void vcreate_syscall(machine_t& machine) {
 	write_variant(result_ptr, value);
 }
 
-void array_at_syscall(machine_t& machine) {
+void array_at_syscall(machine_t &machine) {
 	const size_t handle = size_t(uint32_t(machine.cpu.reg(riscv::REG_ARG0)));
 	const int64_t index = int64_t(machine.cpu.reg(riscv::REG_ARG1));
 	const uint64_t value_ptr = machine.cpu.reg(riscv::REG_ARG2);
 
 	if (handle >= g_host.scoped.size()) {
-		std::cerr << "FAILED: array handle " << handle << " does not exist" << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: array handle ", handle, " does not exist");
 		return;
 	}
-	const std::vector<HostVariant>& array = g_host.scoped[handle].array;
+	const std::vector<HostVariant> &array = g_host.scoped[handle].array;
 	if (index < 0 || size_t(index) >= array.size()) {
-		std::cerr << "FAILED: array index " << index << " out of range" << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: array index ", index, " out of range");
 		return;
 	}
 	write_variant(value_ptr, array[size_t(index)]);
 }
 
-void array_size_syscall(machine_t& machine) {
+void array_size_syscall(machine_t &machine) {
 	const size_t handle = size_t(uint32_t(machine.cpu.reg(riscv::REG_ARG0)));
 	machine.set_result(handle < g_host.scoped.size()
-		? int64_t(g_host.scoped[handle].array.size()) : 0);
+							   ? int64_t(g_host.scoped[handle].array.size())
+							   : 0);
 }
 
 // ECALL_VEVAL stub: integer-only, enough for untyped-parameter tests.
-void veval_syscall(machine_t& machine) {
-	enum { OP_EQUAL = 0, OP_NOT_EQUAL, OP_LESS, OP_LESS_EQUAL, OP_GREATER, OP_GREATER_EQUAL,
-		OP_ADD, OP_SUBTRACT, OP_MULTIPLY, OP_DIVIDE };
+void veval_syscall(machine_t &machine) {
+	enum { OP_EQUAL = 0,
+		   OP_NOT_EQUAL,
+		   OP_LESS,
+		   OP_LESS_EQUAL,
+		   OP_GREATER,
+		   OP_GREATER_EQUAL,
+		   OP_ADD,
+		   OP_SUBTRACT,
+		   OP_MULTIPLY,
+		   OP_DIVIDE };
 
 	const int op = int(machine.cpu.reg(riscv::REG_ARG0));
 	const HostVariant a = read_variant(machine.cpu.reg(riscv::REG_ARG1));
@@ -254,11 +257,9 @@ void veval_syscall(machine_t& machine) {
 	const uint64_t result_ptr = machine.cpu.reg(riscv::REG_ARG0 + 3);
 
 	const bool integers = (a.type == Variant::INT || a.type == Variant::BOOL) &&
-		(b.type == Variant::INT || b.type == Variant::BOOL);
+			(b.type == Variant::INT || b.type == Variant::BOOL);
 	if (!integers) {
-		std::cerr << "FAILED: veval " << op << " on types " << a.type << " and "
-			<< b.type << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: veval ", op, " on types ", a.type, " and ", b.type);
 		machine.stop();
 		return;
 	}
@@ -266,16 +267,32 @@ void veval_syscall(machine_t& machine) {
 	HostVariant out;
 	out.type = Variant::INT;
 	switch (op) {
-		case OP_ADD:      out.integer = a.integer + b.integer; break;
-		case OP_SUBTRACT: out.integer = a.integer - b.integer; break;
-		case OP_MULTIPLY: out.integer = a.integer * b.integer; break;
-		case OP_DIVIDE:   out.integer = b.integer != 0 ? a.integer / b.integer : 0; break;
-		case OP_EQUAL:    out.type = Variant::BOOL; out.integer = a.integer == b.integer; break;
-		case OP_NOT_EQUAL: out.type = Variant::BOOL; out.integer = a.integer != b.integer; break;
-		case OP_LESS:     out.type = Variant::BOOL; out.integer = a.integer < b.integer; break;
+		case OP_ADD:
+			out.integer = a.integer + b.integer;
+			break;
+		case OP_SUBTRACT:
+			out.integer = a.integer - b.integer;
+			break;
+		case OP_MULTIPLY:
+			out.integer = a.integer * b.integer;
+			break;
+		case OP_DIVIDE:
+			out.integer = b.integer != 0 ? a.integer / b.integer : 0;
+			break;
+		case OP_EQUAL:
+			out.type = Variant::BOOL;
+			out.integer = a.integer == b.integer;
+			break;
+		case OP_NOT_EQUAL:
+			out.type = Variant::BOOL;
+			out.integer = a.integer != b.integer;
+			break;
+		case OP_LESS:
+			out.type = Variant::BOOL;
+			out.integer = a.integer < b.integer;
+			break;
 		default:
-			std::cerr << "FAILED: veval operator " << op << " is not stubbed" << std::endl;
-			failures++;
+			FAIL_CHECK("FAILED: veval operator ", op, " is not stubbed");
 			machine.stop();
 			return;
 	}
@@ -285,18 +302,16 @@ void veval_syscall(machine_t& machine) {
 	}
 }
 
-void fail_on_syscall(machine_t& machine) {
-	std::cerr << "FAILED: the test program made syscall "
-		<< machine.cpu.reg(riscv::REG_ARG7) << std::endl;
-	failures++;
+void fail_on_syscall(machine_t &machine) {
+	FAIL_CHECK("FAILED: the test program made syscall ", machine.cpu.reg(riscv::REG_ARG7));
 	machine.stop();
 }
 
-std::unique_ptr<machine_t> boot(const std::vector<uint8_t>& elf) {
-	auto machine = std::make_unique<machine_t>(elf, riscv::MachineOptions<riscv::RISCV64> {
-		.memory_max = 32ull << 20,
-		.stack_size = 4ull << 20,
-	});
+std::unique_ptr<machine_t> boot(const std::vector<uint8_t> &elf) {
+	auto machine = std::make_unique<machine_t>(elf, riscv::MachineOptions<riscv::RISCV64>{
+															.memory_max = 32ull << 20,
+															.stack_size = 4ull << 20,
+													});
 	for (int number = GAME_API_BASE; number < ECALL_LAST; number++) {
 		machine_t::install_syscall_handler(number, fail_on_syscall);
 	}
@@ -308,7 +323,7 @@ std::unique_ptr<machine_t> boot(const std::vector<uint8_t>& elf) {
 	machine_t::install_syscall_handler(ECALL_ARRAY_SIZE, array_size_syscall);
 	machine_t::install_syscall_handler(ECALL_VEVAL, veval_syscall);
 
-	g_host = Host {};
+	g_host = Host{};
 	machine->simulate(50'000'000ull);
 	g_machine = machine.get();
 	return machine;
@@ -319,8 +334,8 @@ std::unique_ptr<machine_t> boot(const std::vector<uint8_t>& elf) {
 // preempt_internal puts the interrupted run back exactly as it was. Handing
 // Machine::preempt() the same job restores the stack pointer this function
 // moved, and the outer frame is lost.
-HostVariant call_guest(uint64_t address, const std::vector<HostVariant>& args) {
-	machine_t& machine = *g_machine;
+HostVariant call_guest(uint64_t address, const std::vector<HostVariant> &args) {
+	machine_t &machine = *g_machine;
 	riscv::Registers<riscv::RISCV64> interrupted = machine.cpu.registers();
 
 	const uint64_t slot_size = uint64_t(LAYOUT.variant_size());
@@ -352,16 +367,15 @@ struct Call {
 	int32_t type = 0;
 };
 
-Call run(machine_t& machine, const std::string& function, const std::vector<int64_t>& args = {}) {
+Call run(machine_t &machine, const std::string &function, const std::vector<int64_t> &args = {}) {
 	const uint64_t address = machine.address_of(function);
 	if (address == 0) {
-		std::cerr << "FAILED: no symbol for " << function << "()" << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED: no symbol for ", function, "()");
 		return {};
 	}
 
 	const uint64_t slot_size = uint64_t(LAYOUT.variant_size());
-	auto& sp = machine.cpu.reg(riscv::REG_SP);
+	auto &sp = machine.cpu.reg(riscv::REG_SP);
 	sp = machine.memory.stack_initial();
 	sp -= 256 + slot_size * (args.size() + 1);
 	const uint64_t retvar = sp;
@@ -389,12 +403,17 @@ Call run(machine_t& machine, const std::string& function, const std::vector<int6
 
 // -= Tests =-
 
-void test_a_lambda_is_a_callable() {
-	std::cout << "Testing that a lambda evaluates to a Callable..." << std::endl;
+// Upstream installed the dyncall handlers at the top of main(). A doctest
+// binary has no main of its own, so they go in once here, before any case.
+const bool SETUP_ONCE = [] {
+	sgd_install_test_dyncalls();
+	return true;
+}();
 
+TEST_CASE("a lambda is a callable") {
 	const std::vector<uint8_t> elf = compile(
-		"func f():\n"
-		"\treturn func(x): return x * 2\n");
+			"func f():\n"
+			"\treturn func(x): return x * 2\n");
 	if (elf.empty()) {
 		return;
 	}
@@ -407,19 +426,15 @@ void test_a_lambda_is_a_callable() {
 	if (!g_host.scoped.empty()) {
 		check(g_host.scoped.back().bound.empty(), "a lambda with no captures binds nothing");
 		check(g_host.scoped.back().address == machine->address_of("@lambda_0"),
-			"the Callable points at the lifted function");
+			  "the Callable points at the lifted function");
 	}
-
-	std::cout << "  ✓ A lambda is a Callable over a lifted function" << std::endl;
 }
 
-void test_calling_a_lambda() {
-	std::cout << "Testing a lambda called through the host..." << std::endl;
-
+TEST_CASE("calling a lambda") {
 	const std::vector<uint8_t> elf = compile(
-		"func f(n):\n"
-		"\tvar double = func(x): return x * 2\n"
-		"\treturn double.call(n)\n");
+			"func f(n):\n"
+			"\tvar double = func(x): return x * 2\n"
+			"\treturn double.call(n)\n");
 	if (elf.empty()) {
 		return;
 	}
@@ -429,19 +444,15 @@ void test_calling_a_lambda() {
 
 	check_eq<int32_t>(answer.type, Variant::INT, "the answer is an integer");
 	check_eq<int64_t>(answer.value, 42, "the lambda ran");
-
-	std::cout << "  ✓ A lambda runs when the host calls it" << std::endl;
 }
 
-void test_captures_arrive_prepended() {
-	std::cout << "Testing that captures arrive before the arguments..." << std::endl;
-
+TEST_CASE("captures arrive prepended") {
 	const std::vector<uint8_t> elf = compile(
-		"func f(x):\n"
-		"\tvar scale = 10\n"
-		"\tvar offset = 3\n"
-		"\tvar g = func(v): return v * scale + offset\n"
-		"\treturn g.call(x)\n");
+			"func f(x):\n"
+			"\tvar scale = 10\n"
+			"\tvar offset = 3\n"
+			"\tvar g = func(v): return v * scale + offset\n"
+			"\treturn g.call(x)\n");
 	if (elf.empty()) {
 		return;
 	}
@@ -454,24 +465,20 @@ void test_captures_arrive_prepended() {
 	if (!g_host.call_argument_counts.empty()) {
 		// The captures travel bound, not as call arguments: the guest passes one.
 		check_eq(g_host.call_argument_counts.front(), 1,
-			"captures are bound, not passed at the call");
+				 "captures are bound, not passed at the call");
 	}
-
-	std::cout << "  ✓ Captures travel bound, and land before the parameters" << std::endl;
 }
 
-void test_captures_are_by_value() {
-	std::cout << "Testing that a capture is the value at creation..." << std::endl;
-
+TEST_CASE("captures are by value") {
 	// GDScript's rule, checked against the engine: assigning to the captured
 	// local after the lambda exists does not change what the lambda sees, and
 	// assigning to it inside the lambda does not reach the outer one.
 	const std::vector<uint8_t> elf = compile(
-		"func f():\n"
-		"\tvar n = 1\n"
-		"\tvar g = func(): return n\n"
-		"\tn = 50\n"
-		"\treturn g.call() * 100 + n\n");
+			"func f():\n"
+			"\tvar n = 1\n"
+			"\tvar g = func(): return n\n"
+			"\tn = 50\n"
+			"\treturn g.call() * 100 + n\n");
 	if (elf.empty()) {
 		return;
 	}
@@ -482,13 +489,13 @@ void test_captures_are_by_value() {
 	check_eq<int64_t>(answer.value, 150, "the lambda kept the value it was built with");
 
 	const std::vector<uint8_t> written = compile(
-		"func f():\n"
-		"\tvar n = 1\n"
-		"\tvar g = func():\n"
-		"\t\tn = 9\n"
-		"\t\treturn n\n"
-		"\tvar inner = g.call()\n"
-		"\treturn inner * 100 + n\n");
+			"func f():\n"
+			"\tvar n = 1\n"
+			"\tvar g = func():\n"
+			"\t\tn = 9\n"
+			"\t\treturn n\n"
+			"\tvar inner = g.call()\n"
+			"\treturn inner * 100 + n\n");
 	if (written.empty()) {
 		return;
 	}
@@ -496,19 +503,15 @@ void test_captures_are_by_value() {
 	auto second = boot(written);
 	const Call after = run(*second, "f");
 	check_eq<int64_t>(after.value, 901, "a write inside the lambda stayed inside it");
-
-	std::cout << "  ✓ Captures are by value, at the point the lambda is built" << std::endl;
 }
 
-void test_a_function_name_is_a_callable() {
-	std::cout << "Testing a function name used as a value..." << std::endl;
-
+TEST_CASE("a function name is a callable") {
 	const std::vector<uint8_t> elf = compile(
-		"func helper(a):\n"
-		"\treturn a + 1\n"
-		"func f():\n"
-		"\tvar c = helper\n"
-		"\treturn c.call(41)\n");
+			"func helper(a):\n"
+			"\treturn a + 1\n"
+			"func f():\n"
+			"\tvar c = helper\n"
+			"\treturn c.call(41)\n");
 	if (elf.empty()) {
 		return;
 	}
@@ -520,23 +523,19 @@ void test_a_function_name_is_a_callable() {
 	check_eq(g_host.callables_created, 1, "one Callable created");
 	if (!g_host.scoped.empty()) {
 		check(g_host.scoped.front().address == machine->address_of("helper"),
-			"the Callable points at helper()");
+			  "the Callable points at helper()");
 		check(g_host.scoped.front().bound.empty(), "nothing is bound to a plain function");
 	}
-
-	std::cout << "  ✓ A function name is a Callable over that function" << std::endl;
 }
 
-void test_calling_a_callable_variable() {
-	std::cout << "Testing a Callable called through a variable..." << std::endl;
-
+TEST_CASE("calling a callable variable") {
 	// Ours, not GDScript's: the engine refuses c(1) and insists on c.call(1).
 	const std::vector<uint8_t> elf = compile(
-		"func helper(a, b):\n"
-		"\treturn a * b\n"
-		"func f():\n"
-		"\tvar c = helper\n"
-		"\treturn c(6, 7)\n");
+			"func helper(a, b):\n"
+			"\treturn a * b\n"
+			"func f():\n"
+			"\tvar c = helper\n"
+			"\treturn c(6, 7)\n");
 	if (elf.empty()) {
 		return;
 	}
@@ -546,18 +545,14 @@ void test_calling_a_callable_variable() {
 
 	check_eq<int64_t>(answer.value, 42, "the variable was called");
 	check_eq<size_t>(g_host.call_argument_counts.size(), 1, "one call through the host");
-
-	std::cout << "  ✓ A variable holding a Callable can be called directly" << std::endl;
 }
 
-void test_a_lambda_called_through_its_variable() {
-	std::cout << "Testing a lambda called through its variable..." << std::endl;
-
+TEST_CASE("a lambda called through its variable") {
 	const std::vector<uint8_t> elf = compile(
-		"func f(n):\n"
-		"\tvar base = 100\n"
-		"\tvar add = func(v): return v + base\n"
-		"\treturn add(n)\n");
+			"func f(n):\n"
+			"\tvar base = 100\n"
+			"\tvar add = func(v): return v + base\n"
+			"\treturn add(n)\n");
 	if (elf.empty()) {
 		return;
 	}
@@ -566,29 +561,25 @@ void test_a_lambda_called_through_its_variable() {
 	const Call answer = run(*machine, "f", { 5 });
 
 	check_eq<int64_t>(answer.value, 105, "the lambda ran with its capture");
-
-	std::cout << "  ✓ A captured lambda answers to f(x) as well as f.call(x)" << std::endl;
 }
 
 // `a[0]()` / `get_f()()`: lowered as `.call()`, same as `c(1)`.
-void test_calling_an_expression() {
-	std::cout << "Testing a call on an expression..." << std::endl;
-
+TEST_CASE("calling an expression") {
 	const std::vector<uint8_t> elf = compile(
-		"func double(x):\n"
-		"\treturn x * 2\n"
-		"func get_f():\n"
-		"\treturn double\n"
-		"func from_array(n):\n"
-		"\tvar a = [double]\n"
-		"\treturn a[0](n)\n"
-		"func from_call(n):\n"
-		"\treturn get_f()(n)\n"
-		"func from_lambda(n):\n"
-		"\tvar a = [func(x): return x + 1]\n"
-		"\treturn a[0](n)\n"
-		"func chained(n):\n"
-		"\treturn get_f()(get_f()(n))\n");
+			"func double(x):\n"
+			"\treturn x * 2\n"
+			"func get_f():\n"
+			"\treturn double\n"
+			"func from_array(n):\n"
+			"\tvar a = [double]\n"
+			"\treturn a[0](n)\n"
+			"func from_call(n):\n"
+			"\treturn get_f()(n)\n"
+			"func from_lambda(n):\n"
+			"\tvar a = [func(x): return x + 1]\n"
+			"\treturn a[0](n)\n"
+			"func chained(n):\n"
+			"\treturn get_f()(get_f()(n))\n");
 	if (elf.empty()) {
 		return;
 	}
@@ -601,41 +592,37 @@ void test_calling_an_expression() {
 
 	// Must produce identical ELF to the explicit `.call()` spelling.
 	const std::vector<uint8_t> spelled_out = compile(
-		"func double(x):\n"
-		"\treturn x * 2\n"
-		"func get_f():\n"
-		"\treturn double\n"
-		"func from_array(n):\n"
-		"\tvar a = [double]\n"
-		"\treturn a[0].call(n)\n"
-		"func from_call(n):\n"
-		"\treturn get_f().call(n)\n"
-		"func from_lambda(n):\n"
-		"\tvar a = [func(x): return x + 1]\n"
-		"\treturn a[0].call(n)\n"
-		"func chained(n):\n"
-		"\treturn get_f().call(get_f().call(n))\n");
+			"func double(x):\n"
+			"\treturn x * 2\n"
+			"func get_f():\n"
+			"\treturn double\n"
+			"func from_array(n):\n"
+			"\tvar a = [double]\n"
+			"\treturn a[0].call(n)\n"
+			"func from_call(n):\n"
+			"\treturn get_f().call(n)\n"
+			"func from_lambda(n):\n"
+			"\tvar a = [func(x): return x + 1]\n"
+			"\treturn a[0].call(n)\n"
+			"func chained(n):\n"
+			"\treturn get_f().call(get_f().call(n))\n");
 	check(spelled_out == elf, "f(x) and f.call(x) on an expression compile alike");
 
 	// Named arguments have no meaning on a Callable.
 	check(!compile_error("func f(a):\n\treturn a[0](x = 1)\n").empty(),
-		"a named argument in a call on an expression is refused");
-
-	std::cout << "  ✓ A call on an expression is the .call() it stands for" << std::endl;
+		  "a named argument in a call on an expression is refused");
 }
 
-void test_a_lambda_inside_a_lambda() {
-	std::cout << "Testing a lambda inside a lambda..." << std::endl;
-
+TEST_CASE("a lambda inside a lambda") {
 	// `n` is free in the inner lambda, so it has to be captured by the outer
 	// one too: the inner can only reach it through the outer's frame.
 	const std::vector<uint8_t> elf = compile(
-		"func f():\n"
-		"\tvar n = 7\n"
-		"\tvar outer = func(x):\n"
-		"\t\tvar inner = func(y): return y + n\n"
-		"\t\treturn inner.call(x)\n"
-		"\treturn outer.call(5)\n");
+			"func f():\n"
+			"\tvar n = 7\n"
+			"\tvar outer = func(x):\n"
+			"\t\tvar inner = func(y): return y + n\n"
+			"\t\treturn inner.call(x)\n"
+			"\treturn outer.call(5)\n");
 	if (elf.empty()) {
 		return;
 	}
@@ -645,138 +632,137 @@ void test_a_lambda_inside_a_lambda() {
 
 	check_eq<int64_t>(answer.value, 12, "the inner lambda saw the outer function's local");
 	check_eq(g_host.callables_created, 2, "two Callables, one per lambda");
-
-	std::cout << "  ✓ A nested lambda captures through the lambda around it" << std::endl;
 }
 
-void test_shapes_of_lambda_syntax() {
-	std::cout << "Testing the shapes a lambda is written in..." << std::endl;
-
+TEST_CASE("shapes of lambda syntax") {
 	// Inline inside an argument list: the lexer emits no newline inside
 	// brackets, so the body has to end at the bracket.
 	check(compile_error("func f(a):\n\treturn a.map(func(x): return x * 2)\n").empty(),
-		"a lambda inline in an argument list");
+		  "a lambda inline in an argument list");
 	check(compile_error("func f(a):\n\treturn a.map(func(x): return x, 1)\n").empty(),
-		"a lambda before a further argument");
+		  "a lambda before a further argument");
 	check(compile_error(
-		"func f(receiver, value):\n"
-		"\treceiver.call(func():\n"
-		"\t\tvar first = value\n"
-		"\t\tfirst += 1\n"
-		"\t)\n").empty(),
-		"a multiline lambda inside an argument list");
+				  "func f(receiver, value):\n"
+				  "\treceiver.call(func():\n"
+				  "\t\tvar first = value\n"
+				  "\t\tfirst += 1\n"
+				  "\t)\n")
+				  .empty(),
+		  "a multiline lambda inside an argument list");
 	check(compile_error(
-		"func f(receiver, value):\n"
-		"\treturn receiver.call(\n"
-		"\t\t\tfunc(v):\n"
-		"\t\t\t\tvalue = v, 0, 1\n"
-		"\t\t)\n").empty(),
-		"an outer argument after a multiline lambda body");
+				  "func f(receiver, value):\n"
+				  "\treturn receiver.call(\n"
+				  "\t\t\tfunc(v):\n"
+				  "\t\t\t\tvalue = v, 0, 1\n"
+				  "\t\t)\n")
+				  .empty(),
+		  "an outer argument after a multiline lambda body");
 	check(compile_error(
-		"func f(receiver, value):\n"
-		"\treceiver.call(\n"
-		"\t\t\tfunc(v):\n"
-		"\t\t\t\tvalue = v\n"
-		"\t\t\t\t)\n").empty(),
-		"a closing paren on its own line, indented past the body");
+				  "func f(receiver, value):\n"
+				  "\treceiver.call(\n"
+				  "\t\t\tfunc(v):\n"
+				  "\t\t\t\tvalue = v\n"
+				  "\t\t\t\t)\n")
+				  .empty(),
+		  "a closing paren on its own line, indented past the body");
 	check(compile_error(
-		"func f(receiver, value):\n"
-		"\treceiver.call(\n"
-		"\t\t\tfunc(v):\n"
-		"\t\t\t\tvalue = v\n"
-		"\t\t\t)\n").empty(),
-		"a closing paren on its own line, aligned with the lambda");
+				  "func f(receiver, value):\n"
+				  "\treceiver.call(\n"
+				  "\t\t\tfunc(v):\n"
+				  "\t\t\t\tvalue = v\n"
+				  "\t\t\t)\n")
+				  .empty(),
+		  "a closing paren on its own line, aligned with the lambda");
 	check(compile_error(
-		"func f(receiver, value):\n"
-		"\treceiver.call(\n"
-		"\t\t\tfunc(v):\n"
-		"\t\t\t\tvalue = v\n"
-		"\t\t\t\t, 0, 1)\n").empty(),
-		"an outer argument after a dedented-paren body");
+				  "func f(receiver, value):\n"
+				  "\treceiver.call(\n"
+				  "\t\t\tfunc(v):\n"
+				  "\t\t\t\tvalue = v\n"
+				  "\t\t\t\t, 0, 1)\n")
+				  .empty(),
+		  "an outer argument after a dedented-paren body");
 	check(compile_error(
-		"func f():\n"
-		"\tvar a = [\n"
-		"\t\t\tfunc():\n"
-		"\t\t\t\tvar x = 1\n"
-		"\t\t\t\treturn x\n"
-		"\t\t\t\t]\n"
-		"\treturn a[0].call()\n").empty(),
-		"a closing bracket on its own line closes the suite");
+				  "func f():\n"
+				  "\tvar a = [\n"
+				  "\t\t\tfunc():\n"
+				  "\t\t\t\tvar x = 1\n"
+				  "\t\t\t\treturn x\n"
+				  "\t\t\t\t]\n"
+				  "\treturn a[0].call()\n")
+				  .empty(),
+		  "a closing bracket on its own line closes the suite");
 	check(compile_error(
-		"func f():\n"
-		"\tvar d = {\n"
-		"\t\t\t\"k\": func():\n"
-		"\t\t\t\t\tvar x = 1\n"
-		"\t\t\t\t\treturn x\n"
-		"\t\t\t\t\t}\n"
-		"\treturn d[\"k\"].call()\n").empty(),
-		"a closing brace on its own line closes the suite");
+				  "func f():\n"
+				  "\tvar d = {\n"
+				  "\t\t\t\"k\": func():\n"
+				  "\t\t\t\t\tvar x = 1\n"
+				  "\t\t\t\t\treturn x\n"
+				  "\t\t\t\t\t}\n"
+				  "\treturn d[\"k\"].call()\n")
+				  .empty(),
+		  "a closing brace on its own line closes the suite");
 
 	// A paren inside the body sits one bracket deeper, so it must not be
 	// mistaken for the enclosing call's closer.
 	const std::vector<uint8_t> dedented = compile(
-		"func g(x):\n"
-		"\treturn x + 1\n"
-		"func apply(c):\n"
-		"\treturn c.call(20)\n"
-		"func f():\n"
-		"\treturn apply(\n"
-		"\t\t\tfunc(v):\n"
-		"\t\t\t\treturn g(v)\n"
-		"\t\t\t\t)\n");
+			"func g(x):\n"
+			"\treturn x + 1\n"
+			"func apply(c):\n"
+			"\treturn c.call(20)\n"
+			"func f():\n"
+			"\treturn apply(\n"
+			"\t\t\tfunc(v):\n"
+			"\t\t\t\treturn g(v)\n"
+			"\t\t\t\t)\n");
 	if (!dedented.empty()) {
 		auto machine = boot(dedented);
 		check_eq<int64_t>(run(*machine, "f").value, 21,
-			"the whole body of a dedented-paren lambda ran");
+						  "the whole body of a dedented-paren lambda ran");
 	}
 	check(compile_error("func f():\n\tvar g = func(x): var y = x; return y\n\treturn g.call(1)\n").empty(),
-		"statements separated by ';' in a one-line body");
+		  "statements separated by ';' in a one-line body");
 	check(compile_error("func f():\n\tvar g = func(x):\n\t\treturn x\n\treturn g.call(1)\n").empty(),
-		"an indented body");
+		  "an indented body");
 	check(compile_error("func f():\n\tvar g = func named(x): return x\n\treturn g.call(1)\n").empty(),
-		"a named lambda");
+		  "a named lambda");
 	check(compile_error("func f():\n\tvar g = func(): return 1\n\treturn g.call()\n").empty(),
-		"no parameters");
+		  "no parameters");
 
 	// The statement after a one-line lambda is still a statement.
 	const std::vector<uint8_t> elf = compile(
-		"func f():\n"
-		"\tvar g = func(x): return x + 1\n"
-		"\tvar n = 10\n"
-		"\treturn g.call(n)\n");
+			"func f():\n"
+			"\tvar g = func(x): return x + 1\n"
+			"\tvar n = 10\n"
+			"\treturn g.call(n)\n");
 	if (!elf.empty()) {
 		auto machine = boot(elf);
 		check_eq<int64_t>(run(*machine, "f").value, 11, "the line after the lambda ran");
 	}
-
-	std::cout << "  ✓ Every spelling of a lambda parses" << std::endl;
 }
 
-void test_the_callable_constructor() {
-	std::cout << "Testing Callable(self, \"name\")..." << std::endl;
-
+TEST_CASE("the callable constructor") {
 	const std::vector<uint8_t> constructed = compile(
-		"func double(x):\n"
-		"\treturn x * 2\n"
-		"func f(n):\n"
-		"\tvar c = Callable(self, \"double\")\n"
-		"\treturn c.call(n)\n");
+			"func double(x):\n"
+			"\treturn x * 2\n"
+			"func f(n):\n"
+			"\tvar c = Callable(self, \"double\")\n"
+			"\treturn c.call(n)\n");
 	const std::vector<uint8_t> bare_name = compile(
-		"func double(x):\n"
-		"\treturn x * 2\n"
-		"func f(n):\n"
-		"\tvar c = double\n"
-		"\treturn c.call(n)\n");
+			"func double(x):\n"
+			"\treturn x * 2\n"
+			"func f(n):\n"
+			"\tvar c = double\n"
+			"\treturn c.call(n)\n");
 	const std::vector<uint8_t> copied = compile(
-		"func double(x):\n"
-		"\treturn x * 2\n"
-		"func f(n):\n"
-		"\tvar c = Callable(double)\n"
-		"\treturn c.call(n)\n");
+			"func double(x):\n"
+			"\treturn x * 2\n"
+			"func f(n):\n"
+			"\tvar c = Callable(double)\n"
+			"\treturn c.call(n)\n");
 	check(!constructed.empty() && constructed == bare_name,
-		"Callable(self, \"f\") and f compile alike");
+		  "Callable(self, \"f\") and f compile alike");
 	check(!copied.empty() && copied == bare_name,
-		"Callable(f) and f compile alike");
+		  "Callable(f) and f compile alike");
 
 	if (!constructed.empty()) {
 		auto machine = boot(constructed);
@@ -784,93 +770,88 @@ void test_the_callable_constructor() {
 	}
 
 	const std::vector<uint8_t> empty = compile(
-		"func f():\n"
-		"\treturn Callable()\n");
+			"func f():\n"
+			"\treturn Callable()\n");
 	if (!empty.empty()) {
 		auto machine = boot(empty);
 		run(*machine, "f");
 		check_eq(g_host.callables_created, 1, "one Callable created");
 		check(!g_host.scoped.empty() && g_host.scoped.back().type == Variant::CALLABLE,
-			"Callable() is a CALLABLE");
+			  "Callable() is a CALLABLE");
 		check(!g_host.scoped.empty() && g_host.scoped.back().address == 0,
-			"Callable() names no guest function");
+			  "Callable() names no guest function");
 	}
 
 	const std::string missing = compile_error(
-		"func f():\n"
-		"\treturn Callable(self, \"nope\")\n");
+			"func f():\n"
+			"\treturn Callable(self, \"nope\")\n");
 	check(missing.find("no function named") != std::string::npos,
-		"an undeclared method name is refused: " + missing);
+		  "an undeclared method name is refused: " + missing);
 
 	const std::vector<uint8_t> another_object = compile(
-		"func f(n):\n"
-		"\treturn Callable(n, \"f\")\n");
+			"func f(n):\n"
+			"\treturn Callable(n, \"f\")\n");
 	check(!another_object.empty(),
-		"an unrestricted program may make a Callable over another object");
+		  "an unrestricted program may make a Callable over another object");
 
 	const std::string restricted_object = restricted_compile_error(
-		"func f(n):\n"
-		"\treturn Callable(n, \"f\")\n");
+			"func f(n):\n"
+			"\treturn Callable(n, \"f\")\n");
 	check(restricted_object.find("restricted Sandbox") != std::string::npos,
-		"a restricted Callable over another object is refused: " + restricted_object);
+		  "a restricted Callable over another object is refused: " + restricted_object);
 
 	const std::string computed = compile_error(
-		"func f(n):\n"
-		"\treturn Callable(self, n)\n");
+			"func f(n):\n"
+			"\treturn Callable(self, n)\n");
 	check(computed.find("compile-time string") != std::string::npos,
-		"a run-time method name is refused: " + computed);
+		  "a run-time method name is refused: " + computed);
 
 	const std::string arity = compile_error(
-		"func f():\n"
-		"\treturn Callable(self)\n");
+			"func f():\n"
+			"\treturn Callable(self)\n");
 	check(arity.find("needs a Callable argument") != std::string::npos,
-		"Callable(self) is refused because self is an Object: " + arity);
+		  "Callable(self) is refused because self is an Object: " + arity);
 
 	check(compile_error(
-		"func Callable(a, b):\n"
-		"\treturn a\n"
-		"func f():\n"
-		"\treturn Callable(1, 2)\n").empty(),
-		"a script function named Callable wins over the constructor");
+				  "func Callable(a, b):\n"
+				  "\treturn a\n"
+				  "func f():\n"
+				  "\treturn Callable(1, 2)\n")
+				  .empty(),
+		  "a script function named Callable wins over the constructor");
 
 	std::cout << "  \u2713 Callable(self, \"name\") is the name it stands for" << std::endl;
 }
 
-void test_what_is_refused() {
-	std::cout << "Testing the refusals..." << std::endl;
-
+TEST_CASE("what is refused") {
 	// A parameter slot is spoken for by the captures, so the arity is one less.
 	const std::string too_many = compile_error(
-		"func f():\n"
-		"\tvar n = 1\n"
-		"\tvar g = func(a, b, c, d, e, f, g, h, i, j, k, l, m, o, p, q): return a + n\n"
-		"\treturn g\n");
+			"func f():\n"
+			"\tvar n = 1\n"
+			"\tvar g = func(a, b, c, d, e, f, g, h, i, j, k, l, m, o, p, q): return a + n\n"
+			"\treturn g\n");
 	check(too_many.find("parameter slots") != std::string::npos,
-		"a lambda that needs more slots than the ABI has is refused: " + too_many);
+		  "a lambda that needs more slots than the ABI has is refused: " + too_many);
 
 	// A variable of a type that cannot be called says so at compile time,
 	// rather than reaching the host with a Variant it will refuse.
 	const std::string not_callable = compile_error(
-		"func f():\n"
-		"\tvar n = 1\n"
-		"\treturn n()\n");
+			"func f():\n"
+			"\tvar n = 1\n"
+			"\treturn n()\n");
 	check(not_callable.find("cannot be called") != std::string::npos,
-		"calling an integer variable is refused: " + not_callable);
-
-	std::cout << "  ✓ What cannot work is refused at compile time" << std::endl;
+		  "calling an integer variable is refused: " + not_callable);
 }
 
-void test_resolution_order() {
-	std::cout << "Testing what a bare name in call position reaches..." << std::endl;
-
+TEST_CASE("resolution order") {
 	// A script function of the same name wins over a variable: this is a call
 	// to helper(), not a call of the Callable in `helper`.
 	const std::vector<uint8_t> elf = compile(
-		"func helper():\n"
-		"\treturn 7\n"
-		"func f():\n"
-		"\tvar helper = 1\n"
-		"\treturn helper()\n");
+			"func helper():\n"
+			"\treturn 7\n"
+			"func f():\n"
+			"\tvar helper = 1\n"
+			"\treturn helper()\n");
 	if (!elf.empty()) {
 		auto machine = boot(elf);
 		check_eq<int64_t>(run(*machine, "f").value, 7, "the script function won");
@@ -880,72 +861,40 @@ void test_resolution_order() {
 	// And @GlobalScope wins over a local: a variable named `abs` does not
 	// capture abs().
 	const std::vector<uint8_t> global = compile(
-		"func f():\n"
-		"\tvar abs = 1\n"
-		"\treturn abs(-5)\n");
+			"func f():\n"
+			"\tvar abs = 1\n"
+			"\treturn abs(-5)\n");
 	if (!global.empty()) {
 		auto machine = boot(global);
 		check_eq<int64_t>(run(*machine, "f").value, 5, "the global function won");
 	}
-
-	std::cout << "  ✓ Script functions and globals still win in call position" << std::endl;
 }
 
-void test_lifted_names_stay_out_of_the_way() {
-	std::cout << "Testing the names lifted lambdas get..." << std::endl;
-
+TEST_CASE("lifted names stay out of the way") {
 	Compiler compiler;
 	CompilerOptions options;
+	options.extensions = true;
 	const std::vector<uint8_t> elf = compiler.compile(
-		"func f():\n"
-		"\tvar a = func(): return 1\n"
-		"\tvar b = func(): return 2\n"
-		"\treturn a.call() + b.call()\n", options);
+			"func f():\n"
+			"\tvar a = func(): return 1\n"
+			"\tvar b = func(): return 2\n"
+			"\treturn a.call() + b.call()\n",
+			options);
 	if (elf.empty()) {
-		std::cerr << "FAILED to compile: " << compiler.get_error() << std::endl;
-		failures++;
+		FAIL_CHECK("FAILED to compile: ", compiler.get_error());
 		return;
 	}
 
 	// One signature per function, in function order: backtraces index this list
 	// by position, so a lifted lambda has to have an entry of its own.
-	const std::vector<FunctionSignature>& signatures = compiler.get_function_signatures();
+	const std::vector<FunctionSignature> &signatures = compiler.get_function_signatures();
 	check_eq<size_t>(signatures.size(), 3, "one signature per function, lambdas included");
 	if (signatures.size() == 3) {
 		check(signatures[0].name == "f", "the declared function comes first");
 		check(signatures[1].name.rfind("@lambda_", 0) == 0,
-			"a lifted lambda is named @lambda_N: " + signatures[1].name);
+			  "a lifted lambda is named @lambda_N: " + signatures[1].name);
 		check(signatures[1].name != signatures[2].name, "two lambdas get two names");
 	}
-
-	std::cout << "  ✓ Lifted lambdas are named where no GDScript identifier can reach" << std::endl;
 }
 
 } // namespace
-
-int main() {
-	sgd_install_test_dyncalls();
-	std::cout << "=== Callable Tests ===" << std::endl << std::endl;
-
-	test_a_lambda_is_a_callable();
-	test_calling_a_lambda();
-	test_captures_arrive_prepended();
-	test_captures_are_by_value();
-	test_a_function_name_is_a_callable();
-	test_calling_a_callable_variable();
-	test_a_lambda_called_through_its_variable();
-	test_calling_an_expression();
-	test_a_lambda_inside_a_lambda();
-	test_shapes_of_lambda_syntax();
-	test_the_callable_constructor();
-	test_what_is_refused();
-	test_resolution_order();
-	test_lifted_names_stay_out_of_the_way();
-
-	if (failures != 0) {
-		std::cerr << std::endl << failures << " callable test(s) failed" << std::endl;
-		return 1;
-	}
-	std::cout << std::endl << "All callable tests passed!" << std::endl;
-	return 0;
-}

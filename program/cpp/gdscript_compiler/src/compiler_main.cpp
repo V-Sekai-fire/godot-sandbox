@@ -155,7 +155,7 @@ PUBLIC Variant validate(String code)
 PUBLIC Variant analyze(String code, int64_t caret_line, int64_t caret_column, int64_t flags)
 {
 	SourceModel model = analyze_source(code.utf8(), gdscript_source_path(),
-			uint32_t(flags), int32_t(caret_line), int32_t(caret_column));
+			uint32_t(flags) | ANALYZE_EXTENSIONS, int32_t(caret_line), int32_t(caret_column));
 	if ((uint32_t(flags) & ANALYZE_DECLARATIONS) != 0) {
 		CompilerOptions options;
 		options.output_elf = false;

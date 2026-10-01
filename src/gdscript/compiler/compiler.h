@@ -14,6 +14,16 @@
 #include <vector>
 #include <cstdint>
 
+// Default for CompilerOptions::fast_arrays; the build can turn it off
+// (-DGDSCRIPT_FAST_ARRAYS=OFF) to run every test against the per-element path.
+#ifndef GDSCRIPT_FAST_ARRAYS_DEFAULT
+#define GDSCRIPT_FAST_ARRAYS_DEFAULT 1
+#endif
+// Default for CompilerOptions::rewrite; -DGDSCRIPT_REWRITE=OFF likewise.
+#ifndef GDSCRIPT_REWRITE_DEFAULT
+#define GDSCRIPT_REWRITE_DEFAULT 1
+#endif
+
 namespace gdscript {
 
 struct IRProgram;
@@ -32,6 +42,15 @@ struct CompilerOptions {
 	bool optimize = true;
 	// Sandbox batching uses scoped handles. Native backends use direct iteration.
 	bool batch_iteration = true;
+	// Packed array regions: a loop copies the typed Packed*Array locals it indexes
+	// into guest memory once (ECALL_PACKED_ACQUIRE) instead of making a host call
+	// per element, and stores the written ones back in place. A host without the
+	// call refuses the acquire, and each loop runs as before. Sandbox only.
+	bool fast_arrays = GDSCRIPT_FAST_ARRAYS_DEFAULT;
+	// Rewrite loops over packed arrays into equivalent GDScript that makes fewer
+	// host calls (rewrite.h) before compiling. The rewritten text keeps the
+	// authored line numbers; get_rewritten_source() returns it.
+	bool rewrite = GDSCRIPT_REWRITE_DEFAULT;
 	// Native ScriptInstances represent nested classes as Objects.
 	bool native_classes = false;
 	std::string output_path;
@@ -47,6 +66,8 @@ struct CompilerOptions {
 	// 1-based lines to break on. Non-empty implies debug_info.
 	std::vector<uint32_t> breakpoint_lines;
 	bool restricted = false;
+	// Opt-in SafeGDScript extensions: struct, trait, uses, switch, `?` types and operators, unions, @test.
+	bool extensions = false;
 	// `@test` functions are compiled in and published. A shipping build turns
 	// this off: the tests leave the ELF entirely.
 	bool emit_tests = true;
@@ -121,10 +142,24 @@ public:
 	bool base_is_path() const { return m_base_is_path; }
 	const std::string &get_native_base_class() const { return m_native_base_class; }
 	bool native_base_is_path() const { return m_native_base_is_path; }
+	// The text that was compiled: the rewritten source when the rewrite applied,
+	// otherwise the authored one. A build artifact, for inspection.
+	const std::string &get_rewritten_source() const { return m_rewritten_source; }
+	// One line per rewrite applied (or why one was dropped).
+	const std::vector<std::string> &get_rewrite_notes() const { return m_rewrite_notes; }
+	// What each loop over packed arrays became under fast arrays.
+	const std::vector<std::string> &get_packed_notes() const { return m_packed_notes; }
 	// Subset of breakpoint_lines that got a stop emitted.
 	const std::vector<uint32_t> &get_installed_breakpoints() const { return m_installed_breakpoints; }
 
 private:
+	// compile_to_ir over `text`; `line_map` (rewritten line -> authored line) is
+	// empty for the authored text, and errors quote `authored`.
+	std::optional<IRProgram> compile_text(const std::string& text, const std::vector<int>& line_map,
+		const std::string& authored, const CompilerOptions& options);
+	std::string m_rewritten_source;
+	std::vector<std::string> m_rewrite_notes;
+	std::vector<std::string> m_packed_notes;
 	void set_error(const std::string& source, const CompilerException& error);
 	void set_error(const std::exception& error);
 	std::string m_error;

@@ -47,6 +47,7 @@ compiler_sources = compiler_host_sources + [
     "src/gdscript/compiler/ir_optimizer.cpp",
     "src/gdscript/compiler/ir_verifier.cpp",
     "src/gdscript/compiler/codegen.cpp",
+    "src/gdscript/compiler/rewrite.cpp",
     "src/gdscript/compiler/riscv_codegen.cpp",
     "src/gdscript/compiler/riscv_globals.cpp",
     "src/gdscript/compiler/riscv_profiling.cpp",

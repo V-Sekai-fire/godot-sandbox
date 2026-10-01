@@ -17,7 +17,7 @@ inline int check_source(const std::string& source, const std::string& path,
 	size_t warnings = 0;
 
 	const SourceModel model = analyze_source(source, where,
-		ANALYZE_DIAGNOSTICS | ANALYZE_DECLARATIONS);
+		ANALYZE_DIAGNOSTICS | ANALYZE_DECLARATIONS | (options.extensions ? ANALYZE_EXTENSIONS : 0u));
 	std::vector<int> reported_lines;
 	for (const SourceDiagnostic& diagnostic : model.diagnostics) {
 		const bool is_error = diagnostic.severity == DiagnosticSeverity::ERROR;

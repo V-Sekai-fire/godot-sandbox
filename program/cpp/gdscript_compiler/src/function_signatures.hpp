@@ -284,6 +284,7 @@ inline void gdscript_set_base_sources(const std::vector<std::string> &triples) {
 }
 
 inline void gdscript_apply_restrictions(gdscript::CompilerOptions &options) {
+	options.extensions = true;
 	options.restricted = gdscript_restricted();
 	options.emit_tests = gdscript_emit_tests();
 	options.trait_structural_fallback = gdscript_trait_structural_fallback();

@@ -127,6 +127,9 @@ private:
 	int resident_int_register(int vreg) const;
 	int resident_float_register(int vreg) const;
 	bool scope_body_may_allocate(const IRFunction& func, size_t mark_index) const;
+	// Loop scopes (released more than once) whose body may allocate: each wants a
+	// callee-saved register for its dirty bit (plan_scopes), at most `cap`.
+	size_t loop_scope_dirty_demand(const IRFunction& func, size_t cap) const;
 	bool instruction_may_ecall(const IRInstruction& instr) const;
 	// Narrower: an ecall whose answer is a register value leaves no scoped
 	// variant behind, so a loop body made only of those needs no release.
@@ -167,6 +170,23 @@ private:
 	void gen_syscall_string_batch(const IRInstruction& instr, int result_vreg);
 	void gen_syscall_string_codepoint_batch(const IRInstruction& instr, int result_vreg);
 	void gen_syscall_array_batch(const IRInstruction& instr, int result_vreg);
+	// Packed array regions (codegen.cpp): the bulk acquire/release and the
+	// native accesses to the acquired copy.
+	void gen_syscall_packed_acquire(const IRInstruction& instr, int result_vreg);
+	void gen_syscall_packed_release(const IRInstruction& instr, int result_vreg);
+	int packed_descriptor_offset(int64_t token) const;
+	void gen_packed_get(const IRInstruction& instr);
+	void gen_packed_set(const IRInstruction& instr);
+	void gen_packed_descriptor_word(const IRInstruction& instr, int word);
+	void gen_packed_index(const IRInstruction& instr);
+	uint8_t emit_packed_element_address(int64_t type, int data_vreg, int index_vreg);
+	// Bytes of one element of a Packed*Array of `type` as the host stores it: the
+	// vectors follow real_t, Color is always four floats. 0 for an unsupported type.
+	int packed_element_bytes(int64_t type) const;
+	// One float at address+offset widened into `dst`, or `value` narrowed into one,
+	// as the host converts them. Clobber t0 and t2 (and f1, to narrow).
+	void emit_packed_float_widen(uint8_t dst, uint8_t address, int offset);
+	void emit_packed_float_narrow(uint8_t value, uint8_t address, int offset);
 	void gen_syscall_dictionary_ops(const IRInstruction& instr, int result_vreg);
 	void gen_dict_const(const IRInstruction& instr);
 	void gen_struct_check(const IRInstruction& instr);
@@ -333,6 +353,7 @@ private:
 
 	void emit_sext_w(uint8_t rd, uint8_t rs);               // addiw rd, rs, 0
 	void emit_srai(uint8_t rd, uint8_t rs, uint8_t shamt);
+	void emit_srli(uint8_t rd, uint8_t rs, uint8_t shamt);
 	void emit_slli(uint8_t rd, uint8_t rs, uint8_t shamt);
 	void emit_sh2add(uint8_t rd, uint8_t rs1, uint8_t rs2); // Zba
 
@@ -498,6 +519,7 @@ private:
 	uint8_t emit_int_operand(uint8_t rd, int vreg, int offset);
 	uint8_t emit_float_operand(uint8_t fd, int vreg, int offset);
 	void emit_typed_int_result(int result_vreg, int result_offset, uint8_t source);
+	void emit_typed_float_result(int result_vreg, int result_offset, uint8_t source);
 
 	// Per-instruction temporaries; do not survive past the emitting instruction.
 	int get_scratch_variant_offset(int index = 0);
@@ -598,6 +620,9 @@ private:
 		bool has_backedge = false;
 		// Bytes occupied by ra/a0 and the callee-saved scalar registers.
 		int saved_reg_space = SAVED_FIXED_SPACE;
+		// Frame offset of the first Variant slot: saved_reg_space, plus the packed
+		// array descriptors when the function has a region.
+		int variant_base = 0;
 		// Frame size in bytes from saved_reg_space; checked at resume.
 		int variant_space = 0;
 
@@ -647,6 +672,9 @@ private:
 		std::unordered_map<int64_t, int> array_batch_offsets;
 		std::unordered_map<size_t, std::vector<int64_t>> array_batch_releases;
 		std::unordered_map<int64_t, int> codepoint_batch_offsets;
+		// Packed array region token -> its 32-byte descriptor: data pointer,
+		// element count, identity, dirty flag (ECALL_PACKED_ACQUIRE fills it).
+		std::unordered_map<int64_t, int> packed_offsets;
 		std::array<int, 3> int_cache_owners {{ -1, -1, -1 }};
 		std::array<int, 3> float_cache_owners {{ -1, -1, -1 }};
 		uint8_t next_int_cache = 0;

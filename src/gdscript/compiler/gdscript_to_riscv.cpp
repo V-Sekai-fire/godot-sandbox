@@ -44,6 +44,7 @@ static void print_usage(const char* program) {
 		"  -l, --program-headers  Show `readelf -l` instead of the disassembly\n"
 		"      --no-optimize      Skip the optimizer (alias: --no-opt)\n"
 		"      --check            Diagnostics only; exit 1 when the script has errors\n"
+		"      --extensions       Allow SafeGDScript extensions (struct, trait, `?`, unions, @test)\n"
 		"      --strip-tests      Leave @test functions out, as a shipping build does\n"
 		"      --profiling        Emit self-instrumentation (wall clock)\n"
 		"      --profiling-instructions  The same, counting instructions\n"
@@ -53,6 +54,15 @@ static void print_usage(const char* program) {
 		"      --trait Name=path  Make a trait from `path` available. Repeatable\n"
 		"      --double-precision Compile for a real_t = double host\n"
 		"      --single-precision Compile for a real_t = float host\n"
+		"      --fast-arrays      Copy the packed arrays a loop indexes into guest memory\n"
+		"                         once (the default)\n"
+		"      --no-fast-arrays   One host call per packed array element\n"
+		"      --rewrite          Rewrite loops over packed arrays first (the default)\n"
+		"      --no-rewrite       Compile the authored loops as written\n"
+		"      --emit-rewritten P Write the GDScript that was compiled to P (a build\n"
+		"                         artifact: the authored file keeps its text)\n"
+		"      --packed-notes     Say which loops copy their packed arrays, and why\n"
+		"                         others do not\n"
 		"  -h, --help             Show this text\n"
 		"\n"
 		"GDSC_PASSES=<names> selects optimizer passes; GDSC_PASSES=none disables them.\n";
@@ -70,6 +80,11 @@ int main(int argc, char** argv)
 	bool profiling = false;
 	bool strip_tests = false;
 	bool check_only = false;
+	bool extensions = false;
+	bool fast_arrays = GDSCRIPT_FAST_ARRAYS_DEFAULT;
+	bool rewrite = GDSCRIPT_REWRITE_DEFAULT;
+	std::string emit_rewritten;
+	bool packed_notes = false;
 	ProfilingClock profiling_clock = ProfilingClock::TIME;
 	std::vector<std::string> autoloads;
 	std::vector<std::pair<std::string, std::string>> global_classes;
@@ -130,6 +145,22 @@ int main(int argc, char** argv)
 			strip_tests = true;
 		} else if (arg == "--check") {
 			check_only = true;
+		} else if (arg == "--extensions") {
+			extensions = true;
+		} else if (arg == "--fast-arrays") {
+			fast_arrays = true;
+		} else if (arg == "--no-fast-arrays") {
+			fast_arrays = false;
+		} else if (arg == "--rewrite") {
+			rewrite = true;
+		} else if (arg == "--no-rewrite") {
+			rewrite = false;
+		} else if (arg == "--packed-notes") {
+			packed_notes = true;
+		} else if (arg == "--emit-rewritten") {
+			if (i + 1 < argc) {
+				emit_rewritten = argv[++i];
+			}
 		} else if (arg == "--help" || arg == "-h") {
 			print_usage(argv[0]);
 			return 0;
@@ -161,6 +192,9 @@ int main(int argc, char** argv)
 	if (check_only) {
 		CompilerOptions options;
 		options.optimize = !no_optimize;
+		options.extensions = extensions;
+		options.fast_arrays = fast_arrays;
+		options.rewrite = rewrite;
 		options.double_precision = double_precision;
 		options.emit_tests = !strip_tests;
 		options.autoloads = autoloads;
@@ -176,6 +210,9 @@ int main(int argc, char** argv)
 		CompilerOptions options;
 		options.output_elf = true;
 		options.optimize = !no_optimize;
+		options.extensions = extensions;
+		options.fast_arrays = fast_arrays;
+		options.rewrite = rewrite;
 		options.double_precision = double_precision;
 		options.profiling = profiling;
 		// What a shipping build produces: no @test function reaches codegen.
@@ -190,6 +227,23 @@ int main(int argc, char** argv)
 			std::cerr << "Error: " << compiler.get_error() << std::endl;
 			unlink(temp_elf.c_str());
 			return 1;
+		}
+		if (!emit_rewritten.empty()) {
+			std::ofstream rewritten(emit_rewritten, std::ios::binary);
+			rewritten << compiler.get_rewritten_source();
+			if (!rewritten) {
+				std::cerr << "Error: cannot write " << emit_rewritten << std::endl;
+				unlink(temp_elf.c_str());
+				return 1;
+			}
+			for (const std::string& note : compiler.get_rewrite_notes()) {
+				std::cerr << "rewrite: " << note << std::endl;
+			}
+		}
+		if (packed_notes) {
+			for (const std::string& note : compiler.get_packed_notes()) {
+				std::cerr << "packed: " << note << std::endl;
+			}
 		}
 
 		if (!output_elf_path.empty()) {
