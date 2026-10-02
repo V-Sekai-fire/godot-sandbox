@@ -144,9 +144,10 @@ Sandbox.
 `GDScriptCompilerBackend` (`src/safegdscript/compiler_backend.h`) is the one
 interface the `.sgd` host drives. Two implementations:
 
-- **sandboxed** (`sandboxed_compiler.cpp`) — `gdscript.elf` in its own Sandbox,
-  reached by vmcall. A compiler bug faults that machine, not the process. Every
-  entry point a previous release lacked is guarded by `has_function()`.
+- **sandboxed** (`sandboxed_compiler.cpp`) — `gdscript.elf` (`gdscript.double.elf`
+  in a double-precision build) in its own Sandbox, reached by vmcall. A compiler
+  bug faults that machine, not the process. Every entry point a previous release
+  lacked is guarded by `has_function()`.
 - **direct** (`direct_compiler.cpp`) — the same compiler linked into the
   extension, called in process. Faster (no guest machine, no ecall per answer)
   and gdb sees the compiler's own frames; a crash in it is a Godot crash.
