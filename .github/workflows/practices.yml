@@ -1,0 +1,14 @@
+name: Practices
+
+# RFD 2294's standard practices, from the one shared workflow in manuals-weftspun.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  practices:
+    uses: V-Sekai-fire/manuals-weftspun/.github/workflows/practices.yml@76ec5ffc431c8c0304f5294524cf2f2e0af4eba3
