@@ -951,6 +951,44 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 		return false;
 	}
 	const std::string_view binary_view = std::string_view{ (const char *)buffer->ptr(), static_cast<size_t>(buffer->size()) };
+	{
+		// A guest lays its Variants out for one real_t; on the other host every value it passes
+		// or returns is misread. A compiled GDScript says which in .gdsmeta, any other guest in
+		// .sandbox_variant, and one that says nothing has every guest API's default, float.
+		const bool host_double = sizeof(real_t) == sizeof(double);
+		const std::string_view metadata = Sandbox::elf_section_bytes(binary_view, ".gdsmeta");
+		String refusal;
+		if (!metadata.empty()) {
+#ifndef SAFEGDSCRIPT_DISABLED
+			gdscript::ScriptMetadata decoded;
+			if (gdscript::decode_script_metadata(reinterpret_cast<const uint8_t *>(metadata.data()), metadata.size(), decoded) &&
+					decoded.double_precision != host_double) {
+				refusal = String("this program was compiled for a ") + (decoded.double_precision ? "double" : "single") +
+						"-precision host, and this build is " + (host_double ? "double" : "single") +
+						" precision. Compile it with" + (host_double ? "" : "out") + " --double-precision.";
+			}
+#endif
+		} else {
+			const std::string_view declared = Sandbox::elf_section_bytes(binary_view, ".sandbox_variant");
+			uint32_t variant_size = 24;
+			const bool named = declared.size() >= 8 && std::memcmp(declared.data(), "SBXV", 4) == 0;
+			if (named) {
+				std::memcpy(&variant_size, declared.data() + 4, sizeof(variant_size));
+			}
+			if (variant_size != sizeof(GuestVariant)) {
+				refusal = (named ? "this program's Variant is " + itos(variant_size) + " bytes"
+								 : String("this program names no Variant size, so it is taken for 24 bytes")) +
+						", and this build's is " + itos(sizeof(GuestVariant)) + ". Build it with" +
+						(host_double ? "" : "out") + " the guest API's double precision (the C++ API's DOUBLE_PRECISION option).";
+			}
+		}
+		if (!refusal.is_empty()) {
+			ERR_PRINT("Sandbox: " + refusal);
+			this->m_unchecked_memory_active = false;
+			this->reset_machine();
+			return false;
+		}
+	}
 
 	// Guest addresses are about to change, so names cached against them are no longer valid.
 	this->m_guest_names.clear();
@@ -1356,6 +1394,11 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 	machine_t &machine = this->machine();
 	int index = 11;
 	int flindex = 10;
+	// Structs larger than 16 bytes are passed as a pointer to a copy
+	auto pass_by_reference = [&](size_t i, const Variant &arg) -> gaddr_t {
+		v[i + 1].set(*this, arg, true);
+		return arrayDataPtr + (i + 1) * sizeof(GuestVariant) + offsetof(GuestVariant, v);
+	};
 
 	for (size_t i = 0; i < argc; i++) {
 		const Variant &arg = *args[i];
@@ -1376,8 +1419,13 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 				machine.cpu.registers().getfl(flindex++).set_double(inner->flt);
 				break;
 			case Variant::VECTOR2: { // 8- or 16-byte structs can be passed in registers
-				machine.cpu.registers().getfl(flindex++).set_float(inner->vec2_flt[0]);
-				machine.cpu.registers().getfl(flindex++).set_float(inner->vec2_flt[1]);
+				if constexpr (sizeof(real_t) == sizeof(float)) {
+					machine.cpu.registers().getfl(flindex++).set_float(inner->vec2_flt[0]);
+					machine.cpu.registers().getfl(flindex++).set_float(inner->vec2_flt[1]);
+				} else {
+					machine.cpu.registers().getfl(flindex++).set_double(inner->vec2_flt[0]);
+					machine.cpu.registers().getfl(flindex++).set_double(inner->vec2_flt[1]);
+				}
 				break;
 			}
 			case Variant::VECTOR2I: { // 8- or 16-byte structs can be passed in registers
@@ -1385,8 +1433,12 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 				break;
 			}
 			case Variant::VECTOR3: {
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec3_flt[0];
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec3_flt[2];
+				if constexpr (sizeof(real_t) == sizeof(float)) {
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec3_flt[0];
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec3_flt[2];
+				} else {
+					machine.cpu.reg(index++) = pass_by_reference(i, arg);
+				}
 				break;
 			}
 			case Variant::VECTOR3I: {
@@ -1395,8 +1447,12 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 				break;
 			}
 			case Variant::VECTOR4: {
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[0];
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[2];
+				if constexpr (sizeof(real_t) == sizeof(float)) {
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[0];
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[2];
+				} else {
+					machine.cpu.reg(index++) = pass_by_reference(i, arg);
+				}
 				break;
 			}
 			case Variant::VECTOR4I: {
@@ -1412,8 +1468,12 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 				break;
 			}
 			case Variant::PLANE: {
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[0];
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[2];
+				if constexpr (sizeof(real_t) == sizeof(float)) {
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[0];
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[2];
+				} else {
+					machine.cpu.reg(index++) = pass_by_reference(i, arg);
+				}
 				break;
 			}
 			case Variant::OBJECT: { // Objects are represented as uintptr_t
