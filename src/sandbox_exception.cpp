@@ -1,6 +1,7 @@
 #include "sandbox.h"
 
 #include "cpp/script_cpp.h"
+#include "sandbox_project_settings.h"
 #include <charconv>
 #ifdef __linux__
 #include <libriscv/rsp_server.hpp>
@@ -113,9 +114,11 @@ void Sandbox::handle_exception(gaddr_t address) {
 	String elfpath = "";
 #if defined(__linux__) || defined(__APPLE__)
 	// Attempt to print the source code line using addr2line from the C++ Docker container
-	// It's not unthinkable that this works for every ELF, regardless of the language
+	// It's not unthinkable that this works for every ELF, regardless of the language.
+	// Only when the project allows Docker (sandbox/toolchain/docker_enabled): otherwise
+	// every guest fault on a server or CI runner pulls and starts a container.
 	Ref<ELFScript> script = this->get_program();
-	if (!script.is_null()) {
+	if (!script.is_null() && SandboxProjectSettings::get_docker_enabled()) {
 		Array line_out;
 		elfpath = get_program()->get_dockerized_program_path();
 		CPPScript::DockerContainerExecute({ "/usr/api/build.sh", "--line", to_hex(address), elfpath }, line_out, false);
