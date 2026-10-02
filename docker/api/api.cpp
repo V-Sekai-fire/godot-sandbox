@@ -11,6 +11,16 @@ EXTERN_SYSCALL(uint64_t, sys_node_create, Node_Create_Shortlist, const char *, s
 MAKE_SYSCALL(ECALL_LOAD, void, sys_load, const char *, size_t, Variant *);
 MAKE_SYSCALL(ECALL_SANDBOX_ADD, void, sys_sandbox_add, int, ...);
 
+/* The size of this program's Variant, which follows real_t: a host whose own differs
+   refuses the program at load instead of misreading its values. */
+struct SandboxVariantSize {
+	char magic[4];
+	uint32_t size;
+};
+extern "C" __attribute__((used, retain, section(".sandbox_variant"))) const SandboxVariantSize sandbox_variant_size{
+	{ 'S', 'B', 'X', 'V' }, sizeof(Variant)
+};
+
 /* Default main: Do nothing */
 __attribute__((weak)) int main() {
 	halt(); // Prevent closing pipes, calling global destructors etc.
