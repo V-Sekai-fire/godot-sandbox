@@ -652,7 +652,7 @@ IRProgram CodeGenerator::generate(const Program& program) {
 			bool folded = fold_global_initializer(global.initializer.get(), ir_global);
 			// Empty Array literals need the same packed-array conversion as nonempty ones.
 			const auto declared = global.type_hint.nullable
-				? Variant::type_from_name(global.type_hint.sole_name()) : m_global_types[i];
+				? IRInstruction::TypeHint(Variant::type_from_name(global.type_hint.sole_name())) : m_global_types[i];
 			if (folded && ir_global.init_type == IRGlobalVar::InitType::EMPTY_ARRAY &&
 				packed_array_constructor_name(declared) != nullptr) {
 				folded = false;
@@ -3269,7 +3269,7 @@ void CodeGenerator::gen_for(const ForStmt* stmt, FunctionContext& func) {
 			func.ir.instructions.emplace_back(IROpcode::MOVE, IRValue::reg(packed_reg),
 				IRValue::reg(array_reg));
 			int64_t packed_types = 0;
-			for (int type = 0; type < Variant::VARIANT_MAX; type++) {
+			for (int type = 0; type < int(Variant::VARIANT_MAX); type++) {
 				if (is_packed_array_type(IRInstruction::TypeHint(type))) packed_types |= int64_t(1) << type;
 			}
 			const int is_packed_reg = alloc_register(func);
@@ -11014,7 +11014,7 @@ bool CodeGenerator::plan_array_windows(const ForStmt* stmt, FunctionContext& fun
 
 	// Values whose methods and members Godot answers without running a script.
 	const auto value_type = [](IRInstruction::TypeHint type) {
-		return type >= Variant::BOOL && type < Variant::OBJECT;
+		return type >= int(Variant::BOOL) && type < int(Variant::OBJECT);
 	};
 	const auto static_type = [&](const std::string& name) -> IRInstruction::TypeHint {
 		if (Variable* local = find_variable(func, name)) {
