@@ -521,7 +521,7 @@ func copied(a, b: PackedInt32Array):
 			expected += v
 		assert_eq(s.vmcallv("sum", a), expected, "untyped PackedInt32Array of %d" % n)
 		assert_eq(s.vmcallv("sum", PackedInt64Array(Array(a))), expected, "untyped PackedInt64Array of %d" % n)
-		assert_eq(s.vmcallv("sum", PackedFloat64Array(Array(a))), float(expected), "untyped PackedFloat64Array of %d" % n)
+		assert_eq(s.vmcallv("sum_from", PackedFloat64Array(Array(a)), 0.0), float(expected), "untyped PackedFloat64Array of %d" % n)
 		assert_eq(s.vmcallv("sum", Array(a)), expected, "an Array still walks")
 	assert_eq(s.vmcallv("sum", PackedByteArray([1, 2, 250])), 253, "bytes")
 	assert_eq(s.vmcallv("sum_from", PackedFloat32Array([0.5, 1.25]), 0.0), 1.75, "float32 widens")
@@ -544,6 +544,12 @@ func copied(a, b: PackedInt32Array):
 	var shared := PackedInt32Array([1, 2, 3, 4])
 	assert_eq(s.vmcallv("copied", shared, shared), PackedInt32Array([1, 10, 100, 1000]),
 		"a written packed array may be the walked one")
+
+	var before := s.get_exceptions()
+	assert_null(s.vmcallv("sum", PackedFloat64Array([0.5])), "a float element does not fit an inferred int")
+	assert_eq(s.get_exceptions(), before + 1, "and is reported as an exception")
+	assert_engine_error("Cannot assign a value to variable 's' of type int")
+	assert_engine_error("Exception: Sandbox exception in TypeError: Cannot assign a value to variable 's' of type int")
 	s.queue_free()
 
 func test_loops_that_must_not_take_a_window():
