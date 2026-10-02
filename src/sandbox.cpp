@@ -668,6 +668,7 @@ void Sandbox::run_instance_initializer(gaddr_t address, gaddr_t base) {
 		this->handle_exception(address);
 	}
 
+	this->commit_packed_acquisitions();
 	// Keep this level active while releasing temporaries: predelete can reenter.
 	this->m_current_state->reset();
 	this->m_instance_base = previous_base;
@@ -1152,6 +1153,7 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 	// Promote before restoring state; runs on the failing path too.
 	if (elevated_startup) {
 		this->promote_startup_handles();
+		this->commit_packed_acquisitions();
 		this->m_current_state->reset();
 		this->m_current_state = startup_state;
 	}
@@ -1594,6 +1596,8 @@ void Sandbox::vmcall_internal(gaddr_t address, const Variant **args, int argc,
 		Sandbox &self;
 		CurrentState &state;
 		~CallStateScope() {
+			// A region the call returned from without its release ends with the call.
+			self.commit_packed_acquisitions();
 			state.reset();
 			self.m_current_state -= 1;
 		}
