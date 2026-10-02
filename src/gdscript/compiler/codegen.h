@@ -55,6 +55,9 @@ private:
 		bool is_const = false;
 		bool is_variant = false;
 		size_t debug_index = SIZE_MAX;
+		// `var x = value`: the slot took its type from the value rather than a
+		// declaration, so a narrowing store is a reclassification, not a conversion.
+		bool inferred = false;
 	};
 
 	struct Scope {
@@ -76,10 +79,6 @@ private:
 		std::unordered_map<size_t, IRInstruction::TypeHint> narrowed_global_types;
 		// Nullable struct slots keep their shape separately from the current tag.
 		std::unordered_map<int, const StructDecl*> declared_structs;
-		// Untyped locals inferred from an initializer may legally change Variant
-		// type later; mixed numeric lowering must not bake their current tag into a
-		// loop-carried CONVERT.
-		std::unordered_set<int> reclassifiable_registers;
 		// Struct known for a register: always DICTIONARY-typed, used for field-name checks.
 		std::unordered_map<int, const StructDecl*> register_structs;
 		std::unordered_map<int, std::unordered_set<const TraitDecl*>> register_traits;
@@ -97,6 +96,22 @@ private:
 		// String. Only the code-point walk produces these; only these skip Godot
 		// for ord().
 		std::unordered_set<int> codepoint_value_registers;
+		// Array[T] of a builtin T, by register: what an array window needs.
+		std::unordered_map<int, IRInstruction::TypeHint> array_element_types;
+		// Typed array windows open in the enclosing loops. Indexed by every
+		// register holding the array -- a variable read is a copy -- and listed
+		// once each, innermost last, for the exits a `return` takes.
+		struct ArrayWindowUse {
+			int64_t token = 0;
+			IRInstruction::TypeHint element_type = IRInstruction::TypeHint_NONE;
+			int array_reg = -1;
+			bool written = false;
+			// A member the loop reads through a local snapshot; written back.
+			std::string member;
+		};
+		std::unordered_map<int, ArrayWindowUse> array_windows;
+		std::vector<ArrayWindowUse> open_array_windows;
+		int next_array_window_id = 0;
 		std::vector<LoopContext> loops;
 		// Innermost enclosing `?.` chain, whose root owns the null result.
 		struct SafeChain {
@@ -215,6 +230,32 @@ private:
 	// `for c in <String>`: batched character walk, see codegen.cpp.
 	void gen_string_walk(const ForStmt* stmt, int string_reg, FunctionContext& func);
 	bool string_walk_uses_only_codepoints(const ForStmt* stmt) const;
+	// Typed array windows over the arrays a counting loop indexes.
+	struct ArrayWindowPlan {
+		std::string name;
+		bool written = false;
+	};
+	bool plan_array_windows(const ForStmt* stmt, FunctionContext& func, std::vector<ArrayWindowPlan>& plans,
+		const std::string& iterated = {}, bool* writes_packed = nullptr);
+	static bool array_window_layout(IRInstruction::TypeHint container, IRInstruction::TypeHint array_element,
+		IRInstruction::TypeHint& element, ArrayWindowLayout& layout);
+	IRInstruction::TypeHint array_window_element(const std::string& name, FunctionContext& func,
+		ArrayWindowLayout* layout = nullptr);
+	std::vector<FunctionContext::ArrayWindowUse> open_array_windows(const ForStmt* stmt, FunctionContext& func);
+	std::vector<FunctionContext::ArrayWindowUse> open_array_windows(const std::vector<ArrayWindowPlan>& plans,
+		const ForStmt* stmt, FunctionContext& func);
+	// `for v in <packed array>`: elements straight from a window.
+	bool gen_packed_walk(const ForStmt* stmt, int array_reg, FunctionContext& func);
+	void close_array_windows(const std::vector<FunctionContext::ArrayWindowUse>& windows,
+		FunctionContext& func);
+	void emit_array_window_exits(FunctionContext& func);
+	int gen_window_read(const FunctionContext::ArrayWindowUse& window, int obj_reg, int idx_reg,
+		FunctionContext& func, const Expr* site);
+	void gen_window_store(const FunctionContext::ArrayWindowUse& window, int obj_reg, int idx_reg,
+		int value_reg, FunctionContext& func, const Expr* site);
+	int gen_element_read_direct(int obj_reg, int idx_reg, FunctionContext& func, const Expr* site);
+	bool gen_element_store_direct(int obj_reg, int idx_reg, int value_reg, FunctionContext& func,
+		const Expr* site);
 	// `for v in <Array>`: ECALL_ARRAY_BATCH fills sixteen guest Variant slots.
 	void gen_array_walk(const ForStmt* stmt, int array_reg, FunctionContext& func,
 		const StructDecl* element_struct, const TraitDecl* element_trait);
@@ -630,6 +671,7 @@ private:
 	std::vector<const StructDecl*> m_global_structs;
 	std::vector<const TraitDecl*> m_global_traits;
 	std::vector<const StructDecl*> m_global_array_element_structs;
+	std::vector<IRInstruction::TypeHint> m_global_array_element_types;
 	std::vector<const StructDecl*> m_global_dictionary_value_structs;
 	std::vector<const TraitDecl*> m_global_array_element_traits;
 	std::vector<const TraitDecl*> m_global_dictionary_value_traits;

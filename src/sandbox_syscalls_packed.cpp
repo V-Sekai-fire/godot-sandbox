@@ -53,7 +53,8 @@ uint64_t packed_identity(const void *storage) {
 // The engine's own Packed*Array inside a Variant, shared by every copy of that
 // Variant, or null when the Variant is not of `type`.
 void *packed_storage(const Variant &var, int type) {
-	if (int(variant_type(var)) != type) {
+	// Only packed arrays have an internal getter; NIL's is null.
+	if (type < Variant::PACKED_BYTE_ARRAY || type > Variant::PACKED_VECTOR4_ARRAY || int(variant_type(var)) != type) {
 		return nullptr;
 	}
 	const GDExtensionVariantGetInternalPtrFunc getter =

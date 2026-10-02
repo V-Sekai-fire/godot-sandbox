@@ -17,6 +17,7 @@
 #include <godot_cpp/classes/timer.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 #include <godot_cpp/variant/variant.hpp>
+#include <godot_cpp/variant/variant_internal.hpp>
 #include <godot_cpp/templates/hashfuncs.hpp>
 //#define ENABLE_SYSCALL_TRACE 1
 #include "syscalls_helpers.hpp"
@@ -341,6 +342,103 @@ static inline void object_call(Sandbox &emu, godot::Object *obj,
 	}
 }
 
+// For methods that pass a second argument with the actual call/target name (eg. emit_signal)
+enum class ByName : uint8_t { NONE, CALL, CALLV, GET, SET };
+struct ByNameMethod {
+	ByName kind;
+	int name_arg;
+};
+
+static ByNameMethod by_name_method(std::string_view m) {
+	if (m == "call" || m == "call_deferred" || m == "call_thread_safe" ||
+			m == "call_deferred_thread_group" || m == "rpc" || m == "propagate_call")
+		return { ByName::CALL, 0 };
+	if (m == "rpc_id")
+		return { ByName::CALL, 1 };
+	if (m == "callv")
+		return { ByName::CALLV, 0 };
+	if (m == "get" || m == "get_indexed")
+		return { ByName::GET, 0 };
+	if (m == "set" || m == "set_indexed" || m == "set_deferred" || m == "set_thread_safe" ||
+			m == "set_deferred_thread_group")
+		return { ByName::SET, 0 };
+	return { ByName::NONE, 0 };
+}
+
+[[noreturn]] static void refuse_by_name(const char *what, const String &name) {
+	ERR_PRINT(String(what) + name);
+	throw std::runtime_error(std::string(what) + name.utf8().get_data());
+}
+
+static String by_name_property(std::string_view method, const Variant &arg) {
+	if (method == "get_indexed" || method == "set_indexed") {
+		const NodePath path = NodePath(arg).get_as_property_path();
+		return path.get_subname_count() > 0 ? String(path.get_subname(0)) : String();
+	}
+	return arg;
+}
+
+static void check_method_reference(const Sandbox &emu, godot::Object *obj, const String &name) {
+	if (UNLIKELY(!emu.is_allowed_method(obj, name)))
+		refuse_by_name("Method reference not allowed: ", name);
+	if (UNLIKELY(!emu.is_fully_unrestricted())) {
+		const CharString utf8 = name.utf8();
+		if (by_name_method(std::string_view(utf8.get_data(), utf8.length())).kind != ByName::NONE)
+			refuse_by_name("Method reference not allowed under restrictions: ", name);
+	}
+}
+
+static void check_by_name_call(const Sandbox &emu, godot::Object *obj, std::string_view method,
+		const Variant *const *args, int argc, int depth = 0) {
+	const ByNameMethod by_name = by_name_method(method);
+	if (by_name.kind == ByName::NONE)
+		return;
+	if (by_name.name_arg >= argc)
+		return;
+	if (UNLIKELY(depth > 4))
+		refuse_by_name("Nested by-name call refused: ", String::utf8(method.data(), method.size()));
+	const Variant &name_arg = *args[by_name.name_arg];
+	switch (by_name.kind) {
+		case ByName::CALL:
+		case ByName::CALLV: {
+			const String name = name_arg;
+			if (UNLIKELY(!emu.is_allowed_method(obj, name)))
+				refuse_by_name("Method not allowed: ", name);
+			const CharString utf8 = name.utf8();
+			const std::string_view inner(utf8.get_data(), utf8.length());
+			if (by_name.kind == ByName::CALL) {
+				const int first = by_name.name_arg + 1;
+				check_by_name_call(emu, obj, inner, args + first, argc - first, depth + 1);
+			} else if (by_name.name_arg + 1 < argc) {
+				const Array inner_args = *args[by_name.name_arg + 1];
+				const Variant *inner_ptrs[gdscript::CallABI::MAX_ARGUMENTS];
+				const int inner_argc = std::min<int>(inner_args.size(), gdscript::CallABI::MAX_ARGUMENTS);
+				Variant inner_values[gdscript::CallABI::MAX_ARGUMENTS];
+				for (int i = 0; i < inner_argc; i++) {
+					inner_values[i] = inner_args[i];
+					inner_ptrs[i] = &inner_values[i];
+				}
+				check_by_name_call(emu, obj, inner, inner_ptrs, inner_argc, depth + 1);
+			}
+		} break;
+		case ByName::GET: {
+			const String property = by_name_property(method, name_arg);
+			if (UNLIKELY(!emu.is_allowed_property(obj, property, false)))
+				refuse_by_name("Banned property accessed: ", property);
+			// get() returns a Callable for a method name.
+			if (obj->has_method(property))
+				check_method_reference(emu, obj, property);
+		} break;
+		case ByName::SET: {
+			const String property = by_name_property(method, name_arg);
+			if (UNLIKELY(!emu.is_allowed_property(obj, property, true)))
+				refuse_by_name("Banned property accessed: ", property);
+		} break;
+		case ByName::NONE:
+			break;
+	}
+}
+
 /// @brief Call a method on an Object, after checking that the sandbox allows it.
 static inline void object_call_checked(Sandbox &emu, godot::Object *obj,
 		Sandbox::CachedNameRef &cached_method, std::string_view method_name,
@@ -349,7 +447,75 @@ static inline void object_call_checked(Sandbox &emu, godot::Object *obj,
 		ERR_PRINT("Variant::call(): Method not allowed: " + cached_method->variant.operator String());
 		throw std::runtime_error("Variant::call(): Method not allowed: " + std::string(method_name));
 	}
+	if (UNLIKELY(!emu.is_fully_unrestricted()) &&
+			by_name_method(method_name).kind != ByName::NONE) {
+		BorrowedVariantScratch scratch;
+		const Variant *argptrs[gdscript::CallABI::MAX_ARGUMENTS];
+		for (int i = 0; i < argc; i++)
+			argptrs[i] = scratch.emplace(emu, args[i]);
+		check_by_name_call(emu, obj, method_name, argptrs, argc);
+	}
 	object_call(emu, obj, cached_method.get(), method_name, args, argc, result, native_only);
+}
+
+static void check_signal_call(const Sandbox &emu, const Variant &signal_variant,
+		std::string_view method_name, const Variant **args, int argc) {
+	const Signal signal = signal_variant;
+	godot::Object *obj = signal.get_object();
+	if (obj == nullptr)
+		return;
+
+	const char *object_method;
+	if (method_name == "get_name" || method_name == "get_object" ||
+			method_name == "get_object_id" || method_name == "is_null") {
+		return;
+	} else if (method_name == "emit") {
+		object_method = "emit_signal";
+	} else if (method_name == "get_connections") {
+		object_method = "get_signal_connection_list";
+	} else if (method_name == "connect" || method_name == "disconnect" ||
+			method_name == "is_connected" || method_name == "has_connections") {
+		object_method = method_name == "connect" ? "connect"
+				: method_name == "disconnect"   ? "disconnect"
+				: method_name == "is_connected" ? "is_connected"
+												: "has_connections";
+	} else {
+		const std::string name(method_name);
+		if (UNLIKELY(!emu.is_allowed_method(obj, name.c_str()))) {
+			ERR_PRINT(String("Signal::call(): Method not allowed: ") + name.c_str());
+			throw std::runtime_error("Signal::call(): Method not allowed: " + name);
+		}
+		return;
+	}
+	if (UNLIKELY(!emu.is_allowed_method(obj, object_method))) {
+		ERR_PRINT(String("Signal::call(): Method not allowed: ") + object_method);
+		throw std::runtime_error(std::string("Signal::call(): Method not allowed: ") + object_method);
+	}
+	if (method_name == "connect" && argc >= 1 && args[0]->get_type() == Variant::CALLABLE) {
+		const Callable callable = *args[0];
+		godot::Object *target = callable.is_custom() ? nullptr : callable.get_object();
+		if (target != nullptr && UNLIKELY(!emu.is_allowed_method(target, callable.get_method()))) {
+			ERR_PRINT("Banned method connected: " + String(callable.get_method()));
+			throw std::runtime_error("Banned method connected: " +
+					std::string(String(callable.get_method()).utf8().get_data()));
+		}
+	}
+}
+
+static void check_callable_create(const Sandbox &emu, const Variant &target, const Variant &name_arg) {
+	const String name = name_arg;
+	switch (variant_type(target)) {
+		case Variant::OBJECT:
+			if (godot::Object *obj = target.operator godot::Object *())
+				check_method_reference(emu, obj, name);
+			break;
+		case Variant::SIGNAL: {
+			const CharString utf8 = name.utf8();
+			check_signal_call(emu, target, std::string_view(utf8.get_data(), utf8.length()), nullptr, 0);
+		} break;
+		default:
+			break;
+	}
 }
 
 /// @brief Call a method on a resolved Variant, whatever the guest labelled it as.
@@ -384,6 +550,10 @@ static inline void variant_or_object_call(Sandbox &emu, Variant *vcall,
 	const Variant *argptrs[gdscript::CallABI::MAX_ARGUMENTS];
 	for (int i = 0; i < argc; i++) {
 		argptrs[i] = scratch.emplace(emu, args[i]);
+	}
+
+	if (UNLIKELY(vtype == Variant::SIGNAL)) {
+		check_signal_call(emu, *vcall, method_name, argptrs, argc);
 	}
 
 	GDExtensionCallError error;
@@ -1205,6 +1375,10 @@ static void vcall_impl(machine_t &machine, bool super) {
 			BorrowedVariantScratch scratch;
 			const Variant *argptrs[gdscript::CallABI::MAX_ARGUMENTS];
 			for (int i = 0; i < args_size; i++) argptrs[i] = scratch.emplace(emu, args[i]);
+			if (UNLIKELY(type == Variant::CALLABLE && args_size == 2 &&
+					!emu.is_fully_unrestricted() && method_name == "create")) {
+				check_callable_create(emu, *argptrs[0], *argptrs[1]);
+			}
 			GDExtensionCallError error;
 			internal::gdextension_interface_variant_call_static(
 				static_cast<GDExtensionVariantType>(type), cached_method->sname._native_ptr(),
@@ -2494,6 +2668,8 @@ APICALL(api_obj_property_get) {
 			bool valid = false;
 			Sandbox::CachedNameRef cached_member = emu.cached_guest_name(g_property, method, false);
 			const StringName &member = cached_member->sname;
+			if (UNLIKELY(var_type == Variant::SIGNAL))
+				check_signal_call(emu, var, method, nullptr, 0);
 			Variant value = var.get_named(member, valid);
 			if (!valid) {
 				ERR_PRINT("api_obj_property_get: " + String(GuestVariant::type_name(var_type)) +
@@ -2517,10 +2693,7 @@ APICALL(api_obj_property_get) {
 
 	// Object::get() skips methods, so `object.method` must return a Callable explicitly.
 	if (obj->has_method(prop_name)) {
-		if (UNLIKELY(!emu.is_allowed_method(obj, cached_property->variant))) {
-			ERR_PRINT("Method reference not allowed: " + prop_name);
-			throw std::runtime_error("Method reference not allowed: " + std::string(method));
-		}
+		check_method_reference(emu, obj, prop_name);
 		vret->create(emu, Variant(Callable(obj, prop_name)));
 		return;
 	}
@@ -3329,28 +3502,62 @@ APICALL(api_array_size) {
 	machine.set_result(variant_container<Array>(var_array).size());
 }
 
+namespace {
+// Calls f with the packed array a Variant holds, or answers false.
+template <typename F>
+bool visit_packed_array(const Variant &subject, F &&f) {
+	switch (variant_type(subject)) {
+		case Variant::PACKED_BYTE_ARRAY: f(*VariantInternal::get_internal_value<PackedByteArray>(&subject)); return true;
+		case Variant::PACKED_INT32_ARRAY: f(*VariantInternal::get_internal_value<PackedInt32Array>(&subject)); return true;
+		case Variant::PACKED_INT64_ARRAY: f(*VariantInternal::get_internal_value<PackedInt64Array>(&subject)); return true;
+		case Variant::PACKED_FLOAT32_ARRAY: f(*VariantInternal::get_internal_value<PackedFloat32Array>(&subject)); return true;
+		case Variant::PACKED_FLOAT64_ARRAY: f(*VariantInternal::get_internal_value<PackedFloat64Array>(&subject)); return true;
+		case Variant::PACKED_STRING_ARRAY: f(*VariantInternal::get_internal_value<PackedStringArray>(&subject)); return true;
+		case Variant::PACKED_VECTOR2_ARRAY: f(*VariantInternal::get_internal_value<PackedVector2Array>(&subject)); return true;
+		case Variant::PACKED_VECTOR3_ARRAY: f(*VariantInternal::get_internal_value<PackedVector3Array>(&subject)); return true;
+		case Variant::PACKED_COLOR_ARRAY: f(*VariantInternal::get_internal_value<PackedColorArray>(&subject)); return true;
+		case Variant::PACKED_VECTOR4_ARRAY: f(*VariantInternal::get_internal_value<PackedVector4Array>(&subject)); return true;
+		default: return false;
+	}
+}
+} // namespace
+
 APICALL(api_array_batch) {
 	auto [arr_idx, start, max_count, output_addr] =
 		machine.sysargs<unsigned, int64_t, unsigned, gaddr_t>();
 	Sandbox &emu = riscv::emu(machine);
 	SYS_TRACE("array_batch", arr_idx, start, max_count, output_addr);
 
+	// An Array, or a packed array walked as an untyped iterable.
 	const Variant &var_array = get_scoped_variant_or_throw(emu, arr_idx, "Array::batch");
-	if (variant_type(var_array) != Variant::ARRAY) {
+	const bool is_array = variant_type(var_array) == Variant::ARRAY;
+	int64_t size = 0;
+	if (is_array) {
+		size = variant_container<Array>(var_array).size();
+	} else if (!visit_packed_array(var_array, [&](const auto &packed) { size = packed.size(); })) {
 		throw std::runtime_error("Invalid Array object for batched iteration");
 	}
-	const Array array = variant_container<Array>(var_array);
-	if (start < 0 || start >= array.size() || max_count == 0) {
+	if (start < 0 || start >= size || max_count == 0) {
 		machine.set_result(0);
 		return;
 	}
-	int64_t count = std::min<int64_t>(max_count, int64_t(array.size()) - start);
+	int64_t count = std::min<int64_t>(max_count, size - start);
 	const Sandbox::CurrentState &st = emu.state();
 	const int64_t headroom = int64_t(st.variants.capacity()) - int64_t(st.scoped_variants.size());
 	count = std::min(count, std::max<int64_t>(1, headroom / 4));
 	if (!emu.is_in_vmcall()) count = 1;
 
 	GuestVariant *output = machine.memory.memarray<GuestVariant>(output_addr, size_t(count));
+	if (!is_array) {
+		visit_packed_array(var_array, [&](const auto &packed) {
+			for (int64_t i = 0; i < count; i++) {
+				output[i].create(emu, Variant(packed[start + i]));
+			}
+		});
+		machine.set_result(count);
+		return;
+	}
+	const Array array = variant_container<Array>(var_array);
 	for (int64_t i = 0; i < count; i++) {
 		const Variant *element = reinterpret_cast<const Variant *>(
 				internal::gdextension_interface_array_operator_index_const(
@@ -3361,6 +3568,200 @@ APICALL(api_array_batch) {
 		output[i].create(emu, *element);
 	}
 	machine.set_result(count);
+}
+
+namespace {
+// The elements a window covers. Its first index is the guest's, so a negative
+// one counts from the end -- the run then never crosses into the positive
+// indices, which name the same elements differently. Out of range throws, as
+// `a[k]` does: the guest only asks for an element it is about to touch.
+struct WindowRun {
+	int64_t first; // physical
+	int64_t count;
+};
+WindowRun window_run(int64_t start, int64_t count, int64_t size) {
+	const int64_t first = start < 0 ? start + size : start;
+	if (UNLIKELY(first < 0 || first >= size)) {
+		throw std::runtime_error("Array index out of bounds: " + std::to_string(start));
+	}
+	return { first, std::min<int64_t>(count, start < 0 ? -start : size - first) };
+}
+
+// One packed array's elements against a guest buffer, both directions. The
+// element is the engine's own type, so the buffer layout is the array's.
+template <typename Packed>
+int64_t packed_window(machine_t &machine, Variant *mutable_subject, const Variant &subject,
+		gaddr_t buffer, int64_t store_start, int64_t store_count, int64_t load_start, int64_t max_count) {
+	using Element = std::remove_cv_t<std::remove_pointer_t<decltype(std::declval<const Packed &>().ptr())>>;
+	// The engine's own array, not a copy: ptrw() copies only a shared one.
+	if (store_count > 0) {
+		Packed &packed = *VariantInternal::get_internal_value<Packed>(mutable_subject);
+		const WindowRun run = window_run(store_start, store_count, packed.size());
+		if (UNLIKELY(run.count != store_count)) {
+			throw std::runtime_error("Packed array window write-back out of range");
+		}
+		const Element *source = machine.memory.memarray<Element>(buffer, size_t(run.count));
+		std::memcpy(packed.ptrw() + run.first, source, size_t(run.count) * sizeof(Element));
+	}
+	const Packed &packed = *VariantInternal::get_internal_value<Packed>(
+			store_count > 0 ? static_cast<const Variant *>(mutable_subject) : &subject);
+	if (max_count == 0) {
+		return packed.size();
+	}
+	const WindowRun run = window_run(load_start, max_count, packed.size());
+	Element *destination = machine.memory.memarray<Element>(buffer, size_t(run.count));
+	std::memcpy(destination, packed.ptr() + run.first, size_t(run.count) * sizeof(Element));
+	return run.count;
+}
+
+// An Array's element in the raw form a packed array of that type would hold.
+// INT widens to int64 and FLOAT to double, the Variant's own payloads; an INT
+// read for a FLOAT element converts, as assigning one into Array[float] would.
+// Typed containers are a compiler promise, so the Array itself may be untyped:
+// null is T's default, which is what resize() leaves in a real Array[T]. The run
+// stops before an element of another type; the first one must match.
+template <typename T>
+int64_t array_window_load(machine_t &machine, const Array &array, gaddr_t buffer,
+		const WindowRun &run, Variant::Type type) {
+	T *destination = machine.memory.memarray<T>(buffer, size_t(run.count));
+	for (int64_t i = 0; i < run.count; i++) {
+		const Variant &element = *reinterpret_cast<const Variant *>(
+				internal::gdextension_interface_array_operator_index_const(array._native_ptr(), run.first + i));
+		if (variant_type(element) != type) {
+			if (variant_type(element) == Variant::NIL) {
+				destination[i] = T();
+				continue;
+			}
+			if constexpr (std::is_same_v<T, double>) {
+				if (variant_type(element) == Variant::INT) {
+					destination[i] = double(element.operator int64_t());
+					continue;
+				}
+			}
+			if (i == 0) {
+				throw std::runtime_error("An element of Array[" + std::string(GuestVariant::type_name(type)) +
+						"] is a " + GuestVariant::type_name(variant_type(element)));
+			}
+			return i;
+		}
+		// An inline payload is the T itself; anything else asks the engine.
+		const GDNativeVariant *inner = reinterpret_cast<const GDNativeVariant *>(&element);
+		if (variant_inline_payload_bytes(type) == int(sizeof(T))) {
+			std::memcpy(&destination[i], &inner->value, sizeof(T));
+		} else {
+			destination[i] = element.operator T();
+		}
+	}
+	return run.count;
+}
+
+// Straight into the element: a T is what Array[T] holds, and the caller has
+// refused a read-only Array. Array::set() is a method bind call per element.
+// The load just found each element a T or null, both inline, so the bytes can
+// be replaced without destroying anything.
+template <typename T>
+void array_window_store(machine_t &machine, Array &array, gaddr_t buffer, const WindowRun &run,
+		Variant::Type type) {
+	const T *source = machine.memory.memarray<T>(buffer, size_t(run.count));
+	const bool raw = variant_inline_payload_bytes(type) == int(sizeof(T));
+	for (int64_t i = 0; i < run.count; i++) {
+		Variant *element = reinterpret_cast<Variant *>(
+				internal::gdextension_interface_array_operator_index(array._native_ptr(), run.first + i));
+		GDNativeVariant *inner = reinterpret_cast<GDNativeVariant *>(element);
+		if (raw && variant_inline_payload_bytes(inner->type) >= 0) {
+			inner->type = uint8_t(type);
+			std::memcpy(&inner->value, &source[i], sizeof(T));
+		} else {
+			*element = source[i];
+		}
+	}
+}
+
+int64_t array_window(machine_t &machine, const Variant &subject, gaddr_t buffer,
+		int64_t store_start, int64_t store_count, int64_t load_start, int64_t max_count, Variant::Type type) {
+	// The handle shares the engine's Array: writes through it are the guest's.
+	Array array = variant_container<Array>(subject);
+	if (store_count > 0) {
+		throw_if_read_only(subject, "Array window (assignment)");
+		const WindowRun run = window_run(store_start, store_count, array.size());
+		if (UNLIKELY(run.count != store_count)) {
+			throw std::runtime_error("Array window write-back out of range");
+		}
+		switch (type) {
+			case Variant::BOOL: array_window_store<bool>(machine, array, buffer, run, type); break;
+			case Variant::INT: array_window_store<int64_t>(machine, array, buffer, run, type); break;
+			case Variant::FLOAT: array_window_store<double>(machine, array, buffer, run, type); break;
+			case Variant::VECTOR2: array_window_store<Vector2>(machine, array, buffer, run, type); break;
+			case Variant::VECTOR2I: array_window_store<Vector2i>(machine, array, buffer, run, type); break;
+			case Variant::VECTOR3: array_window_store<Vector3>(machine, array, buffer, run, type); break;
+			case Variant::VECTOR3I: array_window_store<Vector3i>(machine, array, buffer, run, type); break;
+			case Variant::VECTOR4: array_window_store<Vector4>(machine, array, buffer, run, type); break;
+			case Variant::VECTOR4I: array_window_store<Vector4i>(machine, array, buffer, run, type); break;
+			case Variant::COLOR: array_window_store<Color>(machine, array, buffer, run, type); break;
+			default: throw std::runtime_error("Array window: unsupported element type");
+		}
+	}
+	if (max_count == 0) {
+		return array.size();
+	}
+	const WindowRun run = window_run(load_start, max_count, array.size());
+	switch (type) {
+		case Variant::BOOL: return array_window_load<bool>(machine, array, buffer, run, type);
+		case Variant::INT: return array_window_load<int64_t>(machine, array, buffer, run, type);
+		case Variant::FLOAT: return array_window_load<double>(machine, array, buffer, run, type);
+		case Variant::VECTOR2: return array_window_load<Vector2>(machine, array, buffer, run, type);
+		case Variant::VECTOR2I: return array_window_load<Vector2i>(machine, array, buffer, run, type);
+		case Variant::VECTOR3: return array_window_load<Vector3>(machine, array, buffer, run, type);
+		case Variant::VECTOR3I: return array_window_load<Vector3i>(machine, array, buffer, run, type);
+		case Variant::VECTOR4: return array_window_load<Vector4>(machine, array, buffer, run, type);
+		case Variant::VECTOR4I: return array_window_load<Vector4i>(machine, array, buffer, run, type);
+		case Variant::COLOR: return array_window_load<Color>(machine, array, buffer, run, type);
+		default: throw std::runtime_error("Array window: unsupported element type");
+	}
+}
+} // namespace
+
+APICALL(api_array_window) {
+	auto [index, buffer, store_start, store_count, load_start, max_count, element_type] =
+		machine.sysargs<int32_t, gaddr_t, int64_t, int64_t, int64_t, int64_t, unsigned>();
+	Sandbox &emu = riscv::emu(machine);
+	SYS_TRACE("array_window", index, buffer, store_start, store_count, load_start, max_count);
+	if (UNLIKELY(max_count < 0 || max_count > 4096 || store_count < 0 || store_count > 4096)) {
+		throw std::runtime_error("Array window: count out of range");
+	}
+	PENALIZE(1'000 + 4 * (max_count + store_count));
+	const Variant &subject = get_scoped_variant_or_throw(emu, index, "Array window");
+	const Variant::Type type = variant_type(subject);
+	if (type == Variant::ARRAY) {
+		machine.set_result(array_window(machine, subject, buffer, store_start, store_count,
+			load_start, max_count, Variant::Type(element_type)));
+		return;
+	}
+	// A packed array is a value: writing back copies a borrowed caller's first,
+	// as `a[i] = v` does, and the slot then names the copy.
+	Variant *mutable_subject = store_count > 0 ? &emu.get_mutable_scoped_variant(index) : nullptr;
+	int64_t result;
+	switch (type) {
+		case Variant::PACKED_BYTE_ARRAY: result = packed_window<PackedByteArray>(machine, mutable_subject, subject, buffer, store_start, store_count, load_start, max_count); break;
+		case Variant::PACKED_INT32_ARRAY: result = packed_window<PackedInt32Array>(machine, mutable_subject, subject, buffer, store_start, store_count, load_start, max_count); break;
+		case Variant::PACKED_INT64_ARRAY: result = packed_window<PackedInt64Array>(machine, mutable_subject, subject, buffer, store_start, store_count, load_start, max_count); break;
+		case Variant::PACKED_FLOAT32_ARRAY: result = packed_window<PackedFloat32Array>(machine, mutable_subject, subject, buffer, store_start, store_count, load_start, max_count); break;
+		case Variant::PACKED_FLOAT64_ARRAY: result = packed_window<PackedFloat64Array>(machine, mutable_subject, subject, buffer, store_start, store_count, load_start, max_count); break;
+		case Variant::PACKED_VECTOR2_ARRAY: result = packed_window<PackedVector2Array>(machine, mutable_subject, subject, buffer, store_start, store_count, load_start, max_count); break;
+		case Variant::PACKED_VECTOR3_ARRAY: result = packed_window<PackedVector3Array>(machine, mutable_subject, subject, buffer, store_start, store_count, load_start, max_count); break;
+		case Variant::PACKED_VECTOR4_ARRAY: result = packed_window<PackedVector4Array>(machine, mutable_subject, subject, buffer, store_start, store_count, load_start, max_count); break;
+		case Variant::PACKED_COLOR_ARRAY: result = packed_window<PackedColorArray>(machine, mutable_subject, subject, buffer, store_start, store_count, load_start, max_count); break;
+		case Variant::PACKED_STRING_ARRAY:
+			if (max_count == 0 && store_count == 0) {
+				result = VariantInternal::get_internal_value<PackedStringArray>(&subject)->size();
+				break;
+			}
+			[[fallthrough]];
+		default:
+			throw std::runtime_error("Array window: " + std::string(GuestVariant::type_name(type)) +
+				" is not a typed array");
+	}
+	machine.set_result(result);
 }
 
 APICALL(api_dict_ops) {
@@ -4321,6 +4722,7 @@ void Sandbox::initialize_syscalls() {
 			{ ECALL_ARRAY_AT, api_array_at },
 			{ ECALL_ARRAY_SIZE, api_array_size },
 			{ ECALL_ARRAY_BATCH, api_array_batch },
+			{ ECALL_ARRAY_WINDOW, api_array_window },
 
 			{ ECALL_DICTIONARY_OPS, api_dict_ops },
 

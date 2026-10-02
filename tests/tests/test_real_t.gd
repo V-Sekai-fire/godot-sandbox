@@ -21,6 +21,16 @@ func test_keys_through_to_vector():
 	s.free()
 
 
+func test_vectors_as_unboxed_arguments():
+	var s = Sandbox.FromProgram(Sandbox_TestsTests)
+	var third := 1.0 / 3.0
+	var v2 := Vector2(third, -2.5)
+	var v3 := Vector3(third, 2.0, -third)
+	var v4 := Vector4(third, 2.0, 3.0, -third)
+	var p := Plane(Vector3(third, 2.0, 3.0), -third)
+	assert_eq(s.vmcall("test_real_t_vectors", v2, v3, v4, p, 42), [v2, v3, v4, p, 42])
+	s.free()
+
 func test_numbers_through_a_compiled_gdscript():
 	var script := SafeGDScript.new()
 	script.set_source_code("extends Node\n\nfunc read(d: Dictionary, a: Array) -> Array:\n" +

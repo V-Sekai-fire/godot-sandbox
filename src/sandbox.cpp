@@ -1394,6 +1394,11 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 	machine_t &machine = this->machine();
 	int index = 11;
 	int flindex = 10;
+	// Structs larger than 16 bytes are passed as a pointer to a copy
+	auto pass_by_reference = [&](size_t i, const Variant &arg) -> gaddr_t {
+		v[i + 1].set(*this, arg, true);
+		return arrayDataPtr + (i + 1) * sizeof(GuestVariant) + offsetof(GuestVariant, v);
+	};
 
 	for (size_t i = 0; i < argc; i++) {
 		const Variant &arg = *args[i];
@@ -1414,8 +1419,13 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 				machine.cpu.registers().getfl(flindex++).set_double(inner->flt);
 				break;
 			case Variant::VECTOR2: { // 8- or 16-byte structs can be passed in registers
-				machine.cpu.registers().getfl(flindex++).set_float(inner->vec2_flt[0]);
-				machine.cpu.registers().getfl(flindex++).set_float(inner->vec2_flt[1]);
+				if constexpr (sizeof(real_t) == sizeof(float)) {
+					machine.cpu.registers().getfl(flindex++).set_float(inner->vec2_flt[0]);
+					machine.cpu.registers().getfl(flindex++).set_float(inner->vec2_flt[1]);
+				} else {
+					machine.cpu.registers().getfl(flindex++).set_double(inner->vec2_flt[0]);
+					machine.cpu.registers().getfl(flindex++).set_double(inner->vec2_flt[1]);
+				}
 				break;
 			}
 			case Variant::VECTOR2I: { // 8- or 16-byte structs can be passed in registers
@@ -1423,8 +1433,12 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 				break;
 			}
 			case Variant::VECTOR3: {
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec3_flt[0];
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec3_flt[2];
+				if constexpr (sizeof(real_t) == sizeof(float)) {
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec3_flt[0];
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec3_flt[2];
+				} else {
+					machine.cpu.reg(index++) = pass_by_reference(i, arg);
+				}
 				break;
 			}
 			case Variant::VECTOR3I: {
@@ -1433,8 +1447,12 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 				break;
 			}
 			case Variant::VECTOR4: {
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[0];
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[2];
+				if constexpr (sizeof(real_t) == sizeof(float)) {
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[0];
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[2];
+				} else {
+					machine.cpu.reg(index++) = pass_by_reference(i, arg);
+				}
 				break;
 			}
 			case Variant::VECTOR4I: {
@@ -1450,8 +1468,12 @@ void Sandbox::setup_arguments_native(gaddr_t arrayDataPtr, GuestVariant *v, cons
 				break;
 			}
 			case Variant::PLANE: {
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[0];
-				machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[2];
+				if constexpr (sizeof(real_t) == sizeof(float)) {
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[0];
+					machine.cpu.reg(index++) = *(gaddr_t *)&inner->vec4_flt[2];
+				} else {
+					machine.cpu.reg(index++) = pass_by_reference(i, arg);
+				}
 				break;
 			}
 			case Variant::OBJECT: { // Objects are represented as uintptr_t
