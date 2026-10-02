@@ -1,4 +1,7 @@
 #include "sandbox.h"
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 
 #ifndef SAFEGDSCRIPT_DISABLED
 #include "safegdscript/signature_info.h"
@@ -1031,7 +1034,43 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 		}
 #endif
 
+#ifdef RISCV_BINARY_TRANSLATION
+		// GODOT_SANDBOX_BINTR_EMIT=<dir>: besides looking the translation up,
+		// write it out as standalone C99, <dir>/bintr-<HASH>.c, in the shared-
+		// library form the hash cache loads (libriscv's result_shared_c99: the
+		// translation's defines, its code and the dylib footer; not the
+		// self-registering embeddable form, which the cache refuses). A
+		// compiler turns it into the cache's bintr-<HASH>.so. Every block goes
+		// in: the per-object limits are for a JIT deciding what is worth
+		// compiling now, not for a translation baked ahead of time. Only while
+		// the lookup is enabled, so a translated program is never emitted again.
+		static thread_local std::string emitted_c99;
+		const char *emit_dir = std::getenv("GODOT_SANDBOX_BINTR_EMIT");
+		emitted_c99.clear();
+		if (emit_dir != nullptr && bintr_lookup) {
+			riscv::MachineTranslationEmbeddableCodeOptions embed;
+			embed.result_shared_c99 = &emitted_c99;
+			options->cross_compile.push_back(embed);
+			options->translate_blocks_max = 1u << 24;
+			options->translate_instr_max = 1u << 30;
+		}
+#endif
 		this->m_machine = new machine_t{ binary_view, *options };
+#ifdef RISCV_BINARY_TRANSLATION
+		if (emit_dir != nullptr && !emitted_c99.empty()) {
+			char name[32];
+			std::snprintf(name, sizeof(name), "/bintr-%08X.c",
+					unsigned(this->m_machine->memory.exec_segment_for(this->m_machine->memory.start_address())->translation_hash()));
+			const std::string path = std::string(emit_dir) + name;
+			if (FILE *f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+				std::fwrite(emitted_c99.data(), 1, emitted_c99.size(), f);
+				std::fclose(f);
+			} else {
+				ERR_PRINT(String("Sandbox: cannot write ") + path.c_str());
+			}
+			emitted_c99.clear();
+		}
+#endif
 		this->m_machine->set_options(std::move(options));
 	} catch (const std::exception &e) {
 		ERR_PRINT(("Sandbox construction exception: " + std::string(e.what())).c_str());
