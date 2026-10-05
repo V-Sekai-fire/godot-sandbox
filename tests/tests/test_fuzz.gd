@@ -48,22 +48,26 @@ func _make_sandbox() -> Sandbox:
 	add_child_autofree(s)
 	return s
 
+# The seed is chosen and printed before the run, so a crash inside assault() still names
+# the seed that replays it.
+func _assault(s: Sandbox, target: String) -> Dictionary:
+	var fuzz_seed := randi()
+	gut.p("fuzzing %s with seed %d" % [target, fuzz_seed])
+	return s.assault("%s:%d" % [target, fuzz_seed], ITERATIONS)
+
 func test_fuzz_guest_variants():
 	var s := _make_sandbox()
-	var r: Dictionary = s.assault("variants", ITERATIONS)
+	var r: Dictionary = _assault(s, "variants")
 	assert_eq(r["iterations"], ITERATIONS, "every GuestVariant was converted")
 	assert_gt(r["exceptions"], 0, "hostile GuestVariants are rejected, not accepted")
 
 func test_fuzz_syscalls():
 	var s := _make_sandbox()
-	var r: Dictionary = s.assault("syscalls", ITERATIONS)
+	var r: Dictionary = _assault(s, "syscalls")
 	assert_eq(r["iterations"], ITERATIONS, "every system call was driven")
 
 	var coverage: Dictionary = r["coverage"]
 	assert_gt(coverage.size(), 40, "the run reached almost every system call")
-
-	# Seed %s is printed so a failure below can be replayed with "syscalls:<seed>".
-	gut.p("fuzzing seed: %s" % r["seed"])
 
 	# Every handler has to be reached, or the run proves nothing about it. The
 	# bound is ECALL_LAST: a system call added without extending it here is one
@@ -182,7 +186,7 @@ func test_fuzz_packed_calls_refuse_a_non_packed_subject():
 
 func test_fuzz_syscalls_respect_restrictions():
 	var s := _make_sandbox()
-	var r: Dictionary = s.assault("syscalls", ITERATIONS)
+	var r: Dictionary = _assault(s, "syscalls")
 	var coverage: Dictionary = r["coverage"]
 
 	for syscall in ALWAYS_REFUSED:
