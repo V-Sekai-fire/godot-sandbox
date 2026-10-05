@@ -457,6 +457,7 @@ IRProgram CodeGenerator::generate(const Program& program) {
 	m_global_structs.clear();
 	m_global_traits.clear();
 	m_global_array_element_structs.clear();
+	m_global_array_element_types.clear();
 	m_global_dictionary_value_structs.clear();
 	m_global_array_element_traits.clear();
 	m_global_dictionary_value_traits.clear();
@@ -505,6 +506,9 @@ IRProgram CodeGenerator::generate(const Program& program) {
 			dictionary_value_trait = find_trait(global.type_hint.arguments[1].sole_name());
 		}
 		m_global_array_element_structs.push_back(array_element);
+		m_global_array_element_types.push_back(
+			global.type_hint.single_name() == "Array" && global.type_hint.arguments.size() == 1
+				? single_type_from(global.type_hint.arguments[0]) : IRInstruction::TypeHint_NONE);
 		m_global_dictionary_value_structs.push_back(dictionary_value);
 		m_global_array_element_traits.push_back(array_element_trait);
 		m_global_dictionary_value_traits.push_back(dictionary_value_trait);
@@ -648,7 +652,7 @@ IRProgram CodeGenerator::generate(const Program& program) {
 			bool folded = fold_global_initializer(global.initializer.get(), ir_global);
 			// Empty Array literals need the same packed-array conversion as nonempty ones.
 			const auto declared = global.type_hint.nullable
-				? Variant::type_from_name(global.type_hint.sole_name()) : m_global_types[i];
+				? IRInstruction::TypeHint(Variant::type_from_name(global.type_hint.sole_name())) : m_global_types[i];
 			if (folded && ir_global.init_type == IRGlobalVar::InitType::EMPTY_ARRAY &&
 				packed_array_constructor_name(declared) != nullptr) {
 				folded = false;
@@ -1261,8 +1265,9 @@ void CodeGenerator::gen_var_decl(const VarDeclStmt* stmt, FunctionContext& func,
 			func.declared_structs[reg] = declared_struct;
 		}
 	}
-	if (accepted_type.empty() && stmt->initializer != nullptr && !declared_variant) {
-		func.reclassifiable_registers.insert(reg);
+	if (accepted_type.empty() && stmt->initializer != nullptr && !declared_variant &&
+		!stmt->infer_type) {
+		find_variable(func, stmt->name)->inferred = true;
 	}
 }
 
@@ -1429,7 +1434,20 @@ void CodeGenerator::gen_store_to_variable(const std::string& name, int value_reg
 		set_register_type(func, var->register_num, IRInstruction::TypeHint_NONE);
 	} else {
 		reject_reclassification(*var, value_reg, func, site);
-		value_reg = coerce_to_declared_type(value_reg, get_register_type(func, var->register_num), func,
+		const IRInstruction::TypeHint held = get_register_type(func, var->register_num);
+		if (var->inferred && get_register_type(func, value_reg) == IRInstruction::TypeHint_NONE &&
+			(held == Variant::INT || held == Variant::FLOAT || held == Variant::BOOL))
+		{
+			// The run-time half of reject_reclassification: COERCE would truncate
+			// a float into an inferred int slot, where GDScript keeps the float.
+			// Admit only what the compile-time check admits, the widenings.
+			TypeSet accepted{uint64_t(1) << held};
+			if (held != Variant::BOOL) accepted.mask |= uint64_t(1) << Variant::BOOL;
+			if (held == Variant::FLOAT) accepted.mask |= uint64_t(1) << Variant::INT;
+			value_reg = coerce_to_declared_type(value_reg, accepted, func,
+				"variable '" + name + "'", site, TypeSet{uint64_t(1) << held}.to_string());
+		}
+		value_reg = coerce_to_declared_type(value_reg, held, func,
 			"variable '" + name + "'", site);
 	}
 
@@ -1775,6 +1793,9 @@ void CodeGenerator::gen_return(const ReturnStmt* stmt, FunctionContext& func) {
 		func.ir.instructions.emplace_back(IROpcode::LOAD_NIL, IRValue::reg(0));
 	}
 
+	if (!func.open_array_windows.empty()) {
+		emit_array_window_exits(func);
+	}
 	func.ir.instructions.emplace_back(IROpcode::RETURN);
 }
 
@@ -2703,6 +2724,10 @@ void CodeGenerator::gen_pattern_test(const MatchPattern& pattern, int subject_re
 				it != func.array_element_structs.end()) {
 				func.array_element_structs[bound_reg] = it->second;
 			}
+			if (auto it = func.array_element_types.find(subject_reg);
+				it != func.array_element_types.end()) {
+				func.array_element_types[bound_reg] = it->second;
+			}
 			if (auto it = func.dictionary_value_structs.find(subject_reg);
 				it != func.dictionary_value_structs.end()) {
 				func.dictionary_value_structs[bound_reg] = it->second;
@@ -3221,6 +3246,46 @@ void CodeGenerator::gen_for(const ForStmt* stmt, FunctionContext& func) {
 			gen_array_walk(stmt, array_reg, func, iterable_element, iterable_trait);
 			return;
 		}
+		if (m_batch_iteration && !func.ir.is_coroutine && packed_walk) {
+			pop_scope(func);
+			func.loops.pop_back();
+			if (gen_packed_walk(stmt, array_reg, func)) return;
+			func.loops.push_back({end_label, continue_label});
+			push_scope(func);
+		}
+		// An untyped packed array is walked in batches, as an Array is, when
+		// nothing in the body can write it. The body is emitted twice: the
+		// four-way loop below is the walk of everything else.
+		std::string packed_done_label;
+		int packed_reg = -1;
+		bool writes_packed = false;
+		std::vector<ArrayWindowPlan> unused_plans;
+		if (unknown_iterable && m_batch_iteration && !func.ir.is_coroutine &&
+			plan_array_windows(stmt, func, unused_plans, {}, &writes_packed) && !writes_packed) {
+			pop_scope(func);
+			func.loops.pop_back();
+			// The walk is over the value the loop began with.
+			packed_reg = alloc_register(func);
+			func.ir.instructions.emplace_back(IROpcode::MOVE, IRValue::reg(packed_reg),
+				IRValue::reg(array_reg));
+			int64_t packed_types = 0;
+			for (int type = 0; type < int(Variant::VARIANT_MAX); type++) {
+				if (is_packed_array_type(IRInstruction::TypeHint(type))) packed_types |= int64_t(1) << type;
+			}
+			const int is_packed_reg = alloc_register(func);
+			func.ir.instructions.emplace_back(IROpcode::TYPE_TEST_MASK, IRValue::reg(is_packed_reg),
+				IRValue::reg(packed_reg), IRValue::imm(packed_types)).type_hint = Variant::BOOL;
+			set_register_type(func, is_packed_reg, Variant::BOOL);
+			const std::string not_packed_label = make_label("for_not_packed");
+			packed_done_label = make_label("for_packed_done");
+			emit_conditional_branch(IROpcode::BRANCH_ZERO, is_packed_reg, not_packed_label, func);
+			free_register(func, is_packed_reg);
+			gen_array_walk(stmt, packed_reg, func, iterable_element, iterable_trait);
+			func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(packed_done_label));
+			func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(not_packed_label));
+			func.loops.push_back({end_label, continue_label});
+			push_scope(func);
+		}
 
 		// Float joins the int arm: ceil(f) replaces the bound before the loop.
 		int is_float_reg = -1;
@@ -3477,6 +3542,10 @@ void CodeGenerator::gen_for(const ForStmt* stmt, FunctionContext& func) {
 		free_register(func, one_reg);
 		free_register(func, index_reg);
 		free_register(func, elem_reg);
+		if (!packed_done_label.empty()) {
+			func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(packed_done_label));
+			free_register(func, packed_reg);
+		}
 		return;
 	}
 
@@ -3617,6 +3686,141 @@ void CodeGenerator::gen_array_walk(const ForStmt* stmt, int array_reg, FunctionC
 	free_register(func, one_reg);
 	free_register(func, batch_index_reg);
 	free_register(func, index_reg);
+}
+
+// `for v in <packed array>`: the walk is a counting loop over a window, so an
+// element costs a bounds compare and a load where it cost a size() and a get()
+// VCALL. GDScript's loop shares the array rather than copying it, so the body
+// must pass the same gate a counting loop's windows do: then nothing but the
+// window itself can resize or rewrite the array, the size taken on entry holds,
+// and `a[k] = x` in the body goes through the very window the walk reads.
+// False when the gate refuses; nothing has been emitted then.
+bool CodeGenerator::gen_packed_walk(const ForStmt* stmt, int array_reg, FunctionContext& func) {
+	const IRInstruction::TypeHint container = get_register_type(func, array_reg);
+	IRInstruction::TypeHint element;
+	ArrayWindowLayout layout;
+	if (!array_window_layout(container, IRInstruction::TypeHint_NONE, element, layout)) {
+		return false;
+	}
+	// A variable walked is also one the body may index: both share one window.
+	std::string iterated;
+	if (const auto* variable = dynamic_cast<const VariableExpr*>(stmt->iterable.get());
+		variable != nullptr && array_window_element(variable->name, func) != IRInstruction::TypeHint_NONE) {
+		iterated = variable->name;
+	}
+	const std::string loop_label = make_label("packed_loop");
+	const std::string continue_label = make_label("packed_continue");
+	const std::string end_label = make_label("packed_end");
+	func.loops.push_back({ end_label, continue_label });
+	push_scope(func);
+	// Declared before planning: the gate asks what `v.x` is a member of.
+	const int elem_reg = alloc_register(func);
+	set_register_type(func, elem_reg, element);
+	declare_variable(func, stmt->variable, elem_reg, false, stmt);
+	const auto refuse = [&]() {
+		pop_scope(func);
+		func.ir.debug_locals.pop_back(); // the fallback declares it again
+		func.loops.pop_back();
+		free_register(func, elem_reg);
+		return false;
+	};
+
+	std::vector<ArrayWindowPlan> plans;
+	if (!plan_array_windows(stmt, func, plans, iterated)) return refuse();
+	// Packed arrays are shared by Variant copies too. A window written under
+	// another name could be the walked array, behind this window's back.
+	const auto container_of = [&](const std::string& name) -> IRInstruction::TypeHint {
+		if (Variable* local = find_variable(func, name)) return get_register_type(func, local->register_num);
+		if (auto it = m_global_variables.find(name); it != m_global_variables.end()) return m_global_types[it->second];
+		return IRInstruction::TypeHint_NONE;
+	};
+	const bool walked_written = std::any_of(plans.begin(), plans.end(), [&](const ArrayWindowPlan& plan) {
+		return plan.name == iterated && plan.written;
+	});
+	for (const ArrayWindowPlan& plan : plans) {
+		if (plan.name != iterated && (plan.written || walked_written) && container_of(plan.name) == container) {
+			return refuse();
+		}
+	}
+
+	std::vector<FunctionContext::ArrayWindowUse> windows = open_array_windows(plans, stmt, func);
+	FunctionContext::ArrayWindowUse walked;
+	if (!iterated.empty()) {
+		Variable* local = find_variable(func, iterated);
+		auto it = local != nullptr ? func.array_windows.find(local->register_num) : func.array_windows.end();
+		if (it != func.array_windows.end()) walked = it->second;
+	}
+	if (walked.array_reg < 0) {
+		// A value nothing else names: a window of its own, read only.
+		walked.token = func.next_array_window_id++;
+		walked.element_type = element;
+		walked.array_reg = array_reg;
+		func.ir.array_windows.push_back({ walked.token, uint32_t(element), uint8_t(layout) });
+		func.ir.instructions.emplace_back(IROpcode::WINDOW_OPEN, IRValue::imm(walked.token));
+		func.open_array_windows.push_back(walked);
+		windows.push_back(walked);
+	}
+
+	const auto int_const = [&](int64_t value) {
+		const int reg = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::LOAD_IMM, IRValue::reg(reg),
+			IRValue::imm(value)).type_hint = Variant::INT;
+		set_register_type(func, reg, Variant::INT);
+		return reg;
+	};
+	const int index_reg = int_const(0);
+	const int one_reg = int_const(1);
+	const int size_reg = alloc_register(func);
+	IRInstruction size(IROpcode::CALL_SYSCALL);
+	size.operands.push_back(IRValue::reg(size_reg));
+	size.operands.push_back(IRValue::imm(ECALL_ARRAY_WINDOW));
+	size.operands.push_back(IRValue::reg(walked.array_reg));
+	size.type_hint = Variant::INT;
+	func.ir.instructions.push_back(size);
+	set_register_type(func, size_reg, Variant::INT);
+
+	const int scope_id = open_scope(func);
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(loop_label));
+	emit_scope_release(scope_id, func);
+	const int cond_reg = alloc_register(func);
+	func.ir.instructions.emplace_back(IROpcode::CMP_LT, IRValue::reg(cond_reg),
+		IRValue::reg(index_reg), IRValue::reg(size_reg)).type_hint = Variant::INT;
+	set_register_type(func, cond_reg, Variant::BOOL);
+	emit_conditional_branch(IROpcode::BRANCH_ZERO, cond_reg, end_label, func);
+	free_register(func, cond_reg);
+
+	IRInstruction get(IROpcode::WINDOW_GET, IRValue::reg(elem_reg), IRValue::reg(walked.array_reg),
+		IRValue::reg(index_reg));
+	get.operands.push_back(IRValue::imm(walked.token));
+	func.ir.instructions.push_back(get);
+
+	push_scope(func);
+	for (const auto& body_stmt : stmt->body) gen_stmt(body_stmt.get(), func);
+	pop_scope(func);
+
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(continue_label));
+	func.ir.instructions.emplace_back(IROpcode::ADD, IRValue::reg(index_reg),
+		IRValue::reg(index_reg), IRValue::reg(one_reg)).type_hint = Variant::INT;
+	func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(loop_label));
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(end_label));
+	close_array_windows(windows, func);
+	emit_scope_release(scope_id, func);
+
+	pop_scope(func);
+	for (const FunctionContext::ArrayWindowUse& window : windows) {
+		if (window.written && !window.member.empty()) {
+			LValue member;
+			member.kind = LValue::Kind::GLOBAL;
+			member.name = window.member;
+			store_lvalue(member, window.array_reg, func, stmt);
+		}
+	}
+	func.loops.pop_back();
+	free_register(func, elem_reg);
+	free_register(func, size_reg);
+	free_register(func, one_reg);
+	free_register(func, index_reg);
+	return true;
 }
 
 // `for c in <String>`: the characters come in batches, so the walk costs one
@@ -3937,6 +4141,12 @@ void CodeGenerator::gen_numeric_for(const ForStmt* stmt, int start_reg, int end_
 	}
 	const IRInstruction::TypeHint numeric = float_loop ? Variant::FLOAT : Variant::INT;
 
+	std::vector<FunctionContext::ArrayWindowUse> windows;
+	if (m_batch_iteration && !func.ir.is_coroutine &&
+		get_register_type(func, loop_var_reg) == Variant::INT) {
+		windows = open_array_windows(stmt, func);
+	}
+
 	const int scope_id = open_scope(func);
 	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(loop_label));
 	emit_scope_release(scope_id, func);
@@ -4017,9 +4227,18 @@ void CodeGenerator::gen_numeric_for(const ForStmt* stmt, int start_reg, int end_
 
 	func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(loop_label));
 	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(end_label));
+	close_array_windows(windows, func);
 	emit_scope_release(scope_id, func);
 
 	pop_scope(func);
+	for (const FunctionContext::ArrayWindowUse& window : windows) {
+		if (window.written && !window.member.empty()) {
+			LValue member;
+			member.kind = LValue::Kind::GLOBAL;
+			member.name = window.member;
+			store_lvalue(member, window.array_reg, func, stmt);
+		}
+	}
 	func.loops.pop_back();
 	free_register(func, start_reg);
 	free_register(func, end_reg);
@@ -4578,9 +4797,6 @@ int CodeGenerator::gen_variable(const VariableExpr* expr, FunctionContext& func,
 		if (type != IRInstruction::TypeHint_NONE) {
 			set_register_type(func, new_reg, type);
 		}
-		if (func.reclassifiable_registers.count(local->register_num) != 0) {
-			func.reclassifiable_registers.insert(new_reg);
-		}
 		if (func.string_character_registers.count(local->register_num) != 0) {
 			func.string_character_registers.insert(new_reg);
 		}
@@ -4603,6 +4819,15 @@ int CodeGenerator::gen_variable(const VariableExpr* expr, FunctionContext& func,
 		if (auto it = func.array_element_structs.find(local->register_num);
 			it != func.array_element_structs.end()) {
 			func.array_element_structs[new_reg] = it->second;
+		}
+		if (auto it = func.array_element_types.find(local->register_num);
+			it != func.array_element_types.end()) {
+			func.array_element_types[new_reg] = it->second;
+		}
+		// The copy names the same array, so it reaches the same window.
+		if (auto it = func.array_windows.find(local->register_num);
+			it != func.array_windows.end()) {
+			func.array_windows[new_reg] = it->second;
 		}
 		if (auto it = func.dictionary_value_structs.find(local->register_num);
 			it != func.dictionary_value_structs.end()) {
@@ -4729,6 +4954,9 @@ int CodeGenerator::gen_variable(const VariableExpr* expr, FunctionContext& func,
 		}
 		if (m_global_array_element_structs[global_idx] != nullptr) {
 			func.array_element_structs[result_reg] = m_global_array_element_structs[global_idx];
+		}
+		if (m_global_array_element_types[global_idx] != IRInstruction::TypeHint_NONE) {
+			func.array_element_types[result_reg] = m_global_array_element_types[global_idx];
 		}
 		if (m_global_dictionary_value_structs[global_idx] != nullptr) {
 			func.dictionary_value_structs[result_reg] =
@@ -5634,8 +5862,6 @@ int CodeGenerator::gen_binary(const BinaryExpr* expr, FunctionContext& func) {
 	// Godot promotes a mixed numeric pair to FLOAT. Make that conversion
 	// explicit so the backend receives a homogeneous, fully typed operation.
 	if (((is_arithmetic && expr->op != BinaryExpr::Op::MOD) || is_comparison) &&
-		func.reclassifiable_registers.count(left_reg) == 0 &&
-		func.reclassifiable_registers.count(right_reg) == 0 &&
 		((left_type == Variant::INT && right_type == Variant::FLOAT) ||
 		 (left_type == Variant::FLOAT && right_type == Variant::INT)))
 	{
@@ -5731,11 +5957,6 @@ int CodeGenerator::gen_binary(const BinaryExpr* expr, FunctionContext& func) {
 	instr.lhs_type_hint = left_type;
 	instr.rhs_type_hint = right_type;
 	func.ir.instructions.push_back(instr);
-	if (func.reclassifiable_registers.count(left_reg) != 0 ||
-		func.reclassifiable_registers.count(right_reg) != 0)
-	{
-		func.reclassifiable_registers.insert(result_reg);
-	}
 
 	if (expr->op == BinaryExpr::Op::IN) {
 		set_register_type(func, result_reg, Variant::BOOL);
@@ -6768,6 +6989,15 @@ void CodeGenerator::gen_builtin_method(const BuiltinMethod& method, int result_r
 	const int size_reg = method.empty_test ? alloc_register(func) : result_reg;
 
 	switch (method.lowering) {
+		case MethodLowering::PACKED_SIZE: {
+			IRInstruction call(IROpcode::CALL_SYSCALL);
+			call.operands.push_back(IRValue::reg(size_reg));
+			call.operands.push_back(IRValue::imm(ECALL_ARRAY_WINDOW));
+			call.operands.push_back(IRValue::reg(obj_reg));
+			call.type_hint = Variant::INT;
+			func.ir.instructions.push_back(call);
+			break;
+		}
 		case MethodLowering::ARRAY_SIZE:
 		case MethodLowering::STRING_SIZE: {
 			if (method.lowering == MethodLowering::STRING_SIZE &&
@@ -8603,6 +8833,10 @@ void CodeGenerator::apply_declared_type(int reg, const TypeExpr& type_hint, Func
 		set_register_type(func, reg, type);
 	}
 	if (type_hint.single_name() == "Array" && type_hint.arguments.size() == 1) {
+		if (const IRInstruction::TypeHint element = single_type_from(type_hint.arguments[0]);
+			element != IRInstruction::TypeHint_NONE) {
+			func.array_element_types[reg] = element;
+		}
 		if (const StructDecl* element = find_struct(type_hint.arguments[0].single_name())) {
 			func.array_element_structs[reg] = element;
 		}
@@ -9474,6 +9708,17 @@ void CodeGenerator::reject_reclassification(const Variable& var, int value_reg,
 	}
 	if (constructs_implicitly_from(incoming, held)) {
 		return;
+	}
+	if (held == Variant::INT && incoming == Variant::FLOAT) {
+		// A declared int (`: int` or `:=`) is the declared-type check's to refuse.
+		if (!var.inferred) {
+			return;
+		}
+		error_at("Variable '" + var.name + "' was inferred as int from its initializer and "
+			"is being assigned a float. Reclassification is disabled in SafeGDScript", site,
+			"GDScript would turn '" + var.name + "' into a float here. Initialize it with a "
+			"float ('var " + var.name + " = 0.0') to keep the fraction, or truncate "
+			"explicitly with int(...)");
 	}
 	error_at("Variable '" + var.name + "' has type " + std::string(variant_type_name(held)) +
 		" and is being assigned a value of type " + std::string(variant_type_name(incoming)) +
@@ -10579,6 +10824,15 @@ void CodeGenerator::gen_variant_get(int dest, int obj_reg, int idx_reg, Function
 int CodeGenerator::gen_element_read(int obj_reg, int idx_reg, FunctionContext& func,
 	const Expr* site)
 {
+	if (auto it = func.array_windows.find(obj_reg); it != func.array_windows.end()) {
+		return gen_window_read(it->second, obj_reg, idx_reg, func, site);
+	}
+	return gen_element_read_direct(obj_reg, idx_reg, func, site);
+}
+
+int CodeGenerator::gen_element_read_direct(int obj_reg, int idx_reg, FunctionContext& func,
+	const Expr* site)
+{
 	if (get_register_type(func, obj_reg) == Variant::STRING) {
 		int result_reg = alloc_register(func);
 		gen_string_at(result_reg, obj_reg, idx_reg, func, site);
@@ -10610,6 +10864,17 @@ int CodeGenerator::gen_element_read(int obj_reg, int idx_reg, FunctionContext& f
 
 bool CodeGenerator::gen_element_store(int obj_reg, int idx_reg, int value_reg, FunctionContext& func,
 	const Expr* site)
+{
+	if (auto it = func.array_windows.find(obj_reg); it != func.array_windows.end()) {
+		// The window writes back when the loop leaves; the variable keeps its handle.
+		gen_window_store(it->second, obj_reg, idx_reg, value_reg, func, site);
+		return false;
+	}
+	return gen_element_store_direct(obj_reg, idx_reg, value_reg, func, site);
+}
+
+bool CodeGenerator::gen_element_store_direct(int obj_reg, int idx_reg, int value_reg,
+	FunctionContext& func, const Expr* site)
 {
 	// Guest Strings are shared handles; character mutation would alias.
 	if (get_register_type(func, obj_reg) == Variant::STRING) {
@@ -10644,6 +10909,585 @@ bool CodeGenerator::gen_element_store(int obj_reg, int idx_reg, int value_reg, F
 		default:
 			return true;
 	}
+}
+
+// -= Typed array windows =-
+//
+// `for i in range(n): s += a[i]` pays an ecall per element when `a[i]` is a
+// host access, which no JIT can make cheaper than GDScript's own loop. When `a`
+// is a typed array -- a numeric, vector or Color packed array, or Array[T] of
+// such a T -- the loop instead keeps up to 256 raw elements in a frame buffer
+// (IRFunction::array_windows) and an element costs a bounds compare and a load.
+// A miss refills the window with one ecall that also writes back what the loop
+// changed, and a refill that comes back empty leaves the index to the ordinary
+// access, which wraps a negative index or throws as it always did.
+//
+// Nothing outside the loop may see the array while the window holds it, so the
+// body must touch it only as `a[k]`, `a.size()` or `len(a)`, and may run nothing
+// that could reach it another way: no calls but pure globals and constructors,
+// no await, no lambda, no match. Every exit writes the window back -- the end
+// label that `break` also takes, and each `return`. An error thrown inside the
+// body loses writes still in the window; the function does not continue anyway.
+
+bool CodeGenerator::array_window_layout(IRInstruction::TypeHint container,
+	IRInstruction::TypeHint array_element, IRInstruction::TypeHint& element, ArrayWindowLayout& layout)
+{
+	switch (container) {
+		case Variant::PACKED_BYTE_ARRAY: element = Variant::INT; layout = ArrayWindowLayout::U8; return true;
+		case Variant::PACKED_INT32_ARRAY: element = Variant::INT; layout = ArrayWindowLayout::I32; return true;
+		case Variant::PACKED_INT64_ARRAY: element = Variant::INT; layout = ArrayWindowLayout::I64; return true;
+		case Variant::PACKED_FLOAT32_ARRAY: element = Variant::FLOAT; layout = ArrayWindowLayout::F32; return true;
+		case Variant::PACKED_FLOAT64_ARRAY: element = Variant::FLOAT; layout = ArrayWindowLayout::F64; return true;
+		case Variant::PACKED_VECTOR2_ARRAY: element = Variant::VECTOR2; layout = ArrayWindowLayout::RAW; return true;
+		case Variant::PACKED_VECTOR3_ARRAY: element = Variant::VECTOR3; layout = ArrayWindowLayout::RAW; return true;
+		case Variant::PACKED_VECTOR4_ARRAY: element = Variant::VECTOR4; layout = ArrayWindowLayout::RAW; return true;
+		case Variant::PACKED_COLOR_ARRAY: element = Variant::COLOR; layout = ArrayWindowLayout::RAW; return true;
+		case Variant::ARRAY:
+			element = array_element;
+			switch (array_element) {
+				case Variant::BOOL: layout = ArrayWindowLayout::U8; return true;
+				case Variant::INT: layout = ArrayWindowLayout::I64; return true;
+				case Variant::FLOAT: layout = ArrayWindowLayout::F64; return true;
+				case Variant::VECTOR2:
+				case Variant::VECTOR2I:
+				case Variant::VECTOR3:
+				case Variant::VECTOR3I:
+				case Variant::VECTOR4:
+				case Variant::VECTOR4I:
+				case Variant::COLOR:
+					layout = ArrayWindowLayout::RAW;
+					return true;
+				default:
+					return false;
+			}
+		default:
+			return false;
+	}
+}
+
+// What a window over the variable `name` would hold: NONE unless it is a local
+// or a plain member (no accessor runs on its reads) holding a typed array.
+IRInstruction::TypeHint CodeGenerator::array_window_element(const std::string& name,
+	FunctionContext& func, ArrayWindowLayout* layout_out)
+{
+	IRInstruction::TypeHint container = IRInstruction::TypeHint_NONE;
+	IRInstruction::TypeHint array_element = IRInstruction::TypeHint_NONE;
+	if (Variable* local = find_variable(func, name)) {
+		container = get_register_type(func, local->register_num);
+		if (auto it = func.array_element_types.find(local->register_num);
+			it != func.array_element_types.end()) array_element = it->second;
+	} else if (auto it = m_global_variables.find(name); it != m_global_variables.end()) {
+		const size_t index = it->second;
+		if (m_global_consts.count(name) != 0 || !global_setter(index).empty() ||
+			!global_getter(index).empty()) return IRInstruction::TypeHint_NONE;
+		container = m_global_types[index];
+		array_element = m_global_array_element_types[index];
+	} else {
+		return IRInstruction::TypeHint_NONE;
+	}
+	IRInstruction::TypeHint element;
+	ArrayWindowLayout layout;
+	if (!array_window_layout(container, array_element, element, layout)) {
+		return IRInstruction::TypeHint_NONE;
+	}
+	if (layout_out != nullptr) *layout_out = layout;
+	return element;
+}
+
+// False when the body could observe an array some other way. `iterated` names
+// the array a `for v in a` walks, which needs a window whether or not the body
+// indexes it.
+bool CodeGenerator::plan_array_windows(const ForStmt* stmt, FunctionContext& func,
+	std::vector<ArrayWindowPlan>& plans, const std::string& iterated, bool* writes_packed)
+{
+	struct Use {
+		bool subscripted = false;
+		bool written = false;
+		bool other = false; // any use but `x[k]`, `x.size()`, `len(x)`
+		bool sized = false;
+	};
+	std::map<std::string, Use> uses;
+	std::unordered_set<std::string> declared;
+	// `x[k].member`: only a window proves the element is a value.
+	std::unordered_set<std::string> element_receivers;
+	bool escapes = false;
+
+	// Values whose methods and members Godot answers without running a script.
+	const auto value_type = [](IRInstruction::TypeHint type) {
+		return type >= int(Variant::BOOL) && type < int(Variant::OBJECT);
+	};
+	const auto static_type = [&](const std::string& name) -> IRInstruction::TypeHint {
+		if (Variable* local = find_variable(func, name)) {
+			return get_register_type(func, local->register_num);
+		}
+		if (auto it = m_global_variables.find(name); it != m_global_variables.end() &&
+			global_getter(it->second).empty()) {
+			return m_global_types[it->second];
+		}
+		return IRInstruction::TypeHint_NONE;
+	};
+	const auto runs_accessor = [&](const std::string& name, bool store) {
+		if (find_variable(func, name) != nullptr) return false;
+		auto it = m_global_variables.find(name);
+		return it != m_global_variables.end() &&
+			!(store ? global_setter(it->second) : global_getter(it->second)).empty();
+	};
+
+	std::function<void(const Expr*)> expression = [&](const Expr* expr) {
+		if (expr == nullptr || escapes) return;
+		if (dynamic_cast<const LiteralExpr*>(expr) != nullptr) return;
+		if (const auto* variable = dynamic_cast<const VariableExpr*>(expr)) {
+			uses[variable->name].other = true;
+			if (runs_accessor(variable->name, false)) escapes = true;
+			return;
+		}
+		if (const auto* index = dynamic_cast<const IndexExpr*>(expr)) {
+			const auto* object = dynamic_cast<const VariableExpr*>(index->object.get());
+			// An element of an element may be an Object, whose `[]` is a property.
+			if (object == nullptr || index->safe_chain_root) {
+				escapes = true;
+				return;
+			}
+			uses[object->name].subscripted = true;
+			expression(index->index.get());
+			return;
+		}
+		if (const auto* binary = dynamic_cast<const BinaryExpr*>(expr)) {
+			expression(binary->left.get());
+			expression(binary->right.get());
+			return;
+		}
+		if (const auto* unary = dynamic_cast<const UnaryExpr*>(expr)) {
+			expression(unary->operand.get());
+			return;
+		}
+		if (const auto* type_test = dynamic_cast<const TypeTestExpr*>(expr)) {
+			expression(type_test->value.get());
+			return;
+		}
+		if (const auto* cast = dynamic_cast<const CastExpr*>(expr)) {
+			expression(cast->value.get());
+			return;
+		}
+		if (const auto* ternary = dynamic_cast<const TernaryExpr*>(expr)) {
+			expression(ternary->condition.get());
+			expression(ternary->true_value.get());
+			expression(ternary->false_value.get());
+			return;
+		}
+		if (const auto* array = dynamic_cast<const ArrayLiteralExpr*>(expr)) {
+			for (const auto& element : array->elements) expression(element.get());
+			return;
+		}
+		if (const auto* dictionary = dynamic_cast<const DictionaryLiteralExpr*>(expr)) {
+			for (const auto& [key, value] : dictionary->elements) {
+				expression(key.get());
+				expression(value.get());
+			}
+			return;
+		}
+		if (const auto* call = dynamic_cast<const CallExpr*>(expr)) {
+			const std::string& name = call->function_name;
+			if (call->is_node_path_sugar || is_local_function(name) || call->has_named_arguments()) {
+				escapes = true;
+				return;
+			}
+			if (name == "len" && call->arguments.size() == 1) {
+				if (const auto* argument = dynamic_cast<const VariableExpr*>(call->arguments[0].get())) {
+					uses[argument->name].sized = true;
+					return;
+				}
+			}
+			bool pure = false;
+			if (const GlobalFunction* global = find_global_function(name)) {
+				switch (global->kind) {
+					case GlobalKind::NUMERIC:
+					case GlobalKind::INT_OP:
+					case GlobalKind::FLOAT_OP:
+					case GlobalKind::SYSCALL_INT:
+						pure = true;
+						break;
+					// str() and String() stringify, which can run _to_string().
+					case GlobalKind::SYSCALL:
+						pure = global->utility_op != UTILITY_STR;
+						break;
+					case GlobalKind::CAST:
+						pure = name != "String";
+						break;
+					case GlobalKind::PRINT:
+					case GlobalKind::HOST:
+						break;
+				}
+			} else {
+				const Variant::Type constructed = Variant::type_from_name(name);
+				pure = value_type(IRInstruction::TypeHint(constructed)) && constructed != Variant::STRING;
+			}
+			if (!pure) {
+				escapes = true;
+				return;
+			}
+			for (const auto& argument : call->arguments) expression(argument.get());
+			return;
+		}
+		if (const auto* member = dynamic_cast<const MemberCallExpr*>(expr)) {
+			if (member->has_named_arguments()) {
+				escapes = true;
+				return;
+			}
+			if (const auto* object = dynamic_cast<const VariableExpr*>(member->object.get())) {
+				if (member->is_method_call && member->arguments.empty() &&
+					(member->member_name == "size" || member->member_name == "is_empty")) {
+					uses[object->name].sized = true;
+					return;
+				}
+				if (!value_type(static_type(object->name))) {
+					escapes = true;
+					return;
+				}
+				uses[object->name].other = true;
+			} else if (const auto* index = dynamic_cast<const IndexExpr*>(member->object.get());
+				index != nullptr && dynamic_cast<const VariableExpr*>(index->object.get()) != nullptr) {
+				element_receivers.insert(static_cast<const VariableExpr*>(index->object.get())->name);
+				expression(index);
+			} else {
+				escapes = true;
+				return;
+			}
+			for (const auto& argument : member->arguments) expression(argument.get());
+			return;
+		}
+		// Lambdas, await and anything newer: whatever they reach is unknown.
+		escapes = true;
+	};
+
+	std::function<void(const std::vector<StmtPtr>&)> statements;
+	std::function<void(const Stmt*)> statement = [&](const Stmt* body_stmt) {
+		if (escapes) return;
+		if (const auto* expr_stmt = dynamic_cast<const ExprStmt*>(body_stmt)) {
+			expression(expr_stmt->expression.get());
+		} else if (const auto* declaration = dynamic_cast<const VarDeclStmt*>(body_stmt)) {
+			declared.insert(declaration->name);
+			expression(declaration->initializer.get());
+		} else if (const auto* assignment = dynamic_cast<const AssignStmt*>(body_stmt)) {
+			const Expr* target = assignment->target.get();
+			std::string assigned = assignment->name;
+			if (const auto* variable = dynamic_cast<const VariableExpr*>(target)) {
+				assigned = variable->name;
+			}
+			if (!assigned.empty()) {
+				uses[assigned].other = true;
+				if (runs_accessor(assigned, true)) escapes = true;
+			} else if (const auto* index = dynamic_cast<const IndexExpr*>(target);
+				index != nullptr && dynamic_cast<const VariableExpr*>(index->object.get()) != nullptr) {
+				const std::string& name = static_cast<const VariableExpr*>(index->object.get())->name;
+				uses[name].subscripted = true;
+				uses[name].written = true;
+				expression(index->index.get());
+			} else if (const auto* member = dynamic_cast<const MemberCallExpr*>(target);
+				member != nullptr && !member->is_method_call) {
+				// `v.x = ...` rewrites a value in place; `a[i].x = ...` is an
+				// element read and write.
+				if (const auto* object = dynamic_cast<const VariableExpr*>(member->object.get());
+					object != nullptr && find_variable(func, object->name) != nullptr &&
+					value_type(static_type(object->name))) {
+					uses[object->name].other = true;
+				} else if (const auto* index = dynamic_cast<const IndexExpr*>(member->object.get());
+					index != nullptr && dynamic_cast<const VariableExpr*>(index->object.get()) != nullptr) {
+					const std::string& name = static_cast<const VariableExpr*>(index->object.get())->name;
+					element_receivers.insert(name);
+					uses[name].subscripted = true;
+					uses[name].written = true;
+					expression(index->index.get());
+				} else {
+					escapes = true;
+				}
+			} else {
+				escapes = true;
+			}
+			expression(assignment->value.get());
+		} else if (const auto* returned = dynamic_cast<const ReturnStmt*>(body_stmt)) {
+			expression(returned->value.get());
+		} else if (const auto* branch = dynamic_cast<const IfStmt*>(body_stmt)) {
+			if (branch->binding) {
+				declared.insert(branch->binding->name);
+				expression(branch->binding->initializer.get());
+			}
+			expression(branch->condition.get());
+			statements(branch->then_branch);
+			statements(branch->else_branch);
+		} else if (const auto* loop = dynamic_cast<const WhileStmt*>(body_stmt)) {
+			expression(loop->condition.get());
+			statements(loop->body);
+		} else if (const auto* loop = dynamic_cast<const ForStmt*>(body_stmt)) {
+			// Only counting loops: iterating anything else asks the iterable.
+			const auto* range = dynamic_cast<const CallExpr*>(loop->iterable.get());
+			if (range == nullptr || range->function_name != "range" || is_local_function("range")) {
+				escapes = true;
+				return;
+			}
+			declared.insert(loop->variable);
+			for (const auto& argument : range->arguments) expression(argument.get());
+			statements(loop->body);
+		} else if (dynamic_cast<const BreakStmt*>(body_stmt) == nullptr &&
+			dynamic_cast<const ContinueStmt*>(body_stmt) == nullptr &&
+			dynamic_cast<const PassStmt*>(body_stmt) == nullptr &&
+			dynamic_cast<const BreakpointStmt*>(body_stmt) == nullptr) {
+			escapes = true; // match, and anything newer
+		}
+	};
+	statements = [&](const std::vector<StmtPtr>& body) {
+		for (const auto& body_stmt : body) statement(body_stmt.get());
+	};
+	statements(stmt->body);
+	if (escapes) return false;
+	if (!iterated.empty()) uses[iterated].subscripted = true;
+
+	bool shared_written = false; // an Array window the loop writes
+	size_t shared = 0;
+	bool other_array = false;
+	bool other_array_written = false;
+	for (const auto& [name, use] : uses) {
+		const bool candidate = use.subscripted && !use.other && declared.count(name) == 0 &&
+			name != stmt->variable && array_window_element(name, func) != IRInstruction::TypeHint_NONE;
+		if (writes_packed != nullptr && use.written && is_packed_array_type(static_type(name))) {
+			*writes_packed = true;
+		}
+		if (name == iterated && !candidate) return false;
+		if (candidate) {
+			plans.push_back({ name, use.written });
+			if (static_type(name) == Variant::ARRAY) {
+				shared++;
+				shared_written = shared_written || use.written;
+			}
+			continue;
+		}
+		if (element_receivers.count(name) != 0) return false;
+		if (!use.subscripted && !use.sized) continue;
+		// Subscripting or sizing anything else must not run a script either.
+		const IRInstruction::TypeHint type = declared.count(name) != 0
+			? IRInstruction::TypeHint_NONE : static_type(name);
+		if (type == Variant::ARRAY) {
+			other_array = true;
+			other_array_written = other_array_written || use.written;
+		} else if (!(value_type(type) || type == Variant::DICTIONARY || is_packed_array_type(type))) {
+			return false;
+		}
+	}
+	// Arrays are handles: two names may hold the same one. A written window must
+	// be the only way the loop reaches any Array, and no other Array is written.
+	if (shared > 0 && (other_array_written || (shared_written && (shared > 1 || other_array)))) {
+		plans.erase(std::remove_if(plans.begin(), plans.end(), [&](const ArrayWindowPlan& plan) {
+			return static_type(plan.name) == Variant::ARRAY;
+		}), plans.end());
+	}
+	return true;
+}
+
+std::vector<CodeGenerator::FunctionContext::ArrayWindowUse> CodeGenerator::open_array_windows(
+	const ForStmt* stmt, FunctionContext& func)
+{
+	std::vector<ArrayWindowPlan> plans;
+	if (!plan_array_windows(stmt, func, plans)) return {};
+	return open_array_windows(plans, stmt, func);
+}
+
+std::vector<CodeGenerator::FunctionContext::ArrayWindowUse> CodeGenerator::open_array_windows(
+	const std::vector<ArrayWindowPlan>& plans, const ForStmt* stmt, FunctionContext& func)
+{
+	std::vector<FunctionContext::ArrayWindowUse> opened;
+	for (const ArrayWindowPlan& plan : plans) {
+		ArrayWindowLayout layout;
+		const IRInstruction::TypeHint element = array_window_element(plan.name, func, &layout);
+		FunctionContext::ArrayWindowUse use;
+		if (Variable* local = find_variable(func, plan.name)) {
+			// An enclosing loop's window already holds it.
+			if (func.array_windows.count(local->register_num) != 0) continue;
+			use.array_reg = local->register_num;
+		} else {
+			// The loop reads the member through a local, which nothing the body
+			// runs can see; the loop's exits store it back.
+			const VariableExpr member(plan.name);
+			use.array_reg = gen_variable(&member, func);
+			declare_variable(func, plan.name, use.array_reg, false, stmt);
+			use.member = plan.name;
+		}
+		use.token = func.next_array_window_id++;
+		use.element_type = element;
+		use.written = plan.written;
+		func.ir.array_windows.push_back({ use.token, uint32_t(element), uint8_t(layout) });
+		func.ir.instructions.emplace_back(IROpcode::WINDOW_OPEN, IRValue::imm(use.token));
+		func.array_windows[use.array_reg] = use;
+		func.open_array_windows.push_back(use);
+		opened.push_back(use);
+	}
+	return opened;
+}
+
+void CodeGenerator::close_array_windows(const std::vector<FunctionContext::ArrayWindowUse>& windows,
+	FunctionContext& func)
+{
+	for (const FunctionContext::ArrayWindowUse& window : windows) {
+		if (window.written) {
+			func.ir.instructions.emplace_back(IROpcode::WINDOW_FLUSH, IRValue::reg(window.array_reg),
+				IRValue::imm(window.token));
+		}
+		for (auto it = func.array_windows.begin(); it != func.array_windows.end(); ) {
+			if (it->second.token == window.token) it = func.array_windows.erase(it);
+			else ++it;
+		}
+		auto& open = func.open_array_windows;
+		open.erase(std::remove_if(open.begin(), open.end(), [&](const FunctionContext::ArrayWindowUse& use) {
+			return use.token == window.token;
+		}), open.end());
+	}
+}
+
+// A `return` inside windowed loops leaves all of them at once.
+void CodeGenerator::emit_array_window_exits(FunctionContext& func) {
+	for (auto it = func.open_array_windows.rbegin(); it != func.open_array_windows.rend(); ++it) {
+		if (!it->written) continue;
+		func.ir.instructions.emplace_back(IROpcode::WINDOW_FLUSH, IRValue::reg(it->array_reg),
+			IRValue::imm(it->token));
+		if (!it->member.empty()) {
+			LValue member;
+			member.kind = LValue::Kind::GLOBAL;
+			member.name = it->member;
+			store_lvalue(member, it->array_reg, func, nullptr);
+		}
+	}
+}
+
+// The window answers with the array's own register: copies of it hold the same
+// handle, and a copy's MOVE then has no reader left.
+int CodeGenerator::gen_window_read(const FunctionContext::ArrayWindowUse& window, int obj_reg,
+	int idx_reg, FunctionContext& func, const Expr* site)
+{
+	const IRInstruction::TypeHint index_type = get_register_type(func, idx_reg);
+	const int result_reg = alloc_register(func);
+	const auto emit_get = [&]() {
+		IRInstruction get(IROpcode::WINDOW_GET, IRValue::reg(result_reg), IRValue::reg(window.array_reg),
+			IRValue::reg(idx_reg));
+		get.operands.push_back(IRValue::imm(window.token));
+		func.ir.instructions.push_back(get);
+	};
+	if (index_type == Variant::INT) {
+		emit_get();
+		set_register_type(func, result_reg, window.element_type);
+		return result_reg;
+	}
+
+	// Not known to be an int: the ordinary access answers, from an up-to-date
+	// array, unless the index turns out to be one.
+	const std::string slow_label = make_label("window_slow");
+	const std::string done_label = make_label("window_done");
+	if (index_type == IRInstruction::TypeHint_NONE) {
+		const int is_int = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::TYPE_TEST, IRValue::reg(is_int),
+			IRValue::reg(idx_reg), IRValue::imm(int64_t(Variant::INT))).type_hint = Variant::BOOL;
+		set_register_type(func, is_int, Variant::BOOL);
+		emit_conditional_branch(IROpcode::BRANCH_ZERO, is_int, slow_label, func);
+		emit_get();
+		func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(done_label));
+	}
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(slow_label));
+	func.ir.instructions.emplace_back(IROpcode::WINDOW_FLUSH, IRValue::reg(window.array_reg),
+		IRValue::imm(window.token));
+	int element_reg = gen_element_read_direct(obj_reg, idx_reg, func, site);
+	if (get_register_type(func, obj_reg) == Variant::ARRAY) {
+		// Array[T] promises T, but the Array itself may be untyped: check what
+		// reaches a register the rest of the loop reads as a T.
+		uint64_t accepted = uint64_t(1) << window.element_type;
+		if (window.element_type == Variant::FLOAT) accepted |= uint64_t(1) << Variant::INT;
+		const int is_element = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::TYPE_TEST_MASK, IRValue::reg(is_element),
+			IRValue::reg(element_reg), IRValue::imm(int64_t(accepted))).type_hint = Variant::BOOL;
+		set_register_type(func, is_element, Variant::BOOL);
+		const std::string element_ok = make_label("window_element_ok");
+		emit_conditional_branch(IROpcode::BRANCH_NOT_ZERO, is_element, element_ok, func);
+		const char* type_name = "Variant";
+		switch (window.element_type) {
+			case Variant::BOOL: type_name = "bool"; break;
+			case Variant::INT: type_name = "int"; break;
+			case Variant::FLOAT: type_name = "float"; break;
+			case Variant::VECTOR2: type_name = "Vector2"; break;
+			case Variant::VECTOR2I: type_name = "Vector2i"; break;
+			case Variant::VECTOR3: type_name = "Vector3"; break;
+			case Variant::VECTOR3I: type_name = "Vector3i"; break;
+			case Variant::VECTOR4: type_name = "Vector4"; break;
+			case Variant::VECTOR4I: type_name = "Vector4i"; break;
+			case Variant::COLOR: type_name = "Color"; break;
+			default: break;
+		}
+		IRInstruction fail(IROpcode::THROW, ir_str("TypeError"),
+			ir_str("An element of Array[" + std::string(type_name) + "] holds another type"));
+		fail.operands.push_back(IRValue::imm(0));
+		func.ir.instructions.push_back(fail);
+		func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(element_ok));
+		if (window.element_type == Variant::FLOAT) {
+			const int widened = alloc_register(func);
+			func.ir.instructions.emplace_back(IROpcode::COERCE, IRValue::reg(widened),
+				IRValue::reg(element_reg)).type_hint = Variant::FLOAT;
+			element_reg = widened;
+		}
+	}
+	func.ir.instructions.emplace_back(IROpcode::MOVE, IRValue::reg(result_reg), IRValue::reg(element_reg));
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(done_label));
+	set_register_type(func, result_reg, window.element_type);
+	return result_reg;
+}
+
+void CodeGenerator::gen_window_store(const FunctionContext::ArrayWindowUse& window, int obj_reg,
+	int idx_reg, int value_reg, FunctionContext& func, const Expr* site)
+{
+	const IRInstruction::TypeHint index_type = get_register_type(func, idx_reg);
+	const IRInstruction::TypeHint value_type = get_register_type(func, value_reg);
+	const IRInstruction::TypeHint element = window.element_type;
+	// The window takes a T as is, and widens what assigning one into Array[T]
+	// would widen. Anything else keeps the ordinary assignment's conversions.
+	int stored_reg = value_reg;
+	bool value_fits = value_type == element;
+	if ((element == Variant::FLOAT && value_type == Variant::INT) ||
+		(value_type == Variant::BOOL && (element == Variant::INT || element == Variant::FLOAT))) {
+		stored_reg = alloc_register(func);
+		func.ir.instructions.emplace_back(IROpcode::CONVERT, IRValue::reg(stored_reg),
+			IRValue::reg(value_reg), IRValue::imm(int64_t(value_type))).type_hint = element;
+		set_register_type(func, stored_reg, element);
+		value_fits = true;
+	}
+	const auto emit_set = [&]() {
+		IRInstruction set(IROpcode::WINDOW_SET, IRValue::reg(window.array_reg), IRValue::reg(idx_reg),
+			IRValue::reg(stored_reg));
+		set.operands.push_back(IRValue::imm(window.token));
+		func.ir.instructions.push_back(set);
+	};
+	if (value_fits && index_type == Variant::INT) {
+		emit_set();
+		return;
+	}
+
+	const bool test_value = value_type == IRInstruction::TypeHint_NONE;
+	const bool test_index = index_type == IRInstruction::TypeHint_NONE;
+	const bool windowed = (value_fits || test_value) && (index_type == Variant::INT || test_index);
+	const std::string slow_label = make_label("window_slow");
+	const std::string done_label = make_label("window_done");
+	if (windowed) {
+		const auto require = [&](int reg, IRInstruction::TypeHint type) {
+			const int matches = alloc_register(func);
+			func.ir.instructions.emplace_back(IROpcode::TYPE_TEST, IRValue::reg(matches),
+				IRValue::reg(reg), IRValue::imm(int64_t(type))).type_hint = Variant::BOOL;
+			set_register_type(func, matches, Variant::BOOL);
+			emit_conditional_branch(IROpcode::BRANCH_ZERO, matches, slow_label, func);
+		};
+		if (test_index) require(idx_reg, Variant::INT);
+		if (test_value) require(value_reg, element);
+		emit_set();
+		func.ir.instructions.emplace_back(IROpcode::JUMP, ir_label(done_label));
+	}
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(slow_label));
+	func.ir.instructions.emplace_back(IROpcode::WINDOW_FLUSH, IRValue::reg(window.array_reg),
+		IRValue::imm(window.token));
+	gen_element_store_direct(obj_reg, idx_reg, value_reg, func, site);
+	func.ir.instructions.emplace_back(IROpcode::LABEL, ir_label(done_label));
 }
 
 std::string CodeGenerator::script_level_super_hint() const {

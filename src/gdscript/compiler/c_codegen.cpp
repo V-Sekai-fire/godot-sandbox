@@ -1034,11 +1034,11 @@ struct Emitter {
                 out << "  goto cleanup;\n"; break;
             case IROpcode::VCALL: method(i); break;
             case IROpcode::VGET:
-                if (!vector_member(i, false, p.string_constants.at(a[2].immediate()))) op("GJ_GET_NAMED", reg(0), reg(1), constant(a[2])); break;
+                if (!vector_member(i, false, p.string_constants.at(a[2].immediate()))) { op("GJ_GET_NAMED", reg(0), reg(1), constant(a[2])); } break;
             case IROpcode::VSET:
                 if (!vector_member(i, true, p.string_constants.at(a[1].immediate()))) { op("GJ_SET_NAMED", "&temp", reg(0), constant(a[1]), -1, {reg(3)}); unbox(reg(0)); } break;
             case IROpcode::VGET_INLINE:
-                if (!vector_member(i, false, p.strings[a[2].string_id])) op("GJ_GET_NAMED", reg(0), reg(1), name(a[2])); break;
+                if (!vector_member(i, false, p.strings[a[2].string_id])) { op("GJ_GET_NAMED", reg(0), reg(1), name(a[2])); } break;
             case IROpcode::VSET_INLINE:
                 if (!vector_member(i, true, p.strings[a[1].string_id])) { op("GJ_SET_NAMED", "&temp", reg(0), name(a[1]), -1, {reg(3)}); unbox(reg(0)); } break;
             case IROpcode::ARRAY_GET: op("GJ_GET", reg(0), reg(1), "0", -1, {reg(2)}); break;
@@ -1154,6 +1154,8 @@ struct Emitter {
                     << "  if (suspended) goto cleanup;\nresume" << at << ":;\n";
                 break;
             case IROpcode::MAKE_SCOPED: case IROpcode::BATCH_GET: case IROpcode::CODEPOINT_GET:
+            case IROpcode::WINDOW_OPEN: case IROpcode::WINDOW_GET:
+            case IROpcode::WINDOW_SET: case IROpcode::WINDOW_FLUSH:
                 unsupported(f, i);
             }
             switch (i.opcode) {

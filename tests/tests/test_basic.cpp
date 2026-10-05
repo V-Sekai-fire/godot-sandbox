@@ -261,6 +261,16 @@ PUBLIC Variant test_real_t_keys(Dictionary d) {
 	return out;
 }
 
+PUBLIC Variant test_real_t_vectors(Vector2 v2, Vector3 v3, Vector4 v4, Plane p, int64_t tail) {
+	Array out = Array::Create();
+	out.push_back(v2);
+	out.push_back(v3);
+	out.push_back(v4);
+	out.push_back(p);
+	out.push_back(tail);
+	return out;
+}
+
 PUBLIC Variant test_sub_dictionary(Dictionary dict) {
 	return Dictionary(dict["1"].value());
 }

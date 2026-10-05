@@ -43,7 +43,7 @@ jobs:
           mkdir -p godot-jit
           mv sandbox/libgodot_riscv.* godot-jit/
           # SafeGDScript looks for the compiler at res://addons/godot_sandbox/gdscript.elf,
-          # or gdscript.double.elf in a double-precision build
+          # or gdscript.double.elf when the host is built with double-precision real_t
           mv godot-sandbox/gdscript.elf godot-sandbox/addons/godot_sandbox/gdscript.elf
           mv godot-sandbox/gdscript.double.elf godot-sandbox/addons/godot_sandbox/gdscript.double.elf
           # The asset store requires the license inside the addon directory,

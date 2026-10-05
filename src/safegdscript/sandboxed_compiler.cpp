@@ -318,7 +318,6 @@ private:
 		if (m_sandbox != nullptr) {
 			return m_sandbox;
 		}
-		// A double-precision build refuses a float guest's Variants, so it runs the compiler built double.
 		const String compiler_path = sizeof(real_t) == sizeof(double)
 				? "res://addons/godot_sandbox/gdscript.double.elf"
 				: "res://addons/godot_sandbox/gdscript.elf";
