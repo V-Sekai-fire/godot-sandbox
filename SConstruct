@@ -132,6 +132,8 @@ else:
 
 if env["platform"] != "windows" or env["use_mingw"]:
     env.Append(CXXFLAGS=["-std=c++20"])
+    # godot-cpp's godot.cpp calls realloc and free without <cstdlib>, which llvm-mingw's libc++ does not pull in.
+    env.Append(CXXFLAGS=["-include", "cstdlib"])
 else:
     env.Append(CXXFLAGS=["/std:c++20"])
 
