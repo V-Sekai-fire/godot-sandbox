@@ -13,10 +13,12 @@ jobs:
         include:
           - elf: gdscript.elf
             double_precision: OFF
+            variant_size: 24
             artifact: godot-sandbox-gdscript-elf
-          # A double-precision host runs guests with 40-byte Variants
+          # A double-precision host refuses a guest whose Variant is not 40 bytes.
           - elf: gdscript.double.elf
             double_precision: ON
+            variant_size: 40
             artifact: godot-sandbox-gdscript-double-elf
 
     steps:
@@ -48,7 +50,19 @@ jobs:
         run: mv build/gdscript build/${{ matrix.elf }}
 
       - name: Verify ELF
-        run: file build/${{ matrix.elf }}
+        run: |
+          file build/${{ matrix.elf }}
+          riscv64-linux-gnu-objcopy -O binary --only-section=.sandbox_variant build/${{ matrix.elf }} variant.bin
+          python3 - variant.bin ${{ matrix.variant_size }} <<'EOF'
+          import struct, sys
+          data = open(sys.argv[1], "rb").read()
+          if data[:4] != b"SBXV":
+              sys.exit(f"no .sandbox_variant marker: {data[:8]!r}")
+          size = struct.unpack("<I", data[4:8])[0]
+          print(f".sandbox_variant: {size}-byte Variant")
+          if size != int(sys.argv[2]):
+              sys.exit(f"expected a {sys.argv[2]}-byte Variant")
+          EOF
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
