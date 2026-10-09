@@ -12,13 +12,13 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: ${{github.workspace}}/program/cpp/cmake/example
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Install dependencies
       run: |
@@ -43,7 +43,7 @@ jobs:
         fi
 
   zig_build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     defaults:
       run:
         working-directory: ${{github.workspace}}/program/cpp/project
@@ -52,7 +52,7 @@ jobs:
       CXX: zig c++ -target riscv64-linux-musl
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Install dependencies
       run: |

@@ -4,37 +4,37 @@ on:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: godot-sandbox-*
           merge-multiple: true
           path: godot-sandbox
           name: godot-sandbox
       - name: Download artifacts JIT
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: godot-jit-*
           merge-multiple: true
           path: sandbox
           name: godot-jit
       - name: Download GDScript compiler ELF
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: godot-sandbox-gdscript-elf
           path: .
       - name: Download double-precision GDScript compiler ELF
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: godot-sandbox-gdscript-double-elf
           path: .
       - name: Delete draft release(s)
-        uses: hugo19941994/delete-draft-releases@v1.0.0
+        uses: hugo19941994/delete-draft-releases@v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Archive
@@ -55,7 +55,7 @@ jobs:
           (cd godot-sandbox && zip -r ../godot-sandbox.zip addons)
           zip -r "godot-sandbox-jit.zip" godot-jit
       - name: Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: Godot Sandbox Nightly
           files: |

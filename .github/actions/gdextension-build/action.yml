@@ -40,7 +40,7 @@ runs:
   steps:
 # Android only
     - name: Android - Set up Java 17
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@v5
       if: ${{ inputs.platform == 'android' }}
       with:
         distribution: temurin
@@ -62,7 +62,7 @@ runs:
 
     - name: Android - Set up Android SDK
       if: ${{ inputs.platform == 'android' }}
-      uses: android-actions/setup-android@v3
+      uses: android-actions/setup-android@v4
       with:
         packages: "ndk;${{ env.ANDROID_NDK_VERSION }} cmdline-tools;latest build-tools;34.0.0 platforms;android-34 cmake;3.22.1"
 # Linux only
@@ -75,7 +75,7 @@ runs:
 # Web only
     - name: Web - Set up Emscripten latest
       if: ${{ inputs.platform == 'web' }}
-      uses: mymindstorm/setup-emsdk@v14
+      uses: mymindstorm/setup-emsdk@v15
       with:
         version: ${{ inputs.em_version }}
         actions-cache-folder: ${{ inputs.em-cache-directory }}.${{ inputs.float-precision }}.${{ inputs.build-target-type }}
@@ -93,7 +93,7 @@ runs:
 # Dependencies of godot
     # Use python 3.x release (works cross platform)
     - name: Set up Python 3.x
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         # Semantic version range syntax or exact version of a Python version
         python-version: "3.x"
@@ -122,7 +122,7 @@ runs:
       run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
 
     - name: Cache .scons_cache
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ${{ github.workspace }}/${{ inputs.gdextension-directory }}${{ inputs.scons-cache }}
