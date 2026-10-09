@@ -59,15 +59,15 @@ jobs:
       id-token: write
 
   merge:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     name: Merge
     needs: [build_android, build_ios, build_linux, build_macos, build_windows, build_web, build_godot, build_gdscript_elf]
     steps:
-      - uses: actions/upload-artifact/merge@v4
+      - uses: actions/upload-artifact/merge@v6
         with:
           name: godot-sandbox
           pattern: godot-sandbox-*
-      - uses: actions/upload-artifact/merge@v4
+      - uses: actions/upload-artifact/merge@v6
         with:
           name: godot-jit
           pattern: godot-jit-*

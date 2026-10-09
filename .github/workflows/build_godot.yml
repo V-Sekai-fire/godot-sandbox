@@ -4,13 +4,13 @@ on:
 
 jobs:
   godot:
-    runs-on: "ubuntu-latest"
+    runs-on: ubuntu-26.04
     name: Copy addon files
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: godot-sandbox-gdextension
           # Only the addon itself ships; bin/ is also a test project, and

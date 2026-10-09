@@ -20,7 +20,7 @@ jobs:
 
     steps:
     - name: '🧰 Checkout'
-      uses: actions/checkout@v4
+      uses: actions/checkout@v5
       with:
         fetch-depth: 0
         submodules: true
@@ -58,7 +58,7 @@ jobs:
         mv .build/libgodot-riscv.dll .build/libgodot_riscv.windows.template_release.x86_64.dll
 
     - name: Upload addon DLL
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: godot-jit-windows
         path: .build/libgodot_riscv.windows.template_release.x86_64.dll

@@ -23,13 +23,13 @@ jobs:
       SCONS_CACHE: ${{ github.workspace }}/.scons-cache/
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: true
           fetch-depth: 1
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
@@ -42,13 +42,13 @@ jobs:
           echo "ANDROID_NDK_ROOT=/usr/local/lib/android/sdk/ndk/${{ env.ANDROID_NDK_VERSION }}" >> "$GITHUB_ENV"
 
       - name: Install Android SDK and NDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           packages: ndk;${{ env.ANDROID_NDK_VERSION }} cmdline-tools;latest build-tools;34.0.0 platforms;android-34 cmake;3.22.1
           accept-android-sdk-licenses: true
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: 3.x
 
@@ -62,7 +62,7 @@ jobs:
         run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
 
       - name: Cache SCons
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.SCONS_CACHE }}
           key: android_${{ matrix.arch }}_${{ matrix.precision }}_template_release_cache_${{ steps.cache-epoch.outputs.week }}_${{ github.run_id }}
@@ -73,7 +73,7 @@ jobs:
         run: scons target=template_release platform=android arch=${{ matrix.arch }} precision=${{ matrix.precision }}
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: godot-sandbox-android-${{ matrix.arch }}-${{ matrix.precision }}
           path: |
