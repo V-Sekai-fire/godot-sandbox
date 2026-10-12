@@ -1084,11 +1084,24 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 		// compiling now, not for a translation baked ahead of time. Only while
 		// the lookup is enabled, so a translated program is never emitted again.
 		static thread_local std::string emitted_c99;
+		static thread_local std::vector<std::string> emitted_units;
 		const char *emit_dir = std::getenv("GODOT_SANDBOX_BINTR_EMIT");
+		// GODOT_SANDBOX_BINTR_UNITS=<n>: write the translation as n C units,
+		// bintr-<HASH>.<i>.c, instead of one file. A compiler takes one unit on
+		// one core, so a large guest's single file compiles serially; the units
+		// compile in parallel and link into the same bintr-<HASH> library.
+		const char *emit_units = std::getenv("GODOT_SANDBOX_BINTR_UNITS");
+		const unsigned units = emit_units != nullptr ? unsigned(std::strtoul(emit_units, nullptr, 10)) : 0u;
 		emitted_c99.clear();
+		emitted_units.clear();
 		if (emit_dir != nullptr && bintr_lookup) {
 			riscv::MachineTranslationEmbeddableCodeOptions embed;
-			embed.result_shared_c99 = &emitted_c99;
+			if (units > 1) {
+				embed.result_shared_c99_units = &emitted_units;
+				embed.shared_c99_units = units;
+			} else {
+				embed.result_shared_c99 = &emitted_c99;
+			}
 			options->cross_compile.push_back(embed);
 			options->translate_blocks_max = 1u << 24;
 			options->translate_instr_max = 1u << 30;
@@ -1096,18 +1109,28 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 #endif
 		this->m_machine = new machine_t{ binary_view, *options };
 #ifdef RISCV_BINARY_TRANSLATION
-		if (emit_dir != nullptr && !emitted_c99.empty()) {
-			char name[32];
-			std::snprintf(name, sizeof(name), "/bintr-%08X.c",
-					unsigned(this->m_machine->memory.exec_segment_for(this->m_machine->memory.start_address())->translation_hash()));
-			const std::string path = std::string(emit_dir) + name;
-			if (FILE *f = std::fopen(path.c_str(), "wb"); f != nullptr) {
-				std::fwrite(emitted_c99.data(), 1, emitted_c99.size(), f);
-				std::fclose(f);
+		if (emit_dir != nullptr && (!emitted_c99.empty() || !emitted_units.empty())) {
+			const unsigned hash = unsigned(this->m_machine->memory.exec_segment_for(this->m_machine->memory.start_address())->translation_hash());
+			auto write = [&](const std::string &path, const std::string &code) {
+				if (FILE *f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+					std::fwrite(code.data(), 1, code.size(), f);
+					std::fclose(f);
+				} else {
+					ERR_PRINT(String("Sandbox: cannot write ") + path.c_str());
+				}
+			};
+			char name[48];
+			if (!emitted_units.empty()) {
+				for (size_t i = 0; i < emitted_units.size(); i++) {
+					std::snprintf(name, sizeof(name), "/bintr-%08X.%zu.c", hash, i);
+					write(std::string(emit_dir) + name, emitted_units[i]);
+				}
 			} else {
-				ERR_PRINT(String("Sandbox: cannot write ") + path.c_str());
+				std::snprintf(name, sizeof(name), "/bintr-%08X.c", hash);
+				write(std::string(emit_dir) + name, emitted_c99);
 			}
 			emitted_c99.clear();
+			emitted_units.clear();
 		}
 #endif
 		this->m_machine->set_options(std::move(options));
