@@ -155,6 +155,10 @@ elif env["platform"] == "macos":
     env.Prepend(CPPPATH=["ext/libriscv/lib/libriscv/lib/macos"])
     env.Append(LINKFLAGS=["-framework", "Security"])
     add_godot_cpp_doc_data(env, sources)
+elif env["platform"] == "web":
+    # Godot's web build suspends with Asyncify (WebGPU waits). Guest calls that reach the
+    # RenderingDevice are on the stack then, so this side module must be instrumented too.
+    env.Append(LINKFLAGS=["-sASYNCIFY=1"])
 elif env["platform"] == "linux" or env["platform"] == "android":
     env.Prepend(CPPPATH=["ext/libriscv/lib/libriscv/lib/linux"])
     add_godot_cpp_doc_data(env, sources)
