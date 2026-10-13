@@ -5,6 +5,12 @@ import sys
 ARGUMENTS["disable_exceptions"] = "0"
 ARGUMENTS["use_mingw"] = "yes"
 
+# godot-cpp writes its generated bindings into one shared gen/ directory, sized for the arch of
+# whichever build generated them. Reusing 64-bit bindings on wasm32 made String 8 bytes instead
+# of 4, so walking a PackedStringArray read past its end. Regenerate on every build; unchanged
+# files keep their content hash, so nothing recompiles unless the arch or API changed.
+ARGUMENTS.setdefault("generate_bindings", "yes")
+
 # Use a double-precision extension_api.json for double builds, since the
 # default one shipped with godot-cpp is single-precision only.
 if ARGUMENTS.get("precision", "single") == "double" and "custom_api_file" not in ARGUMENTS:
