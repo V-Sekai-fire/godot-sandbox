@@ -4,6 +4,7 @@
 #include "syscalls.h"
 
 #include <algorithm>
+#include <optional>
 
 #include <godot_cpp/classes/class_db_singleton.hpp>
 #include <godot_cpp/classes/engine.hpp>
@@ -343,7 +344,7 @@ static inline void object_call(Sandbox &emu, godot::Object *obj,
 }
 
 // For methods that pass a second argument with the actual call/target name (eg. emit_signal)
-enum class ByName : uint8_t { NONE, CALL, CALLV, GET, SET };
+enum class ByName : uint8_t { NONE, CALL, CALLV, GET, SET, CONNECT };
 struct ByNameMethod {
 	ByName kind;
 	int name_arg;
@@ -362,6 +363,8 @@ static ByNameMethod by_name_method(std::string_view m) {
 	if (m == "set" || m == "set_indexed" || m == "set_deferred" || m == "set_thread_safe" ||
 			m == "set_deferred_thread_group")
 		return { ByName::SET, 0 };
+	if (m == "connect")
+		return { ByName::CONNECT, 1 };
 	return { ByName::NONE, 0 };
 }
 
@@ -385,6 +388,26 @@ static void check_method_reference(const Sandbox &emu, godot::Object *obj, const
 		const CharString utf8 = name.utf8();
 		if (by_name_method(std::string_view(utf8.get_data(), utf8.length())).kind != ByName::NONE)
 			refuse_by_name("Method reference not allowed under restrictions: ", name);
+	}
+}
+
+static void check_connected_callable(const Sandbox &emu, const Variant &arg) {
+	if (variant_type(arg) != Variant::CALLABLE)
+		return;
+	const Callable callable = arg;
+	const StringName method = callable.get_method();
+	if (method.is_empty())
+		return;
+	godot::Object *target = callable.get_object();
+	if (target == nullptr)
+		return;
+	const String name = method;
+	if (UNLIKELY(!emu.is_allowed_method(target, name)))
+		refuse_by_name("Banned method connected: ", name);
+	if (UNLIKELY(!emu.is_fully_unrestricted())) {
+		const CharString utf8 = name.utf8();
+		if (by_name_method(std::string_view(utf8.get_data(), utf8.length())).kind != ByName::NONE)
+			refuse_by_name("Banned method connected under restrictions: ", name);
 	}
 }
 
@@ -434,6 +457,9 @@ static void check_by_name_call(const Sandbox &emu, godot::Object *obj, std::stri
 			if (UNLIKELY(!emu.is_allowed_property(obj, property, true)))
 				refuse_by_name("Banned property accessed: ", property);
 		} break;
+		case ByName::CONNECT:
+			check_connected_callable(emu, name_arg);
+			break;
 		case ByName::NONE:
 			break;
 	}
@@ -491,14 +517,11 @@ static void check_signal_call(const Sandbox &emu, const Variant &signal_variant,
 		ERR_PRINT(String("Signal::call(): Method not allowed: ") + object_method);
 		throw std::runtime_error(std::string("Signal::call(): Method not allowed: ") + object_method);
 	}
-	if (method_name == "connect" && argc >= 1 && args[0]->get_type() == Variant::CALLABLE) {
-		const Callable callable = *args[0];
-		godot::Object *target = callable.is_custom() ? nullptr : callable.get_object();
-		if (target != nullptr && UNLIKELY(!emu.is_allowed_method(target, callable.get_method()))) {
-			ERR_PRINT("Banned method connected: " + String(callable.get_method()));
-			throw std::runtime_error("Banned method connected: " +
-					std::string(String(callable.get_method()).utf8().get_data()));
-		}
+	if (method_name == "connect") {
+		if (args == nullptr && UNLIKELY(!emu.is_fully_unrestricted()))
+			refuse_by_name("Method reference not allowed under restrictions: ", "connect");
+		if (argc >= 1)
+			check_connected_callable(emu, *args[0]);
 	}
 }
 
@@ -2613,11 +2636,9 @@ APICALL(api_obj) {
 				ERR_PRINT("Banned method called: connect");
 				throw std::runtime_error("Banned method called: connect");
 			}
-			if (UNLIKELY(!emu.is_allowed_method(target, method_name))) {
-				ERR_PRINT("Banned method connected: " + method_name);
-				throw std::runtime_error("Banned method connected: " + std::string(method_name.utf8()));
-			}
-			obj->connect(signal_name, Callable(target, method_name));
+			const Callable callable(target, method_name);
+			check_connected_callable(emu, callable);
+			obj->connect(signal_name, callable);
 		} break;
 		case Object_Op::DISCONNECT: {
 			GuestVariant *vars = machine.memory.memarray<GuestVariant>(gvar, 3);
@@ -3764,6 +3785,24 @@ APICALL(api_array_window) {
 	machine.set_result(result);
 }
 
+static constexpr bool dictionary_operate_operator(int variant_op) {
+	switch (variant_op) {
+		case Variant::OP_ADD:
+		case Variant::OP_SUBTRACT:
+		case Variant::OP_MULTIPLY:
+		case Variant::OP_BIT_AND:
+		case Variant::OP_BIT_OR:
+		case Variant::OP_BIT_XOR:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static constexpr bool is_dictionary_operate(int64_t op) {
+	return op >= int64_t(Dictionary_Op::OPERATE) && op <= int64_t(Dictionary_Op::OPERATE_RAW_STR);
+}
+
 APICALL(api_dict_ops) {
 	auto [op, dict_idx, vkey, vaddr] = machine.sysargs<Dictionary_Op, unsigned, gaddr_t, gaddr_t>();
 	Sandbox &emu = riscv::emu(machine);
@@ -3986,6 +4025,113 @@ APICALL(api_dict_ops) {
 			throw_if_read_only(var_dict, "Dictionary::operation");
 			const GuestVariant *other_dict = machine.memory.memarray<GuestVariant>(vkey, 1);
 			dict.merge(other_dict->toVariant(emu).operator Dictionary());
+			return;
+		}
+		case Dictionary_Op::OPERATE:
+		case Dictionary_Op::OPERATE_INT_KEY:
+		case Dictionary_Op::OPERATE_RAW:
+		case Dictionary_Op::OPERATE_RAW_STR: {
+			PENALIZE(10'000);
+			// Only the operators the compiler fuses. None of them runs script code
+			// for the operand types the fast path handles, and the slot pointer
+			// below must stay valid across variant_evaluate: String % Object or
+			// `in` could call into a script that clears or rehashes this Dictionary.
+			const int variant_op = int(machine.cpu.reg(15)); // A5
+			if (UNLIKELY(!dictionary_operate_operator(variant_op))) {
+				ERR_PRINT("Dictionary::operate(): Invalid operator: " + itos(variant_op));
+				throw std::runtime_error("Dictionary::operate(): Invalid operator: " + std::to_string(variant_op));
+			}
+			const GuestVariant *operand = machine.memory.memarray<GuestVariant>(machine.cpu.reg(14), 1); // A4
+			const BorrowedVariant rhs(emu, *operand);
+
+			std::optional<BorrowedVariant> boxed_key;
+			std::optional<InlineIntVariant> int_key;
+			std::optional<Sandbox::CachedNameRef> raw;
+			const Variant *key;
+			if (op == Dictionary_Op::OPERATE) {
+				boxed_key.emplace(emu, *machine.memory.memarray<GuestVariant>(vkey, 1));
+				key = &**boxed_key;
+			} else if (op == Dictionary_Op::OPERATE_INT_KEY) {
+				int_key.emplace(int64_t(vkey));
+				key = &**int_key;
+			} else {
+				raw.emplace(raw_key(vkey, vaddr));
+				key = op == Dictionary_Op::OPERATE_RAW_STR ? &raw->get().as_string() : &(*raw)->variant;
+			}
+
+			// Typed Dictionaries fall through: operator[] gives a wrong-type key
+			// a fallback slot instead of refusing it.
+			if (LIKELY(!dict.is_read_only() && !dict.is_typed())) {
+				const int64_t size_before = dict.size();
+				Variant *slot = reinterpret_cast<Variant *>(
+						internal::gdextension_interface_dictionary_operator_index(
+							dict._native_ptr(), key->_native_ptr()));
+				if (LIKELY(dict.size() == size_before)) {
+					GDNativeVariant *lhs = reinterpret_cast<GDNativeVariant *>(slot);
+					const GDNativeVariant *operand_native = reinterpret_cast<const GDNativeVariant *>(&*rhs);
+					if (lhs->type == Variant::INT && operand_native->type == Variant::INT) {
+						const uint64_t a = lhs->value, b = operand_native->value;
+						switch (variant_op) {
+							case Variant::OP_ADD: lhs->value = a + b; return;
+							case Variant::OP_SUBTRACT: lhs->value = a - b; return;
+							case Variant::OP_MULTIPLY: lhs->value = a * b; return;
+							case Variant::OP_BIT_AND: lhs->value = a & b; return;
+							case Variant::OP_BIT_OR: lhs->value = a | b; return;
+							case Variant::OP_BIT_XOR: lhs->value = a ^ b; return;
+							default: break;
+						}
+					} else if (lhs->type == Variant::FLOAT &&
+							(operand_native->type == Variant::FLOAT || operand_native->type == Variant::INT)) {
+						const double b = operand_native->type == Variant::FLOAT
+							? operand_native->flt : double(int64_t(operand_native->value));
+						switch (variant_op) {
+							case Variant::OP_ADD: lhs->flt += b; return;
+							case Variant::OP_SUBTRACT: lhs->flt -= b; return;
+							case Variant::OP_MULTIPLY: lhs->flt *= b; return;
+							default: break;
+						}
+					}
+					CallResult result;
+					GDExtensionBool evaluated = false;
+					internal::gdextension_interface_variant_evaluate(static_cast<GDExtensionVariantOperator>(variant_op),
+							slot->_native_ptr(), rhs->_native_ptr(), &result.get(), &evaluated);
+					result.mark_constructed();
+					if (UNLIKELY(!evaluated)) {
+						throw invalid_variant_operands(variant_op, lhs->type, operand_native->type);
+					}
+					*slot = std::move(result.get());
+					return;
+				}
+				// Absent key: undo the insertion operator[] made and fall through.
+				dict.erase(*key);
+			}
+
+			// Slow path: read-only, typed, or absent key.
+			CallResult current;
+			GDExtensionBool valid = false;
+			internal::gdextension_interface_variant_get_keyed(
+					var_dict._native_ptr(), key->_native_ptr(), &current.get(), &valid);
+			current.mark_constructed();
+			if (UNLIKELY(!valid)) {
+				current.get() = Variant();
+			}
+			CallResult result;
+			valid = false;
+			internal::gdextension_interface_variant_evaluate(static_cast<GDExtensionVariantOperator>(variant_op),
+					current.get()._native_ptr(), rhs->_native_ptr(), &result.get(), &valid);
+			result.mark_constructed();
+			if (UNLIKELY(!valid)) {
+				throw invalid_variant_operands(variant_op, current.get().get_type(), rhs->get_type());
+			}
+			valid = false;
+			internal::gdextension_interface_variant_set_keyed(
+					const_cast<Variant &>(var_dict)._native_ptr(), key->_native_ptr(),
+					result.get()._native_ptr(), &valid);
+			if (UNLIKELY(!valid)) {
+				throw_if_read_only(var_dict, "Dictionary::operation");
+				ERR_PRINT("Dictionary::set(): the key could not be assigned");
+				throw std::runtime_error("Dictionary::set(): the key could not be assigned");
+			}
 			return;
 		}
 		case Dictionary_Op::MAKE_KEYED:
@@ -4682,6 +4828,20 @@ const riscv::Instruction<RISCV_ARCH> &counted_operation(
 	return instruction;
 }
 
+// Every Dictionary form except the 6/0 counted one. OPERATE reads a5, which
+// only that form promises to synchronize, so it is refused here.
+const riscv::Instruction<RISCV_ARCH> &dictionary_general_operation(
+		riscv::instruction_printer<RISCV_ARCH> printer) {
+	static const riscv::Instruction<RISCV_ARCH> instruction{
+		[](riscv::CPU<RISCV_ARCH> &cpu, riscv::rv32i_instruction instr) {
+			if (riscv::is_dictionary_operate(int64_t(cpu.reg(riscv::REG_ARG0))))
+				cpu.trigger_exception(riscv::UNIMPLEMENTED_INSTRUCTION, instr.whole);
+			riscv::api_dict_ops(cpu.machine());
+		}, printer
+	};
+	return instruction;
+}
+
 } // namespace
 
 void Sandbox::initialize_syscalls() {
@@ -4795,15 +4955,27 @@ void Sandbox::initialize_syscalls() {
 			if (instr.Itype.imm < Machine<RISCV_ARCH>::syscall_handlers.size()) {
 				// Fixed signatures are completely validated at decode time. Only
 				// operation-dependent counts need a runtime comparison of a0.
+				const auto printer = validated_syscall_instruction.printer;
+				if (legacy && instr.Itype.imm == ECALL_DICTIONARY_OPS)
+					return dictionary_general_operation(printer);
 				if (!legacy) {
-					const auto printer = validated_syscall_instruction.printer;
 					switch (instr.Itype.imm) {
 					case ECALL_VSCOPE:
 						return counted_operation<int64_t(Scope_Op::MARK)>(printer);
 					case ECALL_DICTIONARY_OPS:
 						if (instr.Itype.rd == (16 | 2))
 							return counted_operation<int64_t(Dictionary_Op::GET_SIZE)>(printer);
-						break; // The general 5/1 form covers every operation.
+						if (instr.Itype.rd == (16 | 6)) {
+							static const Instruction<RISCV_ARCH> operate_instruction{
+								[](CPU<RISCV_ARCH> &cpu, rv32i_instruction word) {
+									if (!gdscript::valid_counted_syscall(word.whole, int64_t(cpu.reg(REG_ARG0))))
+										cpu.trigger_exception(UNIMPLEMENTED_INSTRUCTION, word.whole);
+									api_dict_ops(cpu.machine());
+								}, printer
+							};
+							return operate_instruction;
+						}
+						return dictionary_general_operation(printer);
 					case ECALL_UTILITY: {
 						static const Instruction<RISCV_ARCH> utility_instruction{
 							[](CPU<RISCV_ARCH> &cpu, rv32i_instruction word) {
