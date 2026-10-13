@@ -1,0 +1,123 @@
+#!/usr/bin/env python
+# Engine-module build of godot-sandbox. See config.py: this compiles the GDExtension unchanged,
+# with godot-cpp, into the engine; module/register_types.cpp loads it at startup.
+from misc.utility.scons_hints import *
+
+import os
+import sys
+
+Import("env")
+Import("env_modules")
+
+here = Dir(".").srcnode().abspath
+godot_cpp = os.path.join(here, "ext", "godot-cpp")
+libriscv = "ext/libriscv/lib/libriscv"
+
+# godot-cpp bindings, generated for this engine's precision and pointer width. They are made at
+# configure time, and again only when the inputs change.
+precision = env["precision"]
+bits = "32" if "32" in env["arch"] else "64"
+if precision == "double":
+    api_file = os.path.join(here, "gdextension", "extension_api_double.json")
+else:
+    api_file = os.path.join(godot_cpp, "gdextension", "extension_api.json")
+gen_root = os.path.join(here, "ext", "godot-cpp-gen", precision + "_" + bits)
+stamp_path = os.path.join(gen_root, "stamp")
+stamp = "%s %d" % (api_file, os.path.getmtime(api_file))
+if not os.path.exists(stamp_path) or open(stamp_path).read() != stamp:
+    sys.path.insert(0, godot_cpp)
+    from binding_generator import generate_bindings
+
+    sys.path.pop(0)
+    generate_bindings(api_file, True, bits, precision, gen_root)
+    with open(stamp_path, "w") as f:
+        f.write(stamp)
+
+env_ext = env_modules.Clone()
+env_ext.Append(
+    CPPDEFINES=[
+        "GDEXTENSION",
+        "RISCV_SYSCALLS_MAX=600",
+        "RISCV_BRK_MEMORY_SIZE=0x100000",
+        "RISCV_BINARY_TRANSLATION",
+    ]
+)
+if precision == "double":
+    env_ext.Append(CPPDEFINES=["DOUBLE_PRECISION_REAL_T"])
+env_ext.Prepend(
+    CPPPATH=[
+        "#modules/sandbox/ext/libriscv/lib",
+        "#modules/sandbox/src",
+        "#modules/sandbox",
+        os.path.join(godot_cpp, "gdextension"),
+        os.path.join(godot_cpp, "include"),
+        os.path.join(gen_root, "gen", "include"),
+    ]
+)
+platform_dir = {"windows": "win32", "macos": "macos"}.get(env["platform"], "linux")
+env_ext.Prepend(CPPPATH=["#modules/sandbox/" + libriscv + "/lib/" + platform_dir])
+
+if env.msvc:
+    env_ext.Append(CXXFLAGS=["/std:c++20", "/EHsc"])
+else:
+    env_ext.Append(CXXFLAGS=["-std=c++20", "-fexceptions"])
+    # godot-cpp's godot.cpp calls realloc and free without <cstdlib>.
+    env_ext.Append(CXXFLAGS=["-include", "cstdlib"])
+if env["platform"] == "web":
+    env.Append(LINKFLAGS=["-fexceptions", "-sDISABLE_EXCEPTION_CATCHING=0"])
+elif env["platform"] == "windows":
+    env.Append(LIBS=["ws2_32"])
+elif env["platform"] == "macos":
+    env.Append(LINKFLAGS=["-framework", "Security"])
+elif env["platform"] == "linux":
+    env.Append(LIBS=["dl"])
+
+# Where the SafeGDScript compiler runs; SConstruct's safegdscript_compiler=restricted.
+env_ext.Append(CPPDEFINES=["SAFEGDSCRIPT_COMPILER_POLICY=1", "SAFEGDSCRIPT_DIRECT_COMPILER"])
+
+env_ext.disable_warnings()
+
+
+def glob(pattern):
+    return [str(f) for f in Glob(pattern)]
+
+
+compiler = "src/gdscript/compiler/"
+compiler_files = [
+    "function_signature", "property_signature", "source_model", "line_table", "gdsmeta", "globals",
+    "compiler_exception", "debug_layout", "token", "lexer", "parser", "ast_clone", "export_hints",
+    "traits", "chain", "ir", "ir_optimizer", "ir_verifier", "codegen", "riscv_codegen", "riscv_globals",
+    "riscv_profiling", "riscv_debug", "register_allocator", "elf_builder", "compiler", "c_codegen",
+    "compiler_riscv",
+]  # fmt: skip
+
+sources = []
+for d in ("src", "src/cpp", "src/rust", "src/zig", "src/elf", "src/godot", "src/safegdscript", "src/bintr"):
+    sources += glob(d + "/*.cpp")
+sources += [compiler + f + ".cpp" for f in compiler_files]
+sources += ["src/tests/dummy_assault.cpp"]
+
+sources += [
+    libriscv + "/" + f + ".cpp"
+    for f in [
+        "threaded_dispatch", "threaded_inaccurate_dispatch", "cpu", "debug", "decode_bytecodes",
+        "decoder_cache", "machine", "machine_defaults", "memory", "memory_elf", "memory_mmap", "memory_rw",
+        "native_libc", "native_threads", "rv64i", "serialize", "shared_rodata", "posix/minimal",
+        "posix/signals", "posix/threads", "util/crc32c", "tr_api", "tr_emit", "tr_translate",
+    ]
+]  # fmt: skip
+if env["platform"] == "windows":
+    sources += [libriscv + "/win32/" + f + ".cpp" for f in ("dlfcn", "system_calls", "tr_msvc")]
+else:
+    sources += [libriscv + "/linux/system_calls.cpp", libriscv + "/tr_compiler.cpp"]
+
+for d in ("src", "src/classes", "src/core", "src/variant"):
+    sources += [os.path.relpath(p, here) for p in glob(os.path.join(godot_cpp, d, "*.cpp"))]
+for root, _, files in os.walk(os.path.join(gen_root, "gen", "src")):
+    sources += [os.path.join(root, f) for f in files if f.endswith(".cpp")]
+
+env_ext.add_source_files(env.modules_sources, sources)
+
+# The loader is engine code and sees only engine headers.
+env_glue = env_modules.Clone()
+env_glue.add_source_files(env.modules_sources, ["module/register_types.cpp"])

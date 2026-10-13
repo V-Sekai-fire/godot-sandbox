@@ -32,3 +32,4 @@ src/gen/
 # two different things, and the harness says so when it sees one.
 tests/bench/results/
 tests/bench/baseline*.json
+ext/godot-cpp-gen/
