@@ -1916,7 +1916,7 @@ void RiscvCallable::call(const Variant **p_arguments, int p_argcount, Variant &r
 gaddr_t Sandbox::cached_address_of(int64_t hash, const String &function) const {
 	gaddr_t address = 0x0;
 	auto it = m_lookup.find(hash);
-	if (it != m_lookup.end()) {
+	if (it != m_lookup.end() && it->second.name == function) {
 		return it->second.address;
 	} else if (m_machine != &dummy_machine) {
 		const CharString ascii = function.ascii();
