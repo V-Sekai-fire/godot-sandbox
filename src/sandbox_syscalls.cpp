@@ -256,20 +256,20 @@ static uint32_t method_compatibility_hash(const MethodInfo &method) {
 
 static GDExtensionMethodBindPtr cached_method_bind(godot::Object *obj,
 		Sandbox::CachedName &method) {
-	const std::type_info *object_type = &typeid(*obj);
-	const unsigned index = object_type->hash_code() & (Sandbox::CachedName::METHOD_CACHE_SIZE - 1);
-	Sandbox::CachedName::MethodEntry &entry = method.methods[index];
-	if (entry.object_type == object_type)
-		return entry.bind;
-
-	entry = {};
-	entry.object_type = object_type;
-
+	// Key on the engine class: guest handles share one wrapper type, so typeid made
+	// GLTFState and GLTFNode look alike and reuse each other's MethodBind.
 	StringName class_name;
 	if (!internal::gdextension_interface_object_get_class_name(obj->_owner, internal::library,
 			class_name._native_ptr())) {
 		return nullptr;
 	}
+	const unsigned index = class_name.hash() & (Sandbox::CachedName::METHOD_CACHE_SIZE - 1);
+	Sandbox::CachedName::MethodEntry &entry = method.methods[index];
+	if (entry.class_name == class_name)
+		return entry.bind;
+
+	entry = {};
+	entry.class_name = class_name;
 
 	const TypedArray<Dictionary> methods = ClassDBSingleton::get_singleton()->class_get_method_list(class_name);
 	for (int i = 0; i < methods.size(); i++) {

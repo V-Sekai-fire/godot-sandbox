@@ -151,7 +151,7 @@ public:
 		// runtime class. Keep the resolved MethodBind beside that call site's name.
 		static constexpr unsigned METHOD_CACHE_SIZE = 4; // Must be a power of two
 		struct MethodEntry {
-			const std::type_info *object_type = nullptr;
+			StringName class_name;
 			GDExtensionMethodBindPtr bind = nullptr;
 		};
 		MethodEntry methods[METHOD_CACHE_SIZE];
