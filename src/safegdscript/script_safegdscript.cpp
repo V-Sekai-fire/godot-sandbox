@@ -2224,6 +2224,7 @@ bool SafeGDScript::load_binary(const PackedByteArray &bytes) noexcept try {
 	used_traits.clear(); trait_signatures.clear();
 	for (const auto &name : artifact_metadata.uses) used_traits.insert(StringName(String::utf8(name.c_str())));
 	for (const auto &c : artifact_metadata.classes) if (c.is_trait) trait_signatures.push_back(c);
+	update_static_dispatch();
 	last_error = String();
 	return true;
 } catch (...) { return false; }
