@@ -825,6 +825,12 @@ public:
 	/// @return The list of properties.
 	Array get_property_list() const;
 
+	// Object property hooks: Object::get/set/get_property_list reach guest properties through
+	// these. Godot no longer lets an extension bind its own get/set/get_property_list methods.
+	bool _get(const StringName &p_name, Variant &r_ret) const;
+	bool _set(const StringName &p_name, const Variant &p_value);
+	void _get_property_list(List<PropertyInfo> *p_list) const;
+
 	/// @brief Find a property in the sandbox, or return null if it does not exist.
 	/// @param name The name of the property.
 	/// @return The property, or null if it does not exist.

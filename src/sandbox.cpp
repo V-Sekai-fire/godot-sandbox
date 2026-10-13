@@ -242,9 +242,6 @@ void Sandbox::_bind_methods() {
 	ClassDB::bind_static_method("Sandbox", D_METHOD("has_feature_binary_translation"), &Sandbox::has_feature_binary_translation);
 
 	// Properties.
-	ClassDB::bind_method(D_METHOD("set", "name", "value"), &Sandbox::set);
-	ClassDB::bind_method(D_METHOD("get", "name"), &Sandbox::get);
-	ClassDB::bind_method(D_METHOD("get_property_list"), &Sandbox::get_property_list);
 
 	ClassDB::bind_method(D_METHOD("set_max_refs", "max"), &Sandbox::set_max_refs, DEFVAL(MAX_REFS));
 	ClassDB::bind_method(D_METHOD("get_max_refs"), &Sandbox::get_max_refs);
@@ -2754,6 +2751,28 @@ Array Sandbox::get_property_list() const {
 	// Node properties
 	arr.append_array(Node::get_property_list());
 	return arr;
+}
+
+bool Sandbox::_get(const StringName &p_name, Variant &r_ret) const {
+	return const_cast<Sandbox *>(this)->get_property(p_name, r_ret);
+}
+
+bool Sandbox::_set(const StringName &p_name, const Variant &p_value) {
+	return set_property(p_name, p_value);
+}
+
+void Sandbox::_get_property_list(List<PropertyInfo> *p_list) const {
+	for (const SandboxProperty &prop : m_properties) {
+		uint32_t usage = prop.usage() != 0
+				? prop.usage()
+				: uint32_t(PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_STORAGE | PROPERTY_USAGE_SCRIPT_VARIABLE);
+		if (prop.type() == Variant::NIL) {
+			usage |= uint32_t(PROPERTY_USAGE_NIL_IS_VARIANT);
+		} else {
+			usage &= ~uint32_t(PROPERTY_USAGE_NIL_IS_VARIANT);
+		}
+		p_list->push_back(PropertyInfo(Variant::Type(prop.type()), prop.name(), PropertyHint(prop.hint()), prop.hint_string(), usage));
+	}
 }
 
 bool SandboxProperty::set(Sandbox &sandbox, const Variant &value) {
