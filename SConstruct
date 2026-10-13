@@ -158,7 +158,10 @@ elif env["platform"] == "macos":
 elif env["platform"] == "web":
     # Godot's web build suspends with Asyncify (WebGPU waits). Guest calls that reach the
     # RenderingDevice are on the stack then, so this side module must be instrumented too.
-    env.Append(LINKFLAGS=["-sASYNCIFY=1"])
+    # godot-cpp passes -O3 to the compiler only. Asyncify runs at link time, and without
+    # link optimization its added locals are never coalesced: one interpreter function
+    # reached 87340 locals, over V8's 50000 limit, and the module failed to compile.
+    env.Append(LINKFLAGS=["-sASYNCIFY=1", "-O3"])
 elif env["platform"] == "linux" or env["platform"] == "android":
     env.Prepend(CPPPATH=["ext/libriscv/lib/libriscv/lib/linux"])
     add_godot_cpp_doc_data(env, sources)
