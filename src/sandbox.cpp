@@ -2517,8 +2517,8 @@ void Sandbox::add_property(const String &name, Variant::Type vtype, uint64_t set
 	m_properties.emplace_back(name, vtype, setter, getter, def);
 
 	// Make the property getter/setter functions visible to address_of and profiling
-	this->add_cached_address("set_" + name, getter);
-	this->add_cached_address("get_" + name, setter);
+	this->add_cached_address("set_" + name, setter);
+	this->add_cached_address("get_" + name, getter);
 }
 void Sandbox::add_property(const String &name, Variant::Type vtype, gaddr_t address, const Variant &def) const
 {
