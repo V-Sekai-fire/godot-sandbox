@@ -156,12 +156,12 @@ elif env["platform"] == "macos":
     env.Append(LINKFLAGS=["-framework", "Security"])
     add_godot_cpp_doc_data(env, sources)
 elif env["platform"] == "web":
-    # Godot's web build suspends with Asyncify (WebGPU waits). Guest calls that reach the
-    # RenderingDevice are on the stack then, so this side module must be instrumented too.
-    # godot-cpp passes -O3 to the compiler only. Asyncify runs at link time, and without
-    # link optimization its added locals are never coalesced: one interpreter function
-    # reached 87340 locals, over V8's 50000 limit, and the module failed to compile.
-    env.Append(LINKFLAGS=["-sASYNCIFY=1", "-O3"])
+    # Godot's web build suspends WebGPU waits with JSPI, which needs no code changes in this
+    # side module. godot-cpp passes -O3 to the compiler only, so optimize at link time too.
+    # libriscv throws and catches C++ exceptions. Emscripten's default throws but never catches,
+    # so use native WebAssembly exceptions, as Godot's dlink main module does.
+    env.Append(CCFLAGS=["-fwasm-exceptions"])
+    env.Append(LINKFLAGS=["-O3", "-fwasm-exceptions"])
 elif env["platform"] == "linux" or env["platform"] == "android":
     env.Prepend(CPPPATH=["ext/libriscv/lib/libriscv/lib/linux"])
     add_godot_cpp_doc_data(env, sources)
