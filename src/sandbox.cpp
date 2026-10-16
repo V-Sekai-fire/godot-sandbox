@@ -1160,7 +1160,14 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 
 		this->install_self_instrumentation_clock();
 
-		const gaddr_t heap_size = gaddr_t(machine().memory.memory_arena_size() * 0.8) & ~0xFFFLL;
+		// The heap follows the ELF, brk and stack; keep it inside the arena, or a masked
+		// arena wraps its tail onto the program.
+		const gaddr_t arena_size = machine().memory.memory_arena_size();
+		const gaddr_t mmap_now = machine().memory.mmap_address();
+		gaddr_t heap_size = gaddr_t(arena_size * 0.8) & ~0xFFFLL;
+		if (arena_size > mmap_now + HEAP_ARENA_RESERVE) {
+			heap_size = std::min(heap_size, gaddr_t(arena_size - mmap_now - HEAP_ARENA_RESERVE) & ~0xFFFLL);
+		}
 		const gaddr_t heap_area = machine().memory.mmap_allocate(heap_size);
 
 		// Add native system call interfaces
