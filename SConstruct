@@ -84,7 +84,13 @@ else:
     if ARGUMENTS.get("precision", "single") == "double":
         env.Append(CPPDEFINES=["DOUBLE_PRECISION_REAL_T"])
 
-sources = [Glob("src/*.cpp"), Glob("src/cpp/*.cpp"), Glob("src/rust/*.cpp"), Glob("src/zig/*.cpp"), Glob("src/elf/*.cpp"), Glob("src/godot/*.cpp"), Glob("src/safegdscript/*.cpp"), gdscript_compiler_sources, ["src/tests/dummy_assault.cpp"], Glob("src/bintr/*.cpp")]
+# Translation objects compiled ahead of time for this target (src/bintr/README.md).
+# They are position independent, so mark them shared for the library link.
+bintr_objects = Glob("src/bintr/*.o")
+for obj in bintr_objects:
+    obj.attributes.shared = 1
+
+sources = [Glob("src/*.cpp"), Glob("src/cpp/*.cpp"), Glob("src/rust/*.cpp"), Glob("src/zig/*.cpp"), Glob("src/elf/*.cpp"), Glob("src/godot/*.cpp"), Glob("src/safegdscript/*.cpp"), gdscript_compiler_sources, ["src/tests/dummy_assault.cpp"], Glob("src/bintr/*.cpp"), bintr_objects]
 
 librisc_sources = [
     # threaded fast-path:
