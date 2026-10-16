@@ -58,6 +58,7 @@ public:
 	static constexpr unsigned MAX_LEVEL = 4; // Maximum call recursion depth
 	// Shared across MAX_LEVEL recursion levels.
 	static constexpr unsigned GUEST_STACK_SIZE = 2u << 20; // 2MB
+	static constexpr unsigned HEAP_ARENA_RESERVE = 256u << 10; // arena left for guest mmap()
 	static constexpr unsigned MAX_REFS = 100; // Default maximum number of references
 	static constexpr unsigned MAX_UNRESTRICTED_REFS = 65536;
 	static constexpr unsigned EDITOR_THROTTLE = 8; // Throttle VM calls from the editor
