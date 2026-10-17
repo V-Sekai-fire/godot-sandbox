@@ -84,9 +84,12 @@ else:
     if ARGUMENTS.get("precision", "single") == "double":
         env.Append(CPPDEFINES=["DOUBLE_PRECISION_REAL_T"])
 
-# Translation objects compiled ahead of time for this target (src/bintr/README.md).
+# Translation units compiled ahead of time for this target (src/bintr/README.md).
+# Only bintr-<HASH>.<i>.o: on the web SCons itself writes .o files here (the
+# generated bintr_<HASH>_register.cpp), and linking a stale one pulls in a
+# translation that is gone, which stops Emscripten loading the extension.
 # They are position independent, so mark them shared for the library link.
-bintr_objects = Glob("src/bintr/*.o")
+bintr_objects = Glob("src/bintr/bintr-*.o")
 for obj in bintr_objects:
     obj.attributes.shared = 1
 
