@@ -33,8 +33,7 @@ src/gen/
 tests/bench/results/
 tests/bench/baseline*.json
 
-# Ahead-of-time translation objects and their generated registration are
-# per program and per target build (src/bintr/README.md); keep them local.
+# Ahead-of-time translation objects are per program and per target build
+# (src/bintr/README.md); keep them local.
 src/bintr/*.o
 src/bintr/*.err
-src/bintr/bintr_*_register.cpp
