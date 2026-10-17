@@ -1082,13 +1082,19 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 		// the lookup is enabled, so a translated program is never emitted again.
 		static thread_local std::string emitted_c99;
 		static thread_local std::vector<std::string> emitted_units;
-		const char *emit_dir = std::getenv("GODOT_SANDBOX_BINTR_EMIT");
+		// Read through Godot, not std::getenv: on Windows OS.set_environment()
+		// changes the process environment but not the C runtime's copy that
+		// getenv reads, so a value a script sets would never be seen.
+		OS *const os = OS::get_singleton();
+		const std::string emit_dir_value = os->has_environment("GODOT_SANDBOX_BINTR_EMIT")
+				? std::string(os->get_environment("GODOT_SANDBOX_BINTR_EMIT").utf8().get_data())
+				: std::string();
+		const char *emit_dir = emit_dir_value.empty() ? nullptr : emit_dir_value.c_str();
 		// GODOT_SANDBOX_BINTR_UNITS=<n>: write the translation as n C units,
 		// bintr-<HASH>.<i>.c, instead of one file. A compiler takes one unit on
 		// one core, so a large guest's single file compiles serially; the units
 		// compile in parallel and link into the same bintr-<HASH> library.
-		const char *emit_units = std::getenv("GODOT_SANDBOX_BINTR_UNITS");
-		const unsigned units = emit_units != nullptr ? unsigned(std::strtoul(emit_units, nullptr, 10)) : 0u;
+		const unsigned units = unsigned(os->get_environment("GODOT_SANDBOX_BINTR_UNITS").to_int());
 		emitted_c99.clear();
 		emitted_units.clear();
 		if (emit_dir != nullptr && bintr_lookup) {
