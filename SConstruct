@@ -84,11 +84,12 @@ else:
     if ARGUMENTS.get("precision", "single") == "double":
         env.Append(CPPDEFINES=["DOUBLE_PRECISION_REAL_T"])
 
-# Translation objects compiled ahead of time for this target (src/bintr/README.md):
-# bintr-<HASH>.<i>.o units and bintr-<HASH>.register.o. The bintr- prefix keeps
-# out the .o files SCons itself writes here when it compiles src/bintr/*.cpp.
+# Translation objects compiled ahead of time (src/bintr/README.md), one folder
+# per target because each target's host layout gives the translation its own
+# hash: src/bintr/<platform>.<arch>/bintr-<HASH>.<i>.o units and
+# bintr-<HASH>.register.o. The bintr- prefix keeps out any .o SCons writes there.
 # They are position independent, so mark them shared for the library link.
-bintr_objects = Glob("src/bintr/bintr-*.o")
+bintr_objects = Glob("src/bintr/%s.%s/bintr-*.o" % (env["platform"], env["arch"]))
 for obj in bintr_objects:
     obj.attributes.shared = 1
 
