@@ -58,6 +58,7 @@ public:
 	static constexpr unsigned MAX_LEVEL = 4; // Maximum call recursion depth
 	// Shared across MAX_LEVEL recursion levels.
 	static constexpr unsigned GUEST_STACK_SIZE = 2u << 20; // 2MB
+	static constexpr unsigned HEAP_ARENA_RESERVE = 256u << 10; // arena left for guest mmap()
 	static constexpr unsigned MAX_REFS = 100; // Default maximum number of references
 	static constexpr unsigned MAX_UNRESTRICTED_REFS = 65536;
 	static constexpr unsigned EDITOR_THROTTLE = 8; // Throttle VM calls from the editor
@@ -151,7 +152,7 @@ public:
 		// runtime class. Keep the resolved MethodBind beside that call site's name.
 		static constexpr unsigned METHOD_CACHE_SIZE = 4; // Must be a power of two
 		struct MethodEntry {
-			const std::type_info *object_type = nullptr;
+			StringName class_name;
 			GDExtensionMethodBindPtr bind = nullptr;
 		};
 		MethodEntry methods[METHOD_CACHE_SIZE];
@@ -824,6 +825,12 @@ public:
 	/// @brief Get a list of properties.
 	/// @return The list of properties.
 	Array get_property_list() const;
+
+	// Object property hooks: Object::get/set/get_property_list reach guest properties through
+	// these. Godot no longer lets an extension bind its own get/set/get_property_list methods.
+	bool _get(const StringName &p_name, Variant &r_ret) const;
+	bool _set(const StringName &p_name, const Variant &p_value);
+	void _get_property_list(List<PropertyInfo> *p_list) const;
 
 	/// @brief Find a property in the sandbox, or return null if it does not exist.
 	/// @param name The name of the property.

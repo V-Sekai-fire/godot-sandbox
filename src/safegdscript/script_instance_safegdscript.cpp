@@ -335,7 +335,16 @@ uint64_t SafeGDScriptInstance::current_instance_base() const {
 	return this->instance_base;
 }
 
+#ifdef __EMSCRIPTEN__
+// wasm32 has no lazy pages: every script's arena is real heap. Compiled scripts keep their
+// Variants host-side, so 8 MiB (a power of two, for the masked arena) leaves them room.
+static constexpr uint32_t SGD_MEMORY_MAX = 8;
+#else
 static constexpr uint32_t SGD_MEMORY_MAX = 32;
+#endif
+// Variants a project script may hold during one call. Sandbox::MAX_REFS (100) suits a small
+// guest; a converted app's scripts build whole UIs and scene trees in one _ready.
+static constexpr uint32_t SGD_MAX_REFS = 8192;
 
 struct SandboxAndCount {
 	Sandbox *sandbox = nullptr;
@@ -409,6 +418,7 @@ static Sandbox *create_sandbox(Object *p_owner, const Ref<SafeGDScript> &p_scrip
 	sandbox_ptr->set_tree_base(fast_cast_to<Node>(p_owner));
 	sandbox_ptr->set_unboxed_arguments(false);
 	sandbox_ptr->set_memory_max(SGD_MEMORY_MAX);
+	sandbox_ptr->set_max_refs(SGD_MAX_REFS);
 	if (p_restricted) {
 		sandbox_ptr->set_restrictions(true);
 	}

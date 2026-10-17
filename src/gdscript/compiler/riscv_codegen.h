@@ -185,6 +185,7 @@ private:
 	void gen_syscall_array_batch(const IRInstruction& instr, int result_vreg);
 	void gen_syscall_dictionary_ops(const IRInstruction& instr, int result_vreg);
 	void gen_dict_const(const IRInstruction& instr);
+	void gen_dict_operate(const IRInstruction& instr);
 	void gen_struct_check(const IRInstruction& instr);
 	void gen_make_dictionary_keyed(const IRInstruction& instr);
 	void gen_get_node(const IRInstruction& instr);
@@ -269,6 +270,7 @@ private:
 	void emit_sub(uint8_t rd, uint8_t rs1, uint8_t rs2);
 	void emit_mul(uint8_t rd, uint8_t rs1, uint8_t rs2);
 	void emit_div(uint8_t rd, uint8_t rs1, uint8_t rs2);
+	void emit_divu(uint8_t rd, uint8_t rs1, uint8_t rs2);
 	void emit_rem(uint8_t rd, uint8_t rs1, uint8_t rs2);
 	void emit_and(uint8_t rd, uint8_t rs1, uint8_t rs2);
 	void emit_or(uint8_t rd, uint8_t rs1, uint8_t rs2);

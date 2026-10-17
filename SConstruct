@@ -5,6 +5,12 @@ import sys
 ARGUMENTS["disable_exceptions"] = "0"
 ARGUMENTS["use_mingw"] = "yes"
 
+# godot-cpp writes its generated bindings into one shared gen/ directory, sized for the arch of
+# whichever build generated them. Reusing 64-bit bindings on wasm32 made String 8 bytes instead
+# of 4, so walking a PackedStringArray read past its end. Regenerate on every build; unchanged
+# files keep their content hash, so nothing recompiles unless the arch or API changed.
+ARGUMENTS.setdefault("generate_bindings", "yes")
+
 # Use a double-precision extension_api.json for double builds, since the
 # default one shipped with godot-cpp is single-precision only.
 if ARGUMENTS.get("precision", "single") == "double" and "custom_api_file" not in ARGUMENTS:
@@ -78,7 +84,16 @@ else:
     if ARGUMENTS.get("precision", "single") == "double":
         env.Append(CPPDEFINES=["DOUBLE_PRECISION_REAL_T"])
 
-sources = [Glob("src/*.cpp"), Glob("src/cpp/*.cpp"), Glob("src/rust/*.cpp"), Glob("src/zig/*.cpp"), Glob("src/elf/*.cpp"), Glob("src/godot/*.cpp"), Glob("src/safegdscript/*.cpp"), gdscript_compiler_sources, ["src/tests/dummy_assault.cpp"], Glob("src/bintr/*.cpp")]
+# Translation objects compiled ahead of time (src/bintr/README.md), one folder
+# per target because each target's host layout gives the translation its own
+# hash: src/bintr/<platform>.<arch>/bintr-<HASH>.<i>.o units and
+# bintr-<HASH>.register.o. The bintr- prefix keeps out any .o SCons writes there.
+# They are position independent, so mark them shared for the library link.
+bintr_objects = Glob("src/bintr/%s.%s/bintr-*.o" % (env["platform"], env["arch"]))
+for obj in bintr_objects:
+    obj.attributes.shared = 1
+
+sources = [Glob("src/*.cpp"), Glob("src/cpp/*.cpp"), Glob("src/rust/*.cpp"), Glob("src/zig/*.cpp"), Glob("src/elf/*.cpp"), Glob("src/godot/*.cpp"), Glob("src/safegdscript/*.cpp"), gdscript_compiler_sources, ["src/tests/dummy_assault.cpp"], Glob("src/bintr/*.cpp"), bintr_objects]
 
 librisc_sources = [
     # threaded fast-path:
@@ -155,6 +170,13 @@ elif env["platform"] == "macos":
     env.Prepend(CPPPATH=["ext/libriscv/lib/libriscv/lib/macos"])
     env.Append(LINKFLAGS=["-framework", "Security"])
     add_godot_cpp_doc_data(env, sources)
+elif env["platform"] == "web":
+    # Godot's web build suspends WebGPU waits with JSPI, which needs no code changes in this
+    # side module. godot-cpp passes -O3 to the compiler only, so optimize at link time too.
+    # libriscv throws and catches C++ exceptions. Emscripten's default throws but never catches,
+    # so use native WebAssembly exceptions, as Godot's dlink main module does.
+    env.Append(CCFLAGS=["-fwasm-exceptions"])
+    env.Append(LINKFLAGS=["-O3", "-fwasm-exceptions"])
 elif env["platform"] == "linux" or env["platform"] == "android":
     env.Prepend(CPPPATH=["ext/libriscv/lib/libriscv/lib/linux"])
     add_godot_cpp_doc_data(env, sources)

@@ -31,6 +31,8 @@ public:
 	static const std::vector<IRPass>& pipeline();
 
 	const IRStringTable* m_strings = nullptr;
+	// LOAD_STRING text. Null in tests that optimize a bare IRFunction.
+	const std::vector<std::string>* m_string_constants = nullptr;
 
 	void set_pass_limit(size_t count) { m_pass_limit = count; }
 	void set_enabled_passes(const std::vector<std::string>& names);
@@ -55,10 +57,13 @@ private:
 	bool try_remove_branch_to_next(const IRFunction& func, size_t& i, std::vector<IRInstruction>& new_instructions);
 	bool copy_propagation(IRFunction& func);
 	bool eliminate_redundant_stores(IRFunction& func);
-	bool scalar_replace_structs(IRFunction& func);
+	bool scalar_replace_dictionaries(IRFunction& func);
 	bool reduce_register_pressure(IRFunction& func);
 	bool loop_invariant_code_motion(IRFunction& func);
 	bool enhanced_copy_propagation(IRFunction& func);
+	bool fuse_dictionary_updates(IRFunction& func);
+	bool sink_lazy_strings(IRFunction& func);
+	bool sink_one_lazy_string(IRFunction& func);
 
 	struct ConstantValue {
 		enum class Type { NONE, INT, FLOAT, BOOL, STRING };

@@ -242,9 +242,6 @@ void Sandbox::_bind_methods() {
 	ClassDB::bind_static_method("Sandbox", D_METHOD("has_feature_binary_translation"), &Sandbox::has_feature_binary_translation);
 
 	// Properties.
-	ClassDB::bind_method(D_METHOD("set", "name", "value"), &Sandbox::set);
-	ClassDB::bind_method(D_METHOD("get", "name"), &Sandbox::get);
-	ClassDB::bind_method(D_METHOD("get_property_list"), &Sandbox::get_property_list);
 
 	ClassDB::bind_method(D_METHOD("set_max_refs", "max"), &Sandbox::set_max_refs, DEFVAL(MAX_REFS));
 	ClassDB::bind_method(D_METHOD("get_max_refs"), &Sandbox::get_max_refs);
@@ -1085,13 +1082,19 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 		// the lookup is enabled, so a translated program is never emitted again.
 		static thread_local std::string emitted_c99;
 		static thread_local std::vector<std::string> emitted_units;
-		const char *emit_dir = std::getenv("GODOT_SANDBOX_BINTR_EMIT");
+		// Read through Godot, not std::getenv: on Windows OS.set_environment()
+		// changes the process environment but not the C runtime's copy that
+		// getenv reads, so a value a script sets would never be seen.
+		OS *const os = OS::get_singleton();
+		const std::string emit_dir_value = os->has_environment("GODOT_SANDBOX_BINTR_EMIT")
+				? std::string(os->get_environment("GODOT_SANDBOX_BINTR_EMIT").utf8().get_data())
+				: std::string();
+		const char *emit_dir = emit_dir_value.empty() ? nullptr : emit_dir_value.c_str();
 		// GODOT_SANDBOX_BINTR_UNITS=<n>: write the translation as n C units,
 		// bintr-<HASH>.<i>.c, instead of one file. A compiler takes one unit on
 		// one core, so a large guest's single file compiles serially; the units
 		// compile in parallel and link into the same bintr-<HASH> library.
-		const char *emit_units = std::getenv("GODOT_SANDBOX_BINTR_UNITS");
-		const unsigned units = emit_units != nullptr ? unsigned(std::strtoul(emit_units, nullptr, 10)) : 0u;
+		const unsigned units = unsigned(os->get_environment("GODOT_SANDBOX_BINTR_UNITS").to_int());
 		emitted_c99.clear();
 		emitted_units.clear();
 		if (emit_dir != nullptr && bintr_lookup) {
@@ -1163,7 +1166,15 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 
 		this->install_self_instrumentation_clock();
 
-		const gaddr_t heap_size = gaddr_t(machine().memory.memory_arena_size() * 0.8) & ~0xFFFLL;
+		// The heap follows the ELF, brk and stack; keep it inside the arena, or a masked
+		// arena wraps its tail onto the program.
+		const gaddr_t arena_size = machine().memory.memory_arena_size();
+		const gaddr_t mmap_now = machine().memory.mmap_address();
+		constexpr gaddr_t page_mask = ~gaddr_t(0xFFF);
+		gaddr_t heap_size = gaddr_t(arena_size * 0.8) & page_mask;
+		if (arena_size > mmap_now + HEAP_ARENA_RESERVE) {
+			heap_size = std::min<gaddr_t>(heap_size, (arena_size - mmap_now - HEAP_ARENA_RESERVE) & page_mask);
+		}
 		const gaddr_t heap_area = machine().memory.mmap_allocate(heap_size);
 
 		// Add native system call interfaces
@@ -1919,7 +1930,7 @@ void RiscvCallable::call(const Variant **p_arguments, int p_argcount, Variant &r
 gaddr_t Sandbox::cached_address_of(int64_t hash, const String &function) const {
 	gaddr_t address = 0x0;
 	auto it = m_lookup.find(hash);
-	if (it != m_lookup.end()) {
+	if (it != m_lookup.end() && it->second.name == function) {
 		return it->second.address;
 	} else if (m_machine != &dummy_machine) {
 		const CharString ascii = function.ascii();
@@ -2520,8 +2531,8 @@ void Sandbox::add_property(const String &name, Variant::Type vtype, uint64_t set
 	m_properties.emplace_back(name, vtype, setter, getter, def);
 
 	// Make the property getter/setter functions visible to address_of and profiling
-	this->add_cached_address("set_" + name, getter);
-	this->add_cached_address("get_" + name, setter);
+	this->add_cached_address("set_" + name, setter);
+	this->add_cached_address("get_" + name, getter);
 }
 void Sandbox::add_property(const String &name, Variant::Type vtype, gaddr_t address, const Variant &def) const
 {
@@ -2754,6 +2765,28 @@ Array Sandbox::get_property_list() const {
 	// Node properties
 	arr.append_array(Node::get_property_list());
 	return arr;
+}
+
+bool Sandbox::_get(const StringName &p_name, Variant &r_ret) const {
+	return const_cast<Sandbox *>(this)->get_property(p_name, r_ret);
+}
+
+bool Sandbox::_set(const StringName &p_name, const Variant &p_value) {
+	return set_property(p_name, p_value);
+}
+
+void Sandbox::_get_property_list(List<PropertyInfo> *p_list) const {
+	for (const SandboxProperty &prop : m_properties) {
+		uint32_t usage = prop.usage() != 0
+				? prop.usage()
+				: uint32_t(PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_STORAGE | PROPERTY_USAGE_SCRIPT_VARIABLE);
+		if (prop.type() == Variant::NIL) {
+			usage |= uint32_t(PROPERTY_USAGE_NIL_IS_VARIANT);
+		} else {
+			usage &= ~uint32_t(PROPERTY_USAGE_NIL_IS_VARIANT);
+		}
+		p_list->push_back(PropertyInfo(Variant::Type(prop.type()), prop.name(), PropertyHint(prop.hint()), prop.hint_string(), usage));
+	}
 }
 
 bool SandboxProperty::set(Sandbox &sandbox, const Variant &value) {

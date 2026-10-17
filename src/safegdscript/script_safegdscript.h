@@ -216,7 +216,7 @@ private:
 	void update_methods_info(GDScriptCompilerBackend &p_compiler);
 	void update_static_dispatch();
 	void update_constants(GDScriptCompilerBackend &p_compiler);
-	void rebuild_nested_classes(GDScriptCompilerBackend &p_compiler);
+	void rebuild_nested_classes(const std::vector<gdscript::ClassSignature> &declared);
 	void rebuild_if_a_base_changed();
 	// Rejects rebuild while this script is stopped at a breakpoint.
 	bool refuse_while_stopped() const;

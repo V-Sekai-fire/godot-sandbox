@@ -2034,7 +2034,7 @@ void SafeGDScript::update_methods_info(GDScriptCompilerBackend &p_compiler) {
 
 	update_constants(p_compiler);
 	update_static_dispatch();
-	rebuild_nested_classes(p_compiler);
+	rebuild_nested_classes(p_compiler.class_signatures());
 
 	if constexpr (VERBOSE_LOGGING) {
 		ERR_PRINT("SafeGDScript::update_methods_info: Updated methods info with " + itos(methods_info.size()) + " methods.");
@@ -2099,8 +2099,7 @@ void SafeGDScript::update_constants(GDScriptCompilerBackend &p_compiler) {
 
 // Updated in place rather than replaced: a live instance holds a Ref to its
 // class and get_script() has to answer the same object across a reload.
-void SafeGDScript::rebuild_nested_classes(GDScriptCompilerBackend &p_compiler) {
-	const std::vector<gdscript::ClassSignature> declared = p_compiler.class_signatures();
+void SafeGDScript::rebuild_nested_classes(const std::vector<gdscript::ClassSignature> &declared) {
 	trait_signatures.clear();
 	for (const gdscript::ClassSignature &signature : declared) {
 		if (signature.is_trait) trait_signatures.push_back(signature);
@@ -2221,9 +2220,10 @@ bool SafeGDScript::load_binary(const PackedByteArray &bytes) noexcept try {
 		methods_info.push_back(method_info_from_signature(sig, name));
 		method_addresses.push_back(0); method_is_static.push_back(sig.is_static);
 	}
-	used_traits.clear(); trait_signatures.clear();
+	used_traits.clear();
 	for (const auto &name : artifact_metadata.uses) used_traits.insert(StringName(String::utf8(name.c_str())));
-	for (const auto &c : artifact_metadata.classes) if (c.is_trait) trait_signatures.push_back(c);
+	update_static_dispatch();
+	rebuild_nested_classes(artifact_metadata.classes);
 	last_error = String();
 	return true;
 } catch (...) { return false; }
