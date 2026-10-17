@@ -1,3 +1,4 @@
+#include <libriscv/linux_errno.hpp>
 #include "gdscript/compiler/syscall_abi.h"
 #include "guest_datatypes.h"
 #include "gdscript/compiler/call_abi.h"
@@ -4810,7 +4811,9 @@ void Sandbox::initialize_syscalls_runtime() {
 		auto &emu = riscv::emu(machine);
 		PENALIZE(100'000); // Add to the instruction counter due to I/O.
 #endif
-		machine.set_result(-ENOSYS);
+		// Linux's ENOSYS, not the host's: glibc falls back (clone3 to clone,
+		// rseq off) only on that number, and Windows numbers ENOSYS 40.
+		machine.set_result(-riscv::linux_errno(ENOSYS));
 	};
 }
 
