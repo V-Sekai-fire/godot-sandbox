@@ -32,3 +32,7 @@ src/gen/
 # two different things, and the harness says so when it sees one.
 tests/bench/results/
 tests/bench/baseline*.json
+
+# Ahead-of-time translation objects are per program and per target build
+# (src/bintr/README.md); keep them local.
+src/bintr/*/

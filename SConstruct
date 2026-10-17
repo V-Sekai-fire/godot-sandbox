@@ -84,7 +84,16 @@ else:
     if ARGUMENTS.get("precision", "single") == "double":
         env.Append(CPPDEFINES=["DOUBLE_PRECISION_REAL_T"])
 
-sources = [Glob("src/*.cpp"), Glob("src/cpp/*.cpp"), Glob("src/rust/*.cpp"), Glob("src/zig/*.cpp"), Glob("src/elf/*.cpp"), Glob("src/godot/*.cpp"), Glob("src/safegdscript/*.cpp"), gdscript_compiler_sources, ["src/tests/dummy_assault.cpp"], Glob("src/bintr/*.cpp")]
+# Translation objects compiled ahead of time (src/bintr/README.md), one folder
+# per target because each target's host layout gives the translation its own
+# hash: src/bintr/<platform>.<arch>/bintr-<HASH>.<i>.o units and
+# bintr-<HASH>.register.o. The bintr- prefix keeps out any .o SCons writes there.
+# They are position independent, so mark them shared for the library link.
+bintr_objects = Glob("src/bintr/%s.%s/bintr-*.o" % (env["platform"], env["arch"]))
+for obj in bintr_objects:
+    obj.attributes.shared = 1
+
+sources = [Glob("src/*.cpp"), Glob("src/cpp/*.cpp"), Glob("src/rust/*.cpp"), Glob("src/zig/*.cpp"), Glob("src/elf/*.cpp"), Glob("src/godot/*.cpp"), Glob("src/safegdscript/*.cpp"), gdscript_compiler_sources, ["src/tests/dummy_assault.cpp"], Glob("src/bintr/*.cpp"), bintr_objects]
 
 librisc_sources = [
     # threaded fast-path:
