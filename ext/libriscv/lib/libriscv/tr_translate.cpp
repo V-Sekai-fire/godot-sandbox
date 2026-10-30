@@ -1,0 +1,1845 @@
+#if __has_include(<bit>)
+# include <bit>
+# if defined(__cpp_lib_bitops)
+#  define RISCV_HAS_BITOPS
+# endif
+#endif
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstring>
+#include <chrono>
+#include <fstream>
+#include <mutex>
+#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_MSC_VER)
+# define YEP_IS_WINDOWS 1
+# include "win32/dlfcn.h"
+# ifdef _MSC_VER
+#  define access _access
+#  define unlink _unlink
+extern "C" int access(const char* path, int mode);
+extern "C" int unlink(const char* path);
+#  define R_OK   4       /* Test for read permission.  */
+# else // _MSC_VER
+#  include <unistd.h>
+# endif
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
+#include "machine.hpp"
+#include "decoder_cache.hpp"
+#include "instruction_list.hpp"
+#include "livepatch.hpp"
+#include "internal_common.hpp"
+#include "rvfd_util.hpp"
+#include "safe_instr_loader.hpp"
+#include "threaded_bytecodes.hpp"
+#include "tr_api.hpp"
+#include "tr_types.hpp"
+#include "util/crc32.hpp"
+#ifdef RISCV_EXT_C
+#include "rvc.hpp"
+#endif
+
+namespace riscv
+{
+	static constexpr bool VERBOSE_BLOCKS = false;
+	static constexpr bool SCAN_FOR_GP = true;
+	static constexpr int ALIGN_MASK = (compressed_enabled) ? 0x1 : 0x3;
+
+	static inline timespec time_now();
+	static inline long nanodiff(timespec, timespec);
+	#define TIME_POINT(x) \
+		[[maybe_unused]] timespec x;  \
+		if (options.translate_timing) { \
+			asm("" : : : "memory");   \
+			x = time_now();           \
+			asm("" : : : "memory");   \
+		}
+	extern void  dylib_close(void* dylib, bool is_libtcc);
+	extern void* dylib_lookup(void* dylib, const char*, bool is_libtcc);
+
+	// Environment override for the binary translation cache (eg. /tmp/rvbintr-*).
+	// Set BINTR_CACHE=0 to neither reuse nor keep cached shared objects. A cached
+	// translation is dlopen'ed before we consider compiling, so without this an
+	// object produced by an older code emitter is silently reused, which hides
+	// emitter changes while iterating on the binary translator.
+	static bool translation_cache_enabled(bool option)
+	{
+		if (const char* env = getenv("BINTR_CACHE"); env != nullptr)
+			return env[0] != '0';
+		return option;
+	}
+
+
+#ifdef RISCV_EXT_VECTOR
+	// Emitted code reaches the vector state through the C struct RVV in
+	// tr_api.cpp, a hand-written mirror of VectorRegisters<W>. A wrong
+	// offset does not crash: the inline guard simply never holds, and every
+	// vector instruction quietly falls back to the interpreter. So hand the
+	// C compiler the real offsets and let it check the mirror.
+	struct VectorLayoutProbe
+	{
+		template <int W>
+		static std::string layout_checks()
+		{
+			using RVVRegs = VectorRegisters<W>;
+			// Offsets within the register file are measured on a live
+			// instance: Registers<W> is not standard-layout, so offsetof
+			// is not portable there.
+			const Registers<W> regs {};
+			const auto reg_offset = [&] (const void* field) {
+				return uintptr_t(field) - uintptr_t(&regs);
+			};
+
+			// An embedded translation is compiled as C++, where the C11
+			// spelling is not accepted, and the JIT compiles the same text
+			// as C99. Compilers without either spelling skip the check
+			// rather than failing to build.
+			std::string checks = "\n/* Generated: RVV mirror vs. VectorRegisters<"
+				+ std::to_string(W) + "> */\n"
+				"#if defined(__cplusplus)\n"
+				"#  define RVV_LAYOUT_ASSERT(cond, msg) static_assert(cond, msg)\n"
+				"#elif defined(__TINYC__) || defined(__GNUC__) || defined(__clang__)\n"
+				"#  define RVV_LAYOUT_ASSERT(cond, msg) _Static_assert(cond, msg)\n"
+				"#else\n"
+				"#  define RVV_LAYOUT_ASSERT(cond, msg) /* unsupported */\n"
+				"#endif\n";
+			const auto check = [&] (const std::string& expr, size_t value) {
+				checks += "RVV_LAYOUT_ASSERT(" + expr + " == " + std::to_string(value)
+					+ ", \"Stale RVV mirror in tr_api.cpp: " + expr + "\");\n";
+			};
+			const auto field = [&] (const char* name, size_t offset) {
+				check("__builtin_offsetof(RVV, " + std::string(name) + ")", offset);
+			};
+			field("lane",   offsetof(RVVRegs, m_vec));
+			field("vl",     offsetof(RVVRegs, m_vl));
+			field("vstart", offsetof(RVVRegs, m_vstart));
+			field("vsew",   offsetof(RVVRegs, m_vsew));
+			field("vtype",  offsetof(RVVRegs, m_vtype));
+			field("lmul",   offsetof(RVVRegs, m_lmul));
+			field("vxrm",   offsetof(RVVRegs, m_vxrm));
+			field("vxsat",  offsetof(RVVRegs, m_vxsat));
+			field("vta",    offsetof(RVVRegs, m_vta));
+			field("vma",    offsetof(RVVRegs, m_vma));
+			field("vill",   offsetof(RVVRegs, m_vill));
+			check("sizeof(RVV)", sizeof(RVVRegs));
+			check("__builtin_offsetof(CPU, rvv)", reg_offset(&regs.rvv()));
+			// The CPU mirror itself, while we are at it
+			check("__builtin_offsetof(CPU, r)",  reg_offset(regs.get().data()));
+			check("__builtin_offsetof(CPU, pc)", reg_offset(&regs.pc));
+			check("__builtin_offsetof(CPU, fr)", reg_offset(&regs.getfl(0)));
+			check("sizeof(CPU)", sizeof(Registers<W>));
+			return checks;
+		}
+	};
+#endif
+
+	// Fused multiply-add for the vector FMA family. std::fma is a libm call
+	// where the compiler cannot assume an FMA instruction, and inlined
+	// vfmadd emits one per element, so bind the entry once to a version
+	// compiled for the CPU we actually run on.
+	static float  libm_fmaf32(float a, float b, float c) { return std::fma(a, b, c); }
+	static double libm_fmaf64(double a, double b, double c) { return std::fma(a, b, c); }
+#if defined(__x86_64__) && !defined(__FMA__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_MSC_VER)
+	__attribute__((target("fma")))
+	static float  hw_fmaf32(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
+	__attribute__((target("fma")))
+	static double hw_fmaf64(double a, double b, double c) { return __builtin_fma(a, b, c); }
+	static bool host_has_fma() { return __builtin_cpu_supports("fma"); }
+#else
+	// Either the FMA is already inline (aarch64, -mfma, ...) or we have no
+	// way of asking, in which case libm is the portable answer.
+	static constexpr auto hw_fmaf32 = libm_fmaf32;
+	static constexpr auto hw_fmaf64 = libm_fmaf64;
+	static bool host_has_fma() { return false; }
+#endif
+
+	template <int W>
+	using binary_translation_init_func = void (*)(const CallbackTable<W>&, int32_t, int32_t, int32_t);
+	template <int W>
+	static CallbackTable<W> create_bintr_callback_table(DecodedExecuteSegment<W>&);
+
+	// Translations that are embeddable in the binary will be added as a source
+	// file directly in the project, which allows it to run global constructors.
+	// The constructor will register the translation with the binary translator,
+	// and we can check against this list when loading translations.
+	template <int W>
+	struct Mapping {
+		address_type<W> addr;
+		unsigned mapping_index;
+	};
+
+	template <int W>
+	struct EmbeddedTranslation {
+		uint32_t    hash = 0;
+		uint32_t    nmappings = 0;
+		uint32_t    nhandlers = 0;
+		const Mapping<W>* mappings = nullptr;
+		const bintr_block_func<W>* handlers = nullptr;
+		// NOTE: Pointer to the init function of the translation
+		binary_translation_init_func<W> init_func = nullptr;
+	};
+	template <int W>
+	static std::vector<EmbeddedTranslation<W>>& registered_embedded_translations()
+	{
+		static std::vector<EmbeddedTranslation<W>> translations;
+		return translations;
+	}
+
+	template <int W>
+	static EmbeddedTranslation<W>* find_embedded_translation_by_hash(uint32_t hash)
+	{
+		for (auto& translation : registered_embedded_translations<W>()) {
+			if (translation.hash == hash) {
+				return &translation;
+			}
+		}
+		return nullptr;
+	}
+
+	template <int W>
+	static void register_translation(uint32_t hash, const Mapping<W>* mappings, uint32_t nmappings,
+		const bintr_block_func<W>* handlers, uint32_t nhandlers, binary_translation_init_func<W> init_func)
+	{
+		static std::mutex translation_mutex;
+		std::scoped_lock lock(translation_mutex);
+
+		auto& translations = registered_embedded_translations<W>();
+		EmbeddedTranslation<W>* existing = find_embedded_translation_by_hash<W>(hash);
+		if (existing == nullptr) {
+			// We allow overwriting existing translations with the same hash
+			translations.emplace_back();
+			existing = &translations.back();
+		}
+		existing->hash = hash;
+		existing->nmappings = nmappings;
+		existing->mappings  = mappings;
+		existing->nhandlers = nhandlers;
+		existing->handlers  = handlers;
+		existing->init_func = init_func;
+
+		if (getenv("VERBOSE")) {
+			printf("libriscv: Registered embedded translation for hash %08X, %u/%u mappings\n",
+				hash, nhandlers, nmappings);
+		}
+	}
+
+	static std::string defines_to_string(const std::unordered_map<std::string, std::string>& cflags)
+	{
+		std::vector<std::string> cflags_str;
+		for (auto pair : cflags) {
+			cflags_str.push_back(" -D" + pair.first + "=" + pair.second);
+		}
+		// Sort the flags to make sure the hash is consistent
+		std::sort(cflags_str.begin(), cflags_str.end());
+
+		std::string defstr;
+		for (auto& str : cflags_str) {
+			defstr += str;
+		}
+		return defstr;
+	}
+
+	static std::string defines_to_c99(const std::unordered_map<std::string, std::string>& defines)
+	{
+		std::vector<std::pair<std::string, std::string>> sorted(defines.begin(), defines.end());
+		std::sort(sorted.begin(), sorted.end());
+		std::string source;
+		for (const auto& [name, value] : sorted) {
+			source += "#define " + name + " " + value + "\n";
+		}
+		return source;
+	}
+
+	// Split a translation into units of about equal code size: each unit is the
+	// defines, RISCV_TRANSLATION_UNIT, the shared prelude and a contiguous run of
+	// blocks; unit 0 also carries the footer (the mappings). A block is never split,
+	// and no unit is empty unless there are fewer blocks than units.
+	template <int W>
+	static void split_shared_c99(const TransOutput<W>& output, unsigned units,
+		std::vector<std::string>& result)
+	{
+		const std::string& code = *output.code;
+		const std::string head = defines_to_c99(output.defines);
+		const std::string_view prelude(code.data(), output.prelude_end);
+		const size_t nblocks = output.block_ends.size();
+		units = std::max(1u, unsigned(std::min<size_t>(units, std::max<size_t>(nblocks, 1))));
+		const size_t body = code.size() - output.prelude_end;
+
+		result.clear();
+		result.reserve(units);
+		size_t begin = output.prelude_end;
+		size_t block = 0;
+		for (unsigned u = 0; u < units; u++) {
+			size_t end = begin;
+			if (u + 1 == units) {
+				end = code.size();
+				block = nblocks;
+			} else {
+				// Take blocks until this unit holds its share of the body.
+				const size_t target = output.prelude_end + body * (u + 1) / units;
+				while (block < nblocks && (end == begin || output.block_ends[block] <= target)
+					&& nblocks - block > units - u - 1) {
+					end = output.block_ends[block++];
+				}
+			}
+			std::string unit;
+			unit.reserve(head.size() + prelude.size() + (end - begin) + (u == 0 ? output.footer.size() : 0) + 64);
+			unit += head;
+			unit += "#define RISCV_TRANSLATION_UNIT " + std::to_string(u) + "\n";
+			unit.append(prelude);
+			unit.append(code, begin, end - begin);
+			if (u == 0)
+			{
+				// The mappings name every handler, most of them defined in other units.
+				for (const auto& sym : output.handler_symbols)
+					unit += "BINTR_FUNC ReturnValues " + sym + "(CPU*, uint64_t, uint64_t, addr_t);\n";
+				unit += output.footer;
+			}
+			result.push_back(std::move(unit));
+			begin = end;
+		}
+	}
+
+	// Set BINTR_DUMP=<path> to write the emitted C to a file.
+	// The defines are written as a leading comment so the dump can be recompiled
+	// standalone with the same flags the translator used.
+	static void dump_generated_code(const std::string& code,
+		const std::unordered_map<std::string, std::string>& defines)
+	{
+		const char* path = getenv("BINTR_DUMP");
+		if (path == nullptr)
+			return;
+		std::ofstream ofs(path, std::ios::out | std::ios::trunc);
+		if (!ofs.is_open()) {
+			fprintf(stderr, "libriscv: Failed to write generated code to %s\n", path);
+			return;
+		}
+		ofs << "/* cc -O2 -std=c99 -fPIC -shared -x c" << defines_to_string(defines) << " */\n";
+		ofs << code;
+		if (getenv("VERBOSE"))
+			printf("libriscv: Wrote %zu bytes of generated code to %s\n", code.size(), path);
+	}
+
+template <int W>
+inline uint32_t opcode(const TransInstr<W>& ti) {
+	return rv32i_instruction{ti.instr}.opcode();
+}
+
+template <int W>
+inline DecoderData<W>& decoder_entry_at(DecoderData<W>* cache, address_type<W> addr) {
+	return cache[addr / DecoderData<W>::DIVISOR];
+}
+
+template <int W>
+static std::unordered_map<std::string, std::string> create_defines_for(const Machine<W>& machine, const MachineOptions<W>& options)
+{
+	// Some executables are loaded at high-memory addresses, which is outside of the memory arena.
+	size_t arena_end                   = machine.memory.memory_arena_size();
+	address_type<W> initial_rodata_end = machine.memory.initial_rodata_end();
+	if (!options.translation_use_arena) {
+		initial_rodata_end = 0;
+		arena_end = 0x1000;
+	}
+
+	std::unordered_map<std::string, std::string> defines;
+	defines.emplace("RISCV_TRANSLATION_DYLIB", std::to_string(W));
+	defines.emplace("RISCV_MAX_SYSCALLS", std::to_string(RISCV_SYSCALLS_MAX));
+	defines.emplace("RISCV_MACHINE_ALIGNMENT", std::to_string(RISCV_MACHINE_ALIGNMENT));
+	// Bake the arena pointer's offset into the translation. It is a fixed offset
+	// into Machine<W>, so making it a constant turns every arena access from
+	// "load the offset global, then load the pointer" into a single load, and lets
+	// the compiler hoist the pointer far more freely. init() still receives the
+	// offset and asserts it matches, so a layout change can never go unnoticed.
+	// The offset is part of the defines, hence of the translation hash, so cached
+	// and embedded translations from a differently-laid-out build are rejected.
+	defines.emplace("RISCV_ARENA_OFFSET",
+		std::to_string(uintptr_t(&machine.memory.memory_arena_ptr_ref()) - uintptr_t(&machine)));
+	if constexpr (W == 16) {
+		defines.emplace("RISCV_ARENA_END", std::to_string(uint64_t(arena_end)));
+		defines.emplace("RISCV_ARENA_ROEND", std::to_string(uint64_t(initial_rodata_end)));
+	} else {
+		defines.emplace("RISCV_ARENA_END", std::to_string(arena_end));
+		defines.emplace("RISCV_ARENA_ROEND", std::to_string(initial_rodata_end));
+	}
+	if constexpr (atomics_enabled) {
+		defines.emplace("RISCV_EXT_A", "1");
+	}
+	if constexpr (compressed_enabled) {
+		defines.emplace("RISCV_EXT_C", "1");
+	}
+	if constexpr (vector_extension) {
+		defines.emplace("RISCV_EXT_VECTOR", std::to_string(vector_extension));
+	}
+	if constexpr (nanboxing) {
+		defines.emplace("RISCV_NANBOXING", "1");
+	}
+	// The emitter varies what it produces on fcsr_emulation, and the translation
+	// hash is built from the defines rather than the emitted code, so this has to
+	// be a define in order for cached translations from an FCSR-less build (and
+	// vice versa) to be rejected instead of silently reused.
+	if constexpr (fcsr_emulation) {
+		defines.emplace("RISCV_FCSR", "1");
+	}
+	if (options.translate_trace) {
+		// Adding this as a define will change the hash of the translation,
+		// so it will be recompiled if the trace option is toggled.
+		defines.emplace("RISCV_TRACING", "1");
+	}
+	if constexpr (encompassing_Nbit_arena != 0) {
+		defines.emplace("RISCV_NBIT_UNBOUNDED", std::to_string(encompassing_Nbit_arena));
+	}
+	// Enters the define hash like RISCV_FCSR: prevents sharing with a sandboxed Machine.
+	if (options.translate_unsafe_remove_checks) {
+		defines.emplace("RISCV_UNCHECKED_MEMORY", "1");
+	}
+	// Enter the hash so cached translations with the opposite setting are not reused.
+	if (options.translate_automatic_nbit_address_space) {
+		defines.emplace("RISCV_NBIT_AUTOMATIC", "1");
+	}
+	if (options.translate_ignore_instruction_limit) {
+		defines.emplace("RISCV_NO_INSTRUCTION_LIMIT", "1");
+	}
+	return defines;
+}
+
+template <int W>
+int CPU<W>::load_translation(const MachineOptions<W>& options,
+	std::string* filename, DecodedExecuteSegment<W>& exec) const
+{
+	bool has_cross_compile = false;
+	for (auto& cc : options.cross_compile) {
+		if (std::holds_alternative<MachineTranslationEmbeddableCodeOptions>(cc)) {
+			has_cross_compile = true;
+			break;
+		}
+	}
+
+	// Disable translator by setting options.translate_enabled to false
+	// or by setting max blocks to zero.
+	if (0 == options.translate_blocks_max || (!options.translate_enabled && !options.translate_enable_embedded && !has_cross_compile)) {
+		if (options.verbose_loader) {
+			printf("libriscv: Binary translation disabled\n");
+		}
+		return -1;
+	}
+
+	if (!has_cross_compile && exec.is_binary_translated() && !options.translate_enable_embedded) {
+		// It's already binary translated, and embedded translations aren't wanted
+		return 0;
+	}
+
+	// Checksum the execute segment, ...
+	TIME_POINT(t5);
+	const std::string cflags = defines_to_string(create_defines_for(machine(), options));
+	extern std::string compile_command(int arch, const std::string& cflags);
+	uint32_t checksum = exec.crc32c_hash();
+	if (UNLIKELY(checksum == 0)) {
+		throw MachineException(INVALID_PROGRAM, "Invalid execute segment hash for translation");
+	}
+	// Also add the compiler flags to the checksum
+	checksum = crc32c(checksum, cflags.c_str(), cflags.size());
+	exec.set_translation_hash(checksum);
+
+	char filebuffer[512];
+	int len = snprintf(filebuffer, sizeof(filebuffer),
+		"%s%08X%s", options.translation_prefix.c_str(), checksum, options.translation_suffix.c_str());
+	if (len <= 0)
+		return -1;
+
+	if (filename) {
+		*filename = filebuffer;
+	}
+
+	if (options.translate_timing) {
+		TIME_POINT(t6);
+		printf(">> Execute segment 0x%X hashing took %ld ns\n", checksum, nanodiff(t5, t6));
+	}
+
+	// Check if translation is registered
+	// Conditions: Either it's JIT (embedded is better), or it's not binary translated (also better)
+	if (options.translate_enable_embedded && (!exec.is_binary_translated() || exec.is_libtcc()))
+	{
+		TIME_POINT(t6);
+
+		for (size_t i = 0; i < registered_embedded_translations<W>().size(); i++)
+		{
+			auto& translation = registered_embedded_translations<W>()[i];
+			if (translation.hash == checksum)
+			{
+				// Initialize the translation
+				Machine<W>& m = const_cast<Machine<W>&> (machine());
+				auto counters = m.get_counters();
+
+				const int32_t ins_counter_offset = uintptr_t(&counters.first) - uintptr_t(&m);
+				const int32_t max_counter_offset = uintptr_t(&counters.second) - uintptr_t(&m);
+				if (static_cast<int32_t>(ins_counter_offset + sizeof(uint64_t)) != max_counter_offset) {
+					throw MachineException(INVALID_PROGRAM, "Invalid counter offsets in emulator");
+				}
+				const int32_t arena_offset = uintptr_t(&machine().memory.memory_arena_ptr_ref()) - uintptr_t(&m);
+#ifdef RISCV_VIRTUAL_PAGING
+				const int32_t rdcache_offset = uintptr_t(&machine().memory.rdcache()) - uintptr_t(&m);
+#else
+				const int32_t rdcache_offset = 0;
+#endif
+
+				translation.init_func(create_bintr_callback_table(exec),
+					arena_offset, ins_counter_offset, rdcache_offset);
+
+				if (options.verbose_loader) {
+					printf("libriscv: Found embedded translation for hash %08X, %u/%u mappings\n",
+						checksum, translation.nhandlers, translation.nmappings);
+				}
+
+				auto& mappings = exec.create_mappings(translation.nhandlers);
+				std::copy(translation.handlers, translation.handlers + translation.nhandlers, mappings.begin());
+
+				const uint8_t bytecode = RV32I_BC_TRANSLATOR;
+				for (unsigned j = 0; j < translation.nmappings; j++) {
+					const auto& mapping = translation.mappings[j];
+
+					auto& entry = decoder_entry_at(exec.decoder_cache(), mapping.addr);
+					entry.set_bytecode(bytecode);
+					entry.set_invalid_handler();
+					entry.instr = mapping.mapping_index;
+				}
+				// If it was registered as JIT before, it's no longer
+				// XXX: Free any resources associated with the JIT translation
+				exec.set_binary_translated(nullptr, false);
+				if (options.translate_timing) {
+					TIME_POINT(t7);
+					printf(">> Activating embedded code took %ld ns\n", nanodiff(t6, t7));
+				}
+				if (!has_cross_compile)
+					return 0;
+			}
+		}
+		if (options.verbose_loader) {
+			printf("libriscv: No embedded translation found for hash %08X\n", checksum);
+		}
+	}
+
+	// At this point we have already if checked for embedded translations,
+	// now exit if it's already been translated or if binary translation is disabled.
+	if (!options.translate_enabled || exec.is_binary_translated())
+		return (has_cross_compile) ? 1 : -1;
+
+	void* dylib = nullptr;
+	if (translation_cache_enabled(options.translation_cache))
+	{
+		TIME_POINT(t7);
+		// Probably not needed, but on Windows there might be some issues
+		// with the emulated dlopen() functionality. Let's serialize it.
+		static std::mutex dlopen_mutex;
+		std::lock_guard<std::mutex> lock(dlopen_mutex);
+		auto& embedded = registered_embedded_translations<W>();
+		const size_t embedded_before = embedded.size();
+		dylib = dlopen(filebuffer, RTLD_LAZY);
+		// A self-registering object is the wrong format for the hash cache. Its
+		// constructor has just stored pointers into itself in the global registry;
+		// remove those registrations before unmapping it to avoid dangling code.
+		if (dylib != nullptr && embedded.size() != embedded_before) {
+			embedded.resize(embedded_before);
+			dylib_close(dylib, false);
+			dylib = nullptr;
+			if (options.verbose_loader) {
+				fprintf(stderr, "libriscv: Refusing self-registering object in translation cache\n");
+			}
+		}
+		if (options.translate_timing) {
+			TIME_POINT(t8);
+			printf(">> dlopen took %ld ns\n", nanodiff(t7, t8));
+		}
+	}
+	bool must_compile = dylib == nullptr;
+
+	// JIT-compilation with libtcc is secondary to high-performance
+	// pre-compiled translations. If no embedded translation is found,
+	// and no shared library is found we may JIT-compile the translation.
+	if constexpr (libtcc_enabled) {
+		if (must_compile)
+			return 1;
+	}
+
+#ifndef _MSC_VER
+	// If cross compilation is enabled, we should check if all results exist
+	for (auto& cc : options.cross_compile) {
+		if (std::holds_alternative<MachineTranslationCrossOptions>(cc))
+		{
+			auto& mingw = std::get<MachineTranslationCrossOptions>(cc);
+			const uint32_t hash = checksum;
+			const std::string cross_filename = options.translation_filename(
+				mingw.cross_prefix, hash, mingw.cross_suffix);
+			if (access(cross_filename.c_str(), R_OK) != 0) {
+				must_compile = true;
+				break; // We must compile at least one of the cross-compiled binaries
+			}
+		} else if (std::holds_alternative<MachineTranslationEmbeddableCodeOptions>(cc)) {
+			must_compile = true;
+			break; // We must compile embeddable source code
+		} else {
+			throw MachineException(INVALID_PROGRAM, "Invalid cross-compile option");
+		}
+	}
+#endif
+
+	// We must compile ourselves
+	if (dylib == nullptr) {
+		if (filename) *filename = std::string(filebuffer);
+		return 1;
+	}
+
+	this->activate_dylib(options, exec, dylib, machine(), false, false);
+
+	if (options.translate_timing) {
+		TIME_POINT(t10);
+		printf(">> Total binary translation loading time %ld ns\n", nanodiff(t5, t10));
+	}
+
+	// If the mingw PE-dll is not found, we must also compile (despite activating the ELF)
+	if (must_compile) {
+		if (filename) *filename = std::string(filebuffer);
+		return 1;
+	}
+	return 0;
+}
+
+static bool is_stopping_instruction(rv32i_instruction instr) {
+	if (instr.opcode() == RV32I_JALR || instr.whole == RV32_INSTR_STOP
+		|| (instr.opcode() == RV32I_SYSTEM && instr.Itype.funct3 == 0 && instr.Itype.imm == 261) // WFI
+	) return true;
+
+#ifdef RISCV_EXT_C
+	if (instr.is_compressed()) {
+		#define CI_CODE(x, y) ((x << 13) | (y))
+		const rv32c_instruction ci { instr };
+		if (ci.opcode() == CI_CODE(0b100, 0b10)) { // VARIOUS
+			if (ci.CR.rd != 0 && ci.CR.rs2 == 0) {
+				return true; // C.JR and C.JALR (aka. RET)
+			}
+		}
+	}
+#endif
+
+	return false;
+}
+
+template <int W>
+static void record_return_location(std::unordered_map<address_type<W>, std::vector<address_type<W>>>& return_locations, address_type<W> caller, address_type<W> callee)
+{
+	// Every direct call site of a function is a candidate for its returns:
+	// the emitter compares the return address against the known sites and
+	// jumps straight to the winner, before falling back to indirect dispatch.
+	return_locations[callee].push_back(caller);
+}
+
+template <int W>
+void CPU<W>::binary_translate(const MachineOptions<W>& options, DecodedExecuteSegment<W>& exec,
+	TransOutput<W>& output) const
+{
+	// Run with VERBOSE=1 to see command and output
+	const bool verbose = options.verbose_loader;
+	const bool trace_instructions = options.translate_trace;
+	bool is_libtcc = libtcc_enabled;
+	if constexpr (libtcc_enabled) {
+		// If there is an embeddable code option, we can't enable libtcc
+		for (auto& cc : options.cross_compile) {
+			if (std::holds_alternative<MachineTranslationEmbeddableCodeOptions>(cc)) {
+				is_libtcc = false;
+				break;
+			}
+		}
+	}
+
+	const address_t basepc    = exec.exec_begin();
+	const address_t endbasepc = exec.exec_end();
+	const uintptr_t arena_ponter_ref = (uintptr_t)machine().memory.memory_arena_ptr_ref();
+	const address_t arena_roend = machine().memory.initial_rodata_end();
+	const address_t arena_size  = machine().memory.memory_arena_size();
+
+	address_t gp = 0;
+if constexpr (SCAN_FOR_GP) {
+	// We assume that GP is initialized with AUIPC,
+	// followed by OP_IMM (and maybe OP_IMM32)
+	for (address_t pc = basepc; pc < endbasepc; ) {
+		const rv32i_instruction instruction
+			= read_instruction(exec.exec_data(), pc, endbasepc);
+		if (instruction.opcode() == RV32I_AUIPC) {
+			const auto auipc = instruction;
+			if (auipc.Utype.rd == 3) { // GP
+				const rv32i_instruction addi
+					= read_instruction(exec.exec_data(), pc + 4, endbasepc);
+				if (addi.opcode() == RV32I_OP_IMM && addi.Itype.funct3 == 0x0) {
+					//printf("Found OP_IMM: ADDI  rd=%d, rs1=%d\n", addi.Itype.rd, addi.Itype.rs1);
+					if (addi.Itype.rd == 3 && addi.Itype.rs1 == 3) { // GP
+						gp = pc + auipc.Utype.upper_imm() + addi.Itype.signed_imm();
+						break;
+					}
+				} else {
+					gp = pc + auipc.Utype.upper_imm();
+					break;
+				}
+			}
+		} // opcode
+
+		if constexpr (compressed_enabled)
+			pc += instruction.length();
+		else
+			pc += 4;
+	} // iterator
+	if (options.translate_timing) {
+		TIME_POINT(t1);
+		printf(">> GP scan took %ld ns, GP=0x%lX\n", nanodiff(output.t0, t1), (long)gp);
+	}
+} // SCAN_FOR_GP
+
+	// EBREAK locations
+	std::unordered_set<address_type<W>> ebreak_locations;
+	for (auto& loc : options.ebreak_locations) {
+		address_t addr = 0;
+		if (std::holds_alternative<address_type<W>>(loc))
+			addr = std::get<address_type<W>>(loc);
+		else
+			addr = machine().address_of(std::get<std::string>(loc));
+		if (addr >= basepc && addr < endbasepc) {
+			ebreak_locations.insert(addr);
+			if (verbose) {
+				printf("libriscv: Binary translator added ebreak location at 0x%lX\n", (long)addr);
+			}
+		}
+	}
+
+	// Code block and loop detection
+	TIME_POINT(t2);
+	const size_t ITS_TIME_TO_SPLIT = (is_libtcc) ? 5'000 : std::max(1u, options.translate_block_split);
+	size_t icounter = 0;
+	std::unordered_set<address_type<W>> global_jump_locations;
+	std::unordered_map<address_type<W>, std::vector<address_type<W>>> return_locations;
+	std::vector<TransInfo<W>> blocks;
+
+	// Insert the ELF entry point as the first global jump location
+	const auto elf_entry = machine().memory.start_address();
+	if (elf_entry >= basepc && elf_entry < endbasepc)
+		global_jump_locations.insert(elf_entry);
+	// Speculate that the first instruction is a jump target
+	global_jump_locations.insert(exec.exec_begin());
+
+	for (auto address : options.translator_jump_hints) {
+		if (address >= basepc && address < endbasepc) {
+			global_jump_locations.insert(address);
+		}
+	}
+	// Indirect jump targets referenced from data: switch tables (32-bit
+	// absolute entries, even on RV64) and function pointer tables. These
+	// become entry points with their own dispatch case, so a jr/jalr through
+	// them stays inside the translated function instead of leaving for the
+	// interpreter, which then has to find its way back in.
+	if (options.translate_scan_data_jump_targets) {
+		const auto& binary = machine().memory.binary();
+		using Elf = riscv::Elf<W>;
+		if (Elf::validate(binary)) {
+			const auto* hdr = machine().memory.elf_header();
+			const auto* phdrs = (const typename Elf::ProgramHeader*)(binary.data() + hdr->e_phoff);
+			size_t found = 0;
+			for (unsigned i = 0; i < hdr->e_phnum; i++) {
+				const auto& ph = phdrs[i];
+				if (ph.p_type != Elf::PT_LOAD)
+					continue;
+				if (ph.p_offset > binary.size() || ph.p_filesz > binary.size() - ph.p_offset)
+					continue;
+				const char* data = binary.data() + ph.p_offset;
+				const auto consider = [&] (uint64_t value) {
+					if (value >= basepc && value < endbasepc && (value & ALIGN_MASK) == 0) {
+						found += global_jump_locations.insert(address_t(value)).second;
+					}
+				};
+				// Small programs keep .rodata in the executable segment, so
+				// scan around the code rather than skipping the segment. The
+				// code itself is skipped: instruction words are not pointers.
+				const auto in_code = [&] (size_t off, size_t size) {
+					const uint64_t vaddr = uint64_t(ph.p_vaddr) + off;
+					return vaddr + size > basepc && vaddr < endbasepc;
+				};
+				for (size_t off = 0; off + 4 <= ph.p_filesz; off += 4) {
+					if (in_code(off, 4)) continue;
+					uint32_t value;
+					std::memcpy(&value, data + off, sizeof(value));
+					consider(value);
+				}
+				if constexpr (W >= 8) {
+					for (size_t off = 0; off + 8 <= ph.p_filesz; off += 8) {
+						if (in_code(off, 8)) continue;
+						uint64_t value;
+						std::memcpy(&value, data + off, sizeof(value));
+						if (value > UINT32_MAX) consider(value);
+					}
+				}
+			}
+			if (verbose) {
+				printf("libriscv: Binary translator found %zu indirect jump targets in data\n", found);
+			}
+		}
+	}
+
+	for (address_t pc = basepc; pc < endbasepc && icounter < options.translate_instr_max; )
+	{
+		const auto block = pc;
+		std::size_t block_insns = 0;
+
+		for (; pc < endbasepc; ) {
+			const rv32i_instruction instruction
+				= read_instruction(exec.exec_data(), pc, endbasepc);
+			if constexpr (compressed_enabled)
+				pc += instruction.length();
+			else
+				pc += 4;
+			block_insns++;
+
+			// JALR and STOP are show-stoppers / code-block enders
+			if (block_insns >= ITS_TIME_TO_SPLIT && is_stopping_instruction(instruction)) {
+				break;
+			}
+		}
+
+		auto block_end = pc;
+		std::unordered_set<address_t> jump_locations;
+		std::vector<rv32i_instruction> block_instructions;
+		block_instructions.reserve(block_insns);
+
+		// Find jump locations inside block
+		for (pc = block; pc < block_end; ) {
+			const rv32i_instruction instruction
+				= read_instruction(exec.exec_data(), pc, endbasepc);
+			const auto opcode = instruction.opcode();
+			bool is_jal = false;
+			bool is_branch = false;
+
+			address_t location = 0;
+			if (opcode == RV32I_JAL) {
+				is_jal = true;
+				const auto offset = instruction.Jtype.jump_offset();
+				location = pc + offset;
+			} else if (opcode == RV32I_BRANCH) {
+				is_branch = true;
+				const auto offset = instruction.Btype.signed_imm();
+				location = pc + offset;
+			}
+#ifdef RISCV_EXT_C
+			else if (instruction.is_compressed())
+			{
+				const rv32c_instruction ci { instruction };
+
+				// Find branch and jump locations
+				if (W == 4 && ci.opcode() == CI_CODE(0b001, 0b01)) { // C.JAL
+					is_jal = true;
+					const int32_t imm = ci.CJ.signed_imm();
+					location = pc + imm;
+				}
+				else if (ci.opcode() == CI_CODE(0b101, 0b01)) { // C.JMP
+					is_jal = true;
+					const int32_t imm = ci.CJ.signed_imm();
+					location = pc + imm;
+				}
+				else if (ci.opcode() == CI_CODE(0b110, 0b01)) { // C.BEQZ
+					is_branch = true;
+					const int32_t imm = ci.CB.signed_imm();
+					location = pc + imm;
+				}
+				else if (ci.opcode() == CI_CODE(0b111, 0b01)) { // C.BNEZ
+					is_branch = true;
+					const int32_t imm = ci.CB.signed_imm();
+					location = pc + imm;
+				}
+			}
+#endif
+
+			// detect far JAL, otherwise use as local jump
+			if (is_jal) {
+				// All JAL target addresses need to be recorded in order
+				// to detect function calls
+				global_jump_locations.insert(location);
+
+				// Record return location for JALR prediction when rd != 0
+				if (instruction.opcode() == RV32I_JAL && instruction.Jtype.rd != 0) {
+					record_return_location<W>(return_locations, pc + instruction.length(), location);
+					global_jump_locations.insert(pc + instruction.length());
+				}
+
+				if (location >= block && location < block_end)
+					jump_locations.insert(location);
+			}
+			// loop detection (negative branch offsets)
+			else if (is_branch) {
+				// only accept branches relative to current block
+				if (location >= block && location < block_end)
+					jump_locations.insert(location);
+				else
+					global_jump_locations.insert(location);
+			}
+
+			// Add instruction to block
+			block_instructions.push_back(instruction);
+			if constexpr (compressed_enabled)
+				pc += instruction.length();
+			else
+				pc += 4;
+		} // process block
+
+		// Process block and add it for emission
+		const size_t length = block_instructions.size();
+		if (length > 0 && icounter + length < options.translate_instr_max)
+		{
+			if constexpr (VERBOSE_BLOCKS) {
+				printf("Block found at %#lX -> %#lX. Length: %zu\n", long(block), long(block_end), length);
+				for (auto loc : jump_locations)
+					printf("-> Jump to %#lX\n", long(loc));
+			}
+
+			blocks.push_back({
+				std::move(block_instructions),
+				block, block_end,
+				basepc, endbasepc,
+				gp,
+				is_libtcc,
+				trace_instructions,
+				options.translate_ignore_instruction_limit,
+				options.use_shared_execute_segments,
+				options.translate_use_register_caching,
+				options.translate_automatic_nbit_address_space,
+				options.translate_use_virtual_paging_fallback,
+				options.translate_unsafe_remove_checks,
+				std::move(jump_locations),
+				return_locations,
+				nullptr, // blocks
+				&ebreak_locations,
+				global_jump_locations,
+				// Memory arena
+				arena_ponter_ref,
+				arena_roend,
+				arena_size
+			});
+			icounter += length;
+			// we can't translate beyond this estimate, otherwise
+			// the compiler will never finish code generation
+			if (blocks.size() >= options.translate_blocks_max)
+				break;
+		}
+
+		pc = block_end;
+	}
+
+	TIME_POINT(t3);
+	if (options.translate_timing) {
+		printf(">> Code block detection %ld ns\n", nanodiff(t2, t3));
+	}
+
+	// Code generation
+	auto& dlmappings = output.mappings;
+	extern const std::string bintr_code;
+	output.code = std::make_shared<std::string>(bintr_code);
+#ifdef RISCV_EXT_VECTOR
+	*output.code += VectorLayoutProbe::layout_checks<W>();
+#endif
+	output.prelude_end = output.code->size();
+	output.block_ends.reserve(blocks.size());
+
+	for (auto& block : blocks)
+	{
+		block.blocks = &blocks;
+		auto result = emit(*output.code, block);
+		output.block_ends.push_back(output.code->size());
+
+		for (auto& mapping : result) {
+			dlmappings.push_back(std::move(mapping));
+		}
+	}
+	// Append all instruction handler -> dl function mappings
+	// to the footer used by shared libraries
+	auto& footer = output.footer;
+	footer += "VISIBLE const uint32_t no_mappings = "
+		+ std::to_string(dlmappings.size()) + ";\n";
+	footer += R"V0G0N(
+struct Mapping {
+	addr_t   addr;
+	unsigned mapping_index;
+};
+VISIBLE const struct Mapping mappings[] = {
+)V0G0N";
+
+	std::unordered_map<std::string, unsigned> mapping_indices;
+	std::vector<const std::string*> handlers;
+	handlers.reserve(blocks.size());
+
+	for (const auto& mapping : dlmappings)
+	{
+		// Create map of unique mappings
+		unsigned mapping_index = 0;
+		auto it = mapping_indices.find(mapping.symbol);
+		if (it == mapping_indices.end()) {
+			mapping_index = handlers.size();
+			mapping_indices.emplace(mapping.symbol, mapping_index);
+			handlers.push_back(&mapping.symbol);
+		} else {
+			mapping_index = it->second;
+		}
+
+		char buffer[128];
+		snprintf(buffer, sizeof(buffer), 
+			"{0x%lX, %u},\n",
+			(long)mapping.addr, mapping_index);
+		footer.append(buffer);
+	}
+	footer += "};\nVISIBLE const uint32_t no_handlers = "
+		+ std::to_string(mapping_indices.size()) + ";\n"
+		+ "VISIBLE const void* unique_mappings[] = {\n";
+
+	// Create array of unique mappings
+	if (handlers.size() != blocks.size())
+		throw MachineException(INVALID_PROGRAM, "Mismatch in unique mappings");
+	for (auto* handler : handlers) {
+		footer += "    " + *handler + ",\n";
+		output.handler_symbols.push_back(*handler);
+	}
+	footer += "};\n";
+
+	if (options.translate_timing) {
+		TIME_POINT(t4);
+		printf(">> Code generation took %ld ns\n", nanodiff(t3, t4));
+	}
+
+	if (verbose) {
+		printf("libriscv: Emitted %zu accelerated instructions, %zu blocks and %zu functions. GP=0x%lX\n",
+			icounter, blocks.size(), dlmappings.size(), (long) gp);
+		std::vector<unsigned> entries;
+		entries.resize(blocks.size());
+		for (auto& mapping : dlmappings) {
+			const unsigned index = mapping_indices.at(mapping.symbol);
+			entries.at(index)++;
+		}
+		for (unsigned i = 0; i < entries.size(); ++i) {
+			printf("libriscv: %u mappings for %s\n", entries[i], handlers[i]->c_str());
+		}
+	}
+}
+
+template <int W>
+void CPU<W>::produce_embeddable_code(const MachineOptions<W>& options, DecodedExecuteSegment<W>& exec,
+	const TransOutput<W>& output, const MachineTranslationEmbeddableCodeOptions& embed)
+{
+	const uint32_t hash = exec.translation_hash();
+	const std::string& embed_filename = options.translation_filename(
+		embed.prefix, hash, embed.suffix);
+
+	std::string embed_code;
+	embed_code.reserve(output.code->size() + output.mappings.size() * 24 + 4096);
+	embed_code += "#define EMBEDDABLE_CODE 1\n"; // Mark as embeddable variant
+	for (auto& def : output.defines) {
+		embed_code += "#define ";
+		embed_code += def.first;
+		embed_code += " ";
+		embed_code += def.second;
+		embed_code += "\n";
+	}
+	embed_code += *output.code;
+	// Construct a footer that self-registers the translation
+	const std::string reg_func = "libriscv_register_translation" + std::to_string(W);
+	embed_code += R"V0G0N(
+struct Mappings {
+	addr_t   addr;
+	unsigned mapping_index;
+};
+typedef ReturnValues (*bintr_func)(CPU*, uint64_t, uint64_t, addr_t);
+# ifdef __cplusplus
+#define EXTERN_C extern "C"
+# else
+#define EXTERN_C extern
+# endif
+#ifndef CALLBACK_INIT
+EXTERN_C void libriscv_register_translation4(uint32_t hash, const struct Mappings* mappings, uint32_t nmappings, const bintr_func* handlers, uint32_t nhandlers, void*);
+EXTERN_C void libriscv_register_translation8(uint32_t hash, const struct Mappings* mappings, uint32_t nmappings, const bintr_func* handlers, uint32_t nhandlers, void*);
+#define REGISTRATION_ATTR  __attribute__((constructor, used))
+#else
+typedef void (*RegistrationFunction) (uint32_t hash, const struct Mappings* mappings, uint32_t nmappings, const bintr_func* handlers, uint32_t nhandlers, void*);
+static RegistrationFunction libriscv_register_translation4;
+static RegistrationFunction libriscv_register_translation8;
+#define REGISTRATION_ATTR /* */
+#endif
+static REGISTRATION_ATTR void register_translation() {
+	static const struct Mappings mappings[] = {
+)V0G0N";
+
+	std::unordered_map<std::string, unsigned> mapping_indices;
+	std::vector<const std::string*> handlers;
+
+	for (const auto& mapping : output.mappings)
+	{
+		// Create map of unique mappings
+		unsigned mapping_index = 0;
+		auto it = mapping_indices.find(mapping.symbol);
+		if (it == mapping_indices.end()) {
+			mapping_index = handlers.size();
+			mapping_indices.emplace(mapping.symbol, mapping_index);
+			handlers.push_back(&mapping.symbol);
+		} else {
+			mapping_index = it->second;
+		}
+
+		char buffer[128];
+		snprintf(buffer, sizeof(buffer), 
+			"{0x%lX, %u},\n",
+			(long)mapping.addr, mapping_index);
+		embed_code += buffer;
+	}
+	embed_code += "    };\n"
+		"static bintr_func unique_mappings[] = {\n";
+	for (auto* handler : handlers) {
+		embed_code += "    ";
+		embed_code += *handler;
+		embed_code += ",\n";
+	}
+	embed_code += "};\n    ";
+	embed_code += reg_func;
+	embed_code += "(" + std::to_string(hash)
+		+ ", mappings, " + std::to_string(output.mappings.size())
+		+ ", unique_mappings, " + std::to_string(mapping_indices.size())
+		+ ", (void*)&init);\n";
+	embed_code += R"V0G0N(}
+#ifdef CALLBACK_INIT
+EXTERN_C __attribute__((used, visibility("default"))) void libriscv_init_with_callback4(RegistrationFunction regfunc) {
+	libriscv_register_translation4 = regfunc;
+	register_translation();
+}
+EXTERN_C __attribute__((used, visibility("default"))) void libriscv_init_with_callback8(RegistrationFunction regfunc) {
+	libriscv_register_translation8 = regfunc;
+	register_translation();
+}
+#endif
+)V0G0N";
+
+	if (embed.result_c99 == nullptr) {
+		// Write the embeddable code to a file
+		std::ofstream embed_file;
+		embed_file.open(embed_filename, std::ios::out | std::ios::trunc);
+		if (!embed_file.is_open()) {
+			throw MachineException(INVALID_PROGRAM, "Failed to open embeddable code file");
+		}
+		embed_file << embed_code;
+	} else {
+		// Return the embeddable code as a string
+		*embed.result_c99 = std::move(embed_code);
+	}
+}
+
+template <int W>
+void CPU<W>::try_translate(const MachineOptions<W>& options, const std::string& filename,
+	std::shared_ptr<DecodedExecuteSegment<W>>& shared_segment) const
+{
+	// Check if compiling new translations is enabled
+	if (!options.translate_invoke_compiler) {
+		// Check if there are any embeddable code options
+		bool has_embeddable = false;
+		for (auto& cc : options.cross_compile) {
+			if (std::holds_alternative<MachineTranslationEmbeddableCodeOptions>(cc)) {
+				// We must compile embeddable source code
+				has_embeddable = true;
+				break;
+			}
+		}
+		if (!has_embeddable)
+			return; // No need to compile anything
+	}
+
+	TransOutput<W> output;
+	TIME_POINT(t0);
+	output.t0 = t0;
+
+	output.defines = create_defines_for(machine(), options);
+	// Live-patching is enabled if the user has provided a callback.
+	const bool live_patch = options.translate_background_callback != nullptr;
+
+	// Compilation step
+	std::function<void()> compilation_step =
+	[this, options, output = std::move(output), filename, live_patch, shared_segment = shared_segment] () mutable
+	{
+		try {
+			auto* exec = shared_segment.get();
+
+			this->binary_translate(options, *exec, output);
+
+			//printf("*** Compiling translation from 0x%lX to 0x%lX ***\n",
+			//	long(shared_segment->exec_begin()), long(shared_segment->exec_end()));
+
+			for (auto& cc : options.cross_compile)
+			{
+				if (std::holds_alternative<MachineTranslationEmbeddableCodeOptions>(cc))
+				{
+					auto& embed = std::get<MachineTranslationEmbeddableCodeOptions>(cc);
+					if (embed.result_shared_c99 != nullptr) {
+						*embed.result_shared_c99 = defines_to_c99(output.defines);
+						embed.result_shared_c99->append(*output.code);
+						embed.result_shared_c99->append(output.footer);
+					}
+					if (embed.result_shared_c99_units != nullptr) {
+						split_shared_c99(output, std::max(1u, embed.shared_c99_units),
+							*embed.result_shared_c99_units);
+					}
+					// Preserve the legacy filename behavior when no string result was
+					// requested, while allowing shared-source-only callers to avoid an
+					// unwanted embeddable file.
+					if (embed.result_c99 != nullptr
+						|| (embed.result_shared_c99 == nullptr && embed.result_shared_c99_units == nullptr)) {
+						produce_embeddable_code(options, *shared_segment, output, embed);
+					}
+				}
+			}
+
+			void* dylib = nullptr;
+			// Final shared library loadable code w/footer
+			const std::string shared_library_code = *output.code + output.footer;
+
+			dump_generated_code(shared_library_code, output.defines);
+
+			TIME_POINT(t9);
+			// If translate_invoke_compiler is disabled, do not compile
+			// This allows for producing embeddable code without invoking the compiler
+			if (libtcc_enabled && options.translate_invoke_compiler) {
+				extern void* libtcc_compile(const std::string&, int arch, const std::unordered_map<std::string, std::string>& defines, const std::string&);
+				dylib = libtcc_compile(shared_library_code, W, output.defines, "");
+			} else if (options.translate_invoke_compiler) {
+				extern void* compile(const std::string&, int arch, const std::string& cflags, const std::string&);
+				extern bool mingw_compile(const std::string&, int arch, const std::string& cflags, const std::string&, const MachineTranslationCrossOptions&);
+				const std::string cflags = defines_to_string(output.defines);
+
+				// If the binary translation has already been loaded, we can skip compilation
+				if (exec->is_binary_translated()) {
+					dylib = exec->binary_translation_so();
+				} else {
+					dylib = compile(shared_library_code, W, cflags, filename);
+				}
+
+				// Optionally produce cross-compiled binaries
+				for (auto& cc : options.cross_compile)
+				{
+					if (std::holds_alternative<MachineTranslationCrossOptions>(cc))
+					{
+		#ifndef _MSC_VER
+						auto& mingw = std::get<MachineTranslationCrossOptions>(cc);
+						const uint32_t hash = exec->translation_hash();
+						const std::string cross_filename = options.translation_filename(
+							mingw.cross_prefix, hash, mingw.cross_suffix);
+						mingw_compile(shared_library_code, W, cflags, cross_filename, mingw);
+		#endif
+					}
+				}
+			}
+
+			if (options.translate_timing) {
+				TIME_POINT(t10);
+				printf(">> Code compilation took %.2f ms\n", nanodiff(t9, t10) / 1e6);
+			}
+
+			// Check compilation result
+			if (dylib != nullptr) {
+				if (!exec->is_binary_translated()) {
+					// Activation reads and patches the decoder cache, which the owning
+					// thread may still be generating when we are compiling in the
+					// background. Wait for it to be complete before touching it.
+					if (live_patch)
+						exec->wait_for_decoder_cache_ready();
+					activate_dylib(options, *exec, dylib, machine(), libtcc_enabled, live_patch);
+				}
+
+				if constexpr (!libtcc_enabled) {
+					if (!translation_cache_enabled(options.translation_cache)) {
+						// Delete the shared object if it is unwanted
+						unlink(filename.c_str());
+					}
+				}
+			}
+
+			if (options.translate_timing) {
+				TIME_POINT(t12);
+				printf(">> Binary translation totals %.2f ms\n", nanodiff(output.t0, t12) / 1e6);
+			}
+
+			// Signal compilation completion
+			if (live_patch) {
+				exec->set_background_compiling(false);
+			}
+		} catch (const std::exception& e) {
+			if (options.verbose_loader) {
+				fprintf(stderr, "libriscv: Binary translation failed: %s\n", e.what());
+			}
+			// If we are live patching, we must signal that the compilation failed
+			if (live_patch) {
+				shared_segment->set_background_compiling(false);
+			}
+			throw; // Re-throw the exception
+		}
+	};
+
+	if (live_patch) {
+		shared_segment->set_background_compiling(true);
+		// User-provided callback for background compilation
+		try {
+			options.translate_background_callback(compilation_step);
+		} catch (...) {
+			// If the callback failed to take ownership of the compilation step,
+			// nobody will ever clear the flag, and the execute segment would
+			// block forever on destruction. Clear it here instead.
+			shared_segment->set_background_compiling(false);
+			throw;
+		}
+	} else {
+		// Synchronous compilation
+		compilation_step();
+	}
+}
+
+template <int W>
+void CPU<W>::activate_dylib(const MachineOptions<W>& options, DecodedExecuteSegment<W>& exec, void* dylib, const Machine<W>& machine, bool is_libtcc, bool live_patch)
+{
+	TIME_POINT(t11);
+
+	if (!initialize_translated_segment(exec, dylib, machine, is_libtcc))
+	{
+		if constexpr (!libtcc_enabled) {
+			// only warn when translation is not already disabled
+			if (options.verbose_loader) {
+				fprintf(stderr, "libriscv: Could not find dylib init function\n");
+			}
+		}
+		if (dylib != nullptr) {
+			dylib_close(dylib, is_libtcc);
+		}
+		exec.set_binary_translated(nullptr, false);
+		exec.set_background_compiling(false);
+		return;
+	}
+
+	// Map all the functions to instruction handlers
+	const uint32_t* no_mappings = (const uint32_t *)dylib_lookup(dylib, "no_mappings", is_libtcc);
+	const auto* mappings = (const Mapping<W> *)dylib_lookup(dylib, "mappings", is_libtcc);
+	const uint32_t* no_handlers = (const uint32_t *)dylib_lookup(dylib, "no_handlers", is_libtcc);
+	const auto* handlers = (const bintr_block_func<W> *)dylib_lookup(dylib, "unique_mappings", is_libtcc);
+
+	// A mapping names a distinct instruction address, so the segment bounds how many there can be.
+	const uint64_t max_mappings = uint64_t(exec.exec_end() - exec.exec_begin()) / (compressed_enabled ? 2 : 4);
+	if (no_mappings == nullptr || mappings == nullptr || no_handlers == nullptr || handlers == nullptr
+		|| *no_mappings > max_mappings) {
+		// Refuse the library and keep interpreting, as for a missing init().
+		if (options.verbose_loader) {
+			fprintf(stderr, "libriscv: Invalid mappings in binary translation program\n");
+		}
+		dylib_close(dylib, is_libtcc);
+		exec.set_binary_translated(nullptr, false);
+		exec.set_background_compiling(false);
+		return;
+	}
+
+	// After this, we should automatically close the dylib on destruction
+	exec.set_binary_translated(dylib, is_libtcc);
+
+	// A patched copy of the decoder cache, which running threads are switched
+	// over to once every mapping has been applied to it.
+	std::unique_ptr<LivePatchedDecoderCache<W>> patched;
+	if (live_patch)
+		patched = std::make_unique<LivePatchedDecoderCache<W>>(exec, *no_mappings);
+
+	std::unordered_map<bintr_block_func<W>, unsigned> block_indices;
+	const unsigned nmappings = *no_mappings;
+	const unsigned unique_mappings = *no_handlers;
+
+	// Create N+1 mappings, where the last one is a catch-all for invalid mappings
+	auto& exec_mappings = exec.create_mappings(unique_mappings + 1);
+	std::copy(handlers, handlers + unique_mappings, exec_mappings.begin());
+	exec.set_mapping(unique_mappings, [] (CPU<W>&, uint64_t, uint64_t, address_t) -> bintr_block_returns<W> {
+		throw MachineException(INVALID_PROGRAM, "Translation mapping outside execute area");
+	});
+
+	// Apply mappings to decoder cache
+	// NOTE: It is possible to optimize this by applying from the end towards the beginning
+	// and for each mapping, move on to the next mapping when that mappings address is reached.
+	// This way, we can avoid the O(n) search for each mapping, and instead do it in O(1).
+	for (unsigned i = 0; i < nmappings; i++)
+	{
+		const unsigned mapping_index = mappings[i].mapping_index;
+		const auto addr = mappings[i].addr;
+
+		if (exec.is_within(addr)) {
+		#ifdef RISCV_ASMJIT
+			// The asmjit backend ran first (asmjit_override_bintr) and already
+			// owns this decoder entry, so binary translation must not claim it.
+			{
+				const auto& claimed = decoder_entry_at(exec.decoder_cache(), addr);
+				if (claimed.get_bytecode() == RV32I_BC_ASMJIT
+					&& claimed.is_invalid_handler()
+					&& claimed.instr < exec.asmjit_mappings())
+					continue;
+			}
+		#endif
+			auto* handler = handlers[mapping_index];
+			if (handler != nullptr)
+			{
+				if (live_patch) {
+					// NOTE: If we don't use the patched decoder here, entries
+					// will trample each other in the patched decoder cache.
+					// The claimed instruction becomes the last one of its block.
+					auto& entry = patched->claim(addr, options.verbose_loader);
+					entry.set_bytecode(RV32I_BC_TRANSLATOR);
+					entry.set_invalid_handler();
+					entry.instr  = mapping_index;
+					entry.idxend = 0;
+				#ifdef RISCV_EXT_C
+					entry.icount = 0;
+				#endif
+				} else {
+					// Normal block-end hint that will be transformed into a translation
+					// bytecode if it passes a few more checks, later.
+					auto& entry = decoder_entry_at(exec.decoder_cache(), addr);
+					entry.set_bytecode(RV32I_BC_TRANSLATOR);
+					entry.set_invalid_handler();
+					entry.instr = mapping_index;
+				}
+			} else {
+				auto& entry = decoder_entry_at(exec.decoder_cache(), addr);
+				entry.set_bytecode(0x0); /* Invalid opcode */
+			}
+		} else if (options.verbose_loader) {
+			fprintf(stderr, "libriscv: Translation mapping 0x%lX outside execute area 0x%lX-0x%lX\n",
+				(long)addr, (long)exec.exec_begin(), (long)exec.exec_end());
+		}
+	}
+
+	if (live_patch) {
+		// Hand the patched decoder cache to the execute segment, and (unless the
+		// user turned it off) switch running threads over to it.
+		const size_t patch_count = patched->patch_count();
+		patched->activate(options.translate_live_patching);
+		if (options.translate_live_patching && options.verbose_loader) {
+			printf("libriscv: Patched %zu instructions for live-patching\n", patch_count);
+		}
+	}
+
+	if (options.translate_timing) {
+		TIME_POINT(t12);
+		printf(">> Binary translation activation %ld ns\n", nanodiff(t11, t12));
+	}
+	if (options.verbose_loader) {
+		printf("libriscv: Activated %s binary translation with hash 0x%X, %u/%u mappings%s\n",
+			is_libtcc ? "libtcc" : "full",
+			exec.translation_hash(),
+			unique_mappings, nmappings,
+			live_patch ? ", live-patching enabled" : "");
+	}
+}
+
+template <int W>
+CallbackTable<W> create_bintr_callback_table(DecodedExecuteSegment<W>&)
+{
+	return CallbackTable<W>{
+		// Memory exceptions: fully translated code is compiled with -fexceptions,
+		// so the exception simply unwinds through the generated C with its
+		// original stack intact, all the way out of the dispatch loop. Catching
+		// it here only to re-throw would unwind those frames first and hide the
+		// fault site, so it is left alone.
+		// libtcc-generated code has no unwind information at all, so there the
+		// exception has to be stored in the CPU and re-thrown by dispatch once we
+		// are back in C++ frames (see handle_rethrow_exception).
+		.mem_read8 = [] (CPU<W>& cpu, address_type<W> addr) -> uint8_t {
+#ifdef RISCV_LIBTCC
+			try {
+				return cpu.machine().memory.template read<uint8_t>(addr);
+			} catch (...) {
+				cpu.set_current_exception(std::current_exception());
+				cpu.machine().stop();
+				return 0;
+			}
+#else
+			return cpu.machine().memory.template read<uint8_t>(addr);
+#endif
+		},
+		.mem_read16 = [] (CPU<W>& cpu, address_type<W> addr) -> uint16_t {
+#ifdef RISCV_LIBTCC
+			try {
+				return cpu.machine().memory.template read<uint16_t>(addr);
+			} catch (...) {
+				cpu.set_current_exception(std::current_exception());
+				cpu.machine().stop();
+				return 0;
+			}
+#else
+			return cpu.machine().memory.template read<uint16_t>(addr);
+#endif
+		},
+		.mem_read32 = [] (CPU<W>& cpu, address_type<W> addr) -> uint32_t {
+#ifdef RISCV_LIBTCC
+			try {
+				return cpu.machine().memory.template read<uint32_t>(addr);
+			} catch (...) {
+				cpu.set_current_exception(std::current_exception());
+				cpu.machine().stop();
+				return 0;
+			}
+#else
+			return cpu.machine().memory.template read<uint32_t>(addr);
+#endif
+		},
+		.mem_read64 = [] (CPU<W>& cpu, address_type<W> addr) -> uint64_t {
+#ifdef RISCV_LIBTCC
+			try {
+				return cpu.machine().memory.template read<uint64_t>(addr);
+			} catch (...) {
+				cpu.set_current_exception(std::current_exception());
+				cpu.machine().stop();
+				return 0;
+			}
+#else
+			return cpu.machine().memory.template read<uint64_t>(addr);
+#endif
+		},
+		.mem_write8 = [] (CPU<W>& cpu, address_type<W> addr, uint8_t value) -> void {
+#ifdef RISCV_LIBTCC
+			try {
+				cpu.machine().memory.template write<uint8_t>(addr, value);
+			} catch (...) {
+				cpu.set_current_exception(std::current_exception());
+				cpu.machine().stop();
+			}
+#else
+			cpu.machine().memory.template write<uint8_t>(addr, value);
+#endif
+		},
+		.mem_write16 = [] (CPU<W>& cpu, address_type<W> addr, uint16_t value) -> void {
+#ifdef RISCV_LIBTCC
+			try {
+				cpu.machine().memory.template write<uint16_t>(addr, value);
+			} catch (...) {
+				cpu.set_current_exception(std::current_exception());
+				cpu.machine().stop();
+			}
+#else
+			cpu.machine().memory.template write<uint16_t>(addr, value);
+#endif
+		},
+		.mem_write32 = [] (CPU<W>& cpu, address_type<W> addr, uint32_t value) -> void {
+#ifdef RISCV_LIBTCC
+			try {
+				cpu.machine().memory.template write<uint32_t>(addr, value);
+			} catch (...) {
+				cpu.set_current_exception(std::current_exception());
+				cpu.machine().stop();
+			}
+#else
+			cpu.machine().memory.template write<uint32_t>(addr, value);
+#endif
+		},
+		.mem_write64 = [] (CPU<W>& cpu, address_type<W> addr, uint64_t value) -> void {
+#ifdef RISCV_LIBTCC
+			try {
+				cpu.machine().memory.template write<uint64_t>(addr, value);
+			} catch (...) {
+				cpu.set_current_exception(std::current_exception());
+				cpu.machine().stop();
+			}
+#else
+			cpu.machine().memory.template write<uint64_t>(addr, value);
+#endif
+		},
+		.vec_load = [] (CPU<W>& cpu, int vd, address_type<W> addr) {
+#ifdef RISCV_EXT_VECTOR
+			auto& rvv = cpu.registers().rvv();
+			rvv.get(vd) = cpu.machine().memory.template read<VectorLane> (addr);
+#else
+			(void)cpu; (void)addr; (void)vd;
+#endif
+		},
+		.vec_store = [] (CPU<W>& cpu, address_type<W> addr, int vd) {
+#ifdef RISCV_EXT_VECTOR
+			auto& rvv = cpu.registers().rvv();
+			cpu.machine().memory.template write<VectorLane> (addr, rvv.get(vd));
+#else
+			(void)cpu; (void)addr; (void)vd;
+#endif
+		},
+		.syscalls = Machine<W>::syscall_handlers.data(),
+		.system_call = [] (CPU<W>& cpu, address_type<W> pc, uint64_t ic, uint64_t max_ic, int sysno) -> uint64_t {
+			try {
+				cpu.machine().set_instruction_counter(ic);
+				cpu.machine().set_max_instructions(max_ic);
+				cpu.registers().pc = pc; // Set PC to the syscall instruction
+				const auto current_tp = cpu.reg(REG_TP);
+				const auto current_pc = cpu.registers().pc;
+				cpu.machine().system_call(sysno);
+				if (cpu.registers().pc != current_pc || cpu.reg(REG_TP) != current_tp || cpu.machine().stopped()) {
+					cpu.registers().pc += 4; // Advance PC to the next instruction
+					return 0;
+				}
+				return cpu.machine().max_instructions(); // No change in PC or TP, syscall did not alter execution flow
+			} catch (...) {
+#ifdef RISCV_LIBTCC
+				cpu.set_current_exception(std::current_exception());
+				cpu.machine().stop();
+				return false;
+#else
+				throw;
+#endif
+			}
+		},
+		.unknown_syscall = [] (CPU<W>& cpu, address_type<W> sysno) {
+			cpu.machine().on_unhandled_syscall(cpu.machine(), sysno);
+		},
+		.system = [] (CPU<W>& cpu, uint32_t instr) -> int {
+			try {
+				cpu.machine().system(rv32i_instruction{instr});
+				return 0;
+			} catch (...) {
+#ifdef RISCV_LIBTCC
+				cpu.set_current_exception(std::current_exception());
+				return 1; // Indicate that an exception occurred
+#else
+				throw; // Re-throw the exception
+#endif
+			}
+		},
+		.execute = [] (CPU<W>& cpu, uint32_t instr) -> unsigned {
+			const rv32i_instruction rvi{instr};
+			auto* handler = cpu.decode(rvi).handler;
+			handler(cpu, rvi);
+			return DecoderData<W>::handler_index_for(handler);
+		},
+		.execute_handler = [] (CPU<W>& cpu, uint32_t instr, void(*handler)(CPU<W>&, rv32i_instruction)) -> unsigned {
+			const rv32i_instruction rvi{instr};
+			try {
+				handler(cpu, rvi);
+				return 0;
+			} catch (...) {
+#ifdef RISCV_LIBTCC
+				cpu.set_current_exception(std::current_exception());
+				return 1;
+#else
+				throw;
+#endif
+			}
+		},
+		.handlers = (void (**)(CPU<W>&, uint32_t)) DecoderData<W>::get_handlers(),
+		.trigger_exception = [] (CPU<W>& cpu, address_type<W> pc, int e) {
+			cpu.registers().pc = pc; // XXX: Set PC to the failing instruction (?)
+#ifdef RISCV_LIBTCC
+			if (cpu.current_execute_segment().is_libtcc())
+			{
+				// If we're using libtcc, we can't throw C++ exceptions because
+				// there's no unwinding support. But we can mark an exception
+				// in the CPU state and return back to dispatch.
+				try {
+					cpu.trigger_exception(e);
+				} catch (...) {
+					cpu.set_current_exception(std::current_exception());
+				}
+				// Trigger a slow-path in dispatch (which will check for exceptions)
+				cpu.machine().stop();
+				return;
+			}
+#endif
+			cpu.trigger_exception(e);
+		},
+		.trace = [] (CPU<W>& cpu, const char* msg, address_type<W> addr, uint32_t instr) {
+			(void)cpu;
+			printf("f %s pc 0x%lX instr %08X\n", msg, (long)addr, instr);
+		},
+		.sqrtf32 = [] (float f) -> float {
+			return std::sqrt(f);
+		},
+		.sqrtf64 = [] (double d) -> double {
+			return std::sqrt(d);
+		},
+		// RISC-V spec §11.6 (fused, single rounding) + §11.3 (NaN
+		// outputs must be canonicalized to the canonical qNaN).
+		.fmaf32 = [] (float a, float b, float c) -> float {
+			float r = std::fma(a, b, c);
+			if (std::isnan(r)) {
+				uint32_t canon = 0x7FC00000u;
+				float out;
+				__builtin_memcpy(&out, &canon, 4);
+				return out;
+			}
+			return r;
+		},
+		.fmaf64 = [] (double a, double b, double c) -> double {
+			double r = std::fma(a, b, c);
+			if (std::isnan(r)) {
+				uint64_t canon = 0x7FF8000000000000ull;
+				double out;
+				__builtin_memcpy(&out, &canon, 8);
+				return out;
+			}
+			return r;
+		},
+		// The vector FMA family rounds once like the scalar one, but leaves
+		// a NaN result as std::fma produced it, matching rvv_instr.cpp.
+		.vfmaf32 = host_has_fma() ? hw_fmaf32 : libm_fmaf32,
+		.vfmaf64 = host_has_fma() ? hw_fmaf64 : libm_fmaf64,
+		// FMIN/FMAX with RISC-V -0.0 < +0.0 convention. std::fmin/fmax
+		// leave the ±0 case implementation-defined, and two NaN operands must
+		// produce the canonical qNaN. The rules live in rvfd_util.hpp, shared
+		// with the interpreter and the asmjit backend so that all three answer
+		// the same thing.
+		.fmin32_rv = rv_fmin32,
+		.fmax32_rv = rv_fmax32,
+		.fmin64_rv = rv_fmin64,
+		.fmax64_rv = rv_fmax64,
+		.clz = [] (uint32_t x) -> int {
+#ifdef RISCV_HAS_BITOPS
+			return std::countl_zero(x);
+#else
+			return x ? __builtin_clz(x) : 32;
+#endif
+		},
+		.clzl = [] (uint64_t x) -> int {
+#ifdef RISCV_HAS_BITOPS
+			return std::countl_zero(x);
+#else
+			return x ? __builtin_clzl(x) : 64;
+#endif
+		},
+		.ctz = [] (uint32_t x) -> int {
+#ifdef RISCV_HAS_BITOPS
+			return std::countr_zero(x);
+#else
+			return x ? __builtin_ctz(x) : 0;
+#endif
+		},
+		.ctzl = [] (uint64_t x) -> int {
+#ifdef RISCV_HAS_BITOPS
+			return std::countr_zero(x);
+#else
+			return x ? __builtin_ctzl(x) : 0;
+#endif
+		},
+		.cpop = [] (uint32_t x) -> int {
+#ifdef RISCV_HAS_BITOPS
+			return std::popcount(x);
+#else
+			return __builtin_popcount(x);
+#endif
+		},
+		.cpopl = [] (uint64_t x) -> int {
+#ifdef RISCV_HAS_BITOPS
+			return std::popcount(x);
+#else
+			return __builtin_popcountl(x);
+#endif
+		},
+	};
+}
+
+template <int W>
+bool CPU<W>::initialize_translated_segment(DecodedExecuteSegment<W>& exec, void* dylib, const Machine<W>& machine, bool is_libtcc)
+{
+	// NOTE: At some point this must be able to duplicate the dylib
+	// in order to be able to share execute segments across machines.
+
+	auto* ptr = dylib_lookup(dylib, "init", is_libtcc); // init() function
+	if (ptr == nullptr) {
+		return false;
+	}
+
+	// Map the API callback table
+	auto counters = const_cast<Machine<W>&> (machine).get_counters();
+	auto func = (binary_translation_init_func<W>) ptr;
+
+	const int32_t ins_counter_offset = uintptr_t(&counters.first) - uintptr_t(&machine);
+	const int32_t max_counter_offset = uintptr_t(&counters.second) - uintptr_t(&machine);
+	if (static_cast<int32_t>(ins_counter_offset + sizeof(uint64_t)) != max_counter_offset) {
+		throw MachineException(INVALID_PROGRAM, "Invalid counter offsets in emulator");
+	}
+	const int32_t arena_offset = uintptr_t(&machine.memory.memory_arena_ptr_ref()) - uintptr_t(&machine);
+
+	// Translations bake the arena offset in as a constant (RISCV_ARENA_OFFSET). It
+	// is covered by the translation hash, so a mismatch should be impossible -- but
+	// getting it wrong would mean every guest memory access reads a bogus pointer,
+	// so refuse the translation instead of taking the chance.
+	if (const auto* baked = (const int32_t *)dylib_lookup(dylib, "arena_offset_constant", is_libtcc);
+		baked != nullptr && *baked != arena_offset) {
+		return false;
+	}
+
+#ifdef RISCV_VIRTUAL_PAGING
+	const int32_t rdcache_offset = uintptr_t(&machine.memory.rdcache()) - uintptr_t(&machine);
+#else
+	const int32_t rdcache_offset = 0;
+#endif
+
+	func(create_bintr_callback_table<W>(exec), arena_offset, ins_counter_offset, rdcache_offset);
+
+	return true;
+}
+
+template <int W>
+std::string MachineOptions<W>::translation_filename(const std::string& prefix, uint32_t hash, const std::string& suffix)
+{
+	char buffer[256];
+	const int len = snprintf(buffer, sizeof(buffer), "%s%08X%s",
+		prefix.c_str(), hash, suffix.c_str());
+	return std::string(buffer, len);
+}
+
+#ifdef RISCV_32I
+	template void CPU<4>::try_translate(const MachineOptions<4>&, const std::string&, std::shared_ptr<DecodedExecuteSegment<4>>&) const;
+	template int CPU<4>::load_translation(const MachineOptions<4>&, std::string*, DecodedExecuteSegment<4>&) const;
+	template std::string MachineOptions<4>::translation_filename(const std::string&, uint32_t, const std::string&);
+#endif
+#ifdef RISCV_64I
+	template void CPU<8>::try_translate(const MachineOptions<8>&, const std::string&, std::shared_ptr<DecodedExecuteSegment<8>>&) const;
+	template int CPU<8>::load_translation(const MachineOptions<8>&, std::string*, DecodedExecuteSegment<8>&) const;
+	template std::string MachineOptions<8>::translation_filename(const std::string&, uint32_t, const std::string&);
+#endif
+#ifdef RISCV_128I
+	template void CPU<16>::try_translate(const MachineOptions<16>&, const std::string&, std::shared_ptr<DecodedExecuteSegment<16>>&) const;
+	template int CPU<16>::load_translation(const MachineOptions<16>&, std::string*, DecodedExecuteSegment<16>&) const;
+	template std::string MachineOptions<16>::translation_filename(const std::string&, uint32_t, const std::string&);
+#endif
+
+	timespec time_now()
+	{
+		timespec t;
+#ifdef YEP_IS_WINDOWS
+		std::chrono::nanoseconds ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::high_resolution_clock::now().time_since_epoch());
+		t.tv_sec  = ns.count() / 1000000000;
+		t.tv_nsec = ns.count() % 1000000000;
+#else
+		clock_gettime(CLOCK_MONOTONIC, &t);
+#endif
+		return t;
+	}
+	long nanodiff(timespec start_time, timespec end_time)
+	{
+		return (end_time.tv_sec - start_time.tv_sec) * (long)1e9 + (end_time.tv_nsec - start_time.tv_nsec);
+	}
+} // riscv
+
+extern "C" {
+	void RISCV_EXPORT libriscv_register_translation4(uint32_t hash, const riscv::Mapping<4>* mappings, uint32_t nmappings,
+		const riscv::bintr_block_func<4>* handlers, uint32_t nhandlers, void* init_func_ptr)
+	{
+#ifdef RISCV_32I
+		riscv::register_translation<4>(hash, mappings, nmappings, handlers, nhandlers, (riscv::binary_translation_init_func<4>)init_func_ptr);
+#else
+		(void)hash; (void)mappings; (void)nmappings; (void)handlers; (void)nhandlers; (void)init_func_ptr;
+		fprintf(stderr, "libriscv: Warning: libriscv_register_translation4 called on 64-bit build\n");
+#endif
+	}
+	void RISCV_EXPORT libriscv_register_translation8(uint32_t hash, const riscv::Mapping<8>* mappings, uint32_t nmappings,
+		const riscv::bintr_block_func<8>* handlers, uint32_t nhandlers, void* init_func_ptr)
+	{
+#ifdef RISCV_64I
+		riscv::register_translation<8>(hash, mappings, nmappings, handlers, nhandlers, (riscv::binary_translation_init_func<8>)init_func_ptr);
+#else
+		(void)hash; (void)mappings; (void)nmappings; (void)handlers; (void)nhandlers; (void)init_func_ptr;
+		fprintf(stderr, "libriscv: Warning: libriscv_register_translation8 called on 32-bit build\n");
+#endif
+	}
+}
