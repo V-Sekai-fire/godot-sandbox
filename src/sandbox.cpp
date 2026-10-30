@@ -1047,6 +1047,13 @@ bool Sandbox::load(const PackedByteArray *buffer, const std::vector<std::string>
 		this->m_unchecked_memory_active = this->unchecked_memory_wanted();
 		options->translate_unsafe_remove_checks = this->m_unchecked_memory_active;
 		options->default_exit_function = "fast_exit";
+		// A guest that links static glibc carries an ifunc trampoline in .iplt, outside .text:
+		// load the whole executable segment, or the first jump into it faults "Illegal opcode
+		// executed" (the same limit rvlinux's -I exists for). Measured on every guest the
+		// viewers ship: the executable PT_LOAD equals .text exactly for skintokens.elf,
+		// motion.elf, mm.elf, mujoco.elf and headfit.elf, and exceeds it only for usd.elf, by
+		// its 9 KB .pxrctor. So this changes the execute segment of no shipped guest.
+		options->ignore_text_section = true;
 #if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
 		// Background compilation, if enabled, will run the compilation in a separate thread
 		// and live-patch the results into the decoder cache after the compilation is done.
