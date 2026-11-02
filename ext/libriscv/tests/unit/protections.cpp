@@ -106,14 +106,8 @@ TEST_CASE("Caches must be invalidated", "[Memory]")
 	machine.memory.memset(V, 0, VLEN);
 	// Read data from page, causing cached read
 	REQUIRE(machine.memory.read<uint32_t> (V) == 0x0);
-	// Make page completely unpresented
+	// Make page completely unpresented, which drops it from the caches
 	machine.memory.set_page_attr(V, Page::size(), {.read = false, .write = false, .exec = false});
-	// We can still read from the page, because
-	// it is in the read cache.
-	REQUIRE(machine.memory.read<uint32_t> (V) == 0x0);
-
-	// Invalidate the caches
-	machine.memory.invalidate_reset_cache();
 
 	// We can no longer read from the page
 	REQUIRE_THROWS_WITH([&] {
@@ -377,4 +371,53 @@ TEST_CASE("Discarding an enormous range only visits existing pages", "[Memory]")
 	machine.memory.memdiscard(B, HUGE, true);
 	REQUIRE(machine.memory.read<uint8_t>(A) == 0x41);
 	REQUIRE(machine.memory.read<uint8_t>(B) == 0x00);
+}
+
+TEST_CASE("Setting attributes on an enormous range only visits existing pages", "[Memory]")
+{
+	static constexpr uint64_t MEMORY_MAX = 8ul << 20; /* 8MB */
+	static constexpr uint64_t B = 0x40000000;
+	static constexpr uint64_t A = 0x80000000;
+	static constexpr uint64_t HUGE = 1ull << 46;
+	static constexpr PageAttributes RO {.read = true, .write = false};
+
+	Machine<RISCV64> machine { empty, { .memory_max = MEMORY_MAX } };
+	machine.memory.set_page_attr(A, Page::size(), RO);
+	machine.memory.set_page_attr(B, Page::size(), RO);
+	REQUIRE_THROWS(machine.memory.write<uint8_t>(A, 1));
+	REQUIRE_THROWS(machine.memory.write<uint8_t>(B, 1));
+	const size_t before = machine.memory.pages_active();
+
+	// A guest can mmap() a range this large, which must not be walked page by page
+	auto timed = [&] (uint64_t dst, uint64_t len) {
+		const auto t0 = std::chrono::steady_clock::now();
+		machine.memory.set_page_attr(dst, len, {});
+		return std::chrono::duration<double, std::milli>(
+			std::chrono::steady_clock::now() - t0).count();
+	};
+	REQUIRE(timed(A, HUGE) < 1000.0);
+	REQUIRE(machine.memory.pages_active() == before);
+	// The existing page in the range got the new attributes
+	REQUIRE_NOTHROW(machine.memory.write<uint8_t>(A, 1));
+	REQUIRE(machine.memory.read<uint8_t>(A) == 1);
+	// The page outside the range was left alone
+	REQUIRE_THROWS(machine.memory.write<uint8_t>(B, 1));
+
+	// A range that wraps around the address space reaches the low pages
+	REQUIRE(timed(0xFFFF000000000000ull, 1ull << 62) < 1000.0);
+	REQUIRE_NOTHROW(machine.memory.write<uint8_t>(B, 1));
+	REQUIRE(machine.memory.read<uint8_t>(B) == 1);
+}
+
+TEST_CASE("Page attributes on a range that wraps around", "[Memory]")
+{
+	static constexpr PageAttributes RO {.read = true, .write = false};
+	Machine<RISCV32> machine { empty, { .use_memory_arena = false } };
+
+	// The last page of the address space, and then the first page
+	const size_t before = machine.memory.pages_active();
+	machine.memory.set_page_attr(0u - Page::size(), 2 * Page::size(), RO);
+	REQUIRE(machine.memory.pages_active() == before + 2);
+	REQUIRE(machine.memory.get_page(0u - Page::size()).attr.write == false);
+	REQUIRE(machine.memory.get_page(0).attr.write == false);
 }
