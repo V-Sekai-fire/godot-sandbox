@@ -1,0 +1,48 @@
+name: Error path benchmark
+
+on:
+  push:
+    branches: [dev/error-path-macros]
+    paths: [src/sandbox_fail.h, tests/bench_error_path/**, .github/workflows/bench_error_path.yml]
+  pull_request:
+    paths: [src/sandbox_fail.h, tests/bench_error_path/**, .github/workflows/bench_error_path.yml]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: tests/bench_error_path
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build
+        run: |
+          CXX=clang++
+          command -v clang++ >/dev/null || CXX=g++
+          echo "compiler: $CXX"
+          $CXX -O2 -std=c++20 -fexceptions    -c exc.cpp   -o exc.o
+          $CXX -O2 -std=c++20 -fno-exceptions -DSB_VARIANT=0 -c macro.cpp -o m0.o
+          $CXX -O2 -std=c++20 -fno-exceptions -DSB_VARIANT=1 -c macro.cpp -o m1.o
+          $CXX -O2 -std=c++20 -fexceptions    -c main.cpp  -o main.o
+          $CXX main.o exc.o m0.o m1.o -o bench
+      - name: Run
+        run: ./bench 100000 > results_ci.csv
+      - name: Score
+        env:
+          NOFAULT_TOL: "1.25"
+          MIN_OK: "6"
+          SLACK_NS: "3"
+        run: |
+          cp results_ci.csv results.csv
+          python3 frontier.py | tee score.txt
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: bench-${{ matrix.os }}
+          path: tests/bench_error_path/*.csv
