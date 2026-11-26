@@ -1,0 +1,48 @@
+name: nix
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: write
+  packages: write
+  actions: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ github.sha }}
+          restore-prefixes-first-match: |
+            nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
+            nix-${{ runner.os }}-
+          gc-max-store-size-linux: 6G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
+      - run: nix flake check --no-build
+      - run: nix build .#addon -L --out-link addon
+      - if: github.event_name == 'push'
+        uses: oras-project/setup-oras@v1
+      - if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="v0.0.0-$(date -u -d @"$(git show -s --format=%ct)" +%Y%m%d%H%M%S)-${GITHUB_SHA:0:12}"
+          mkdir out
+          cp -rL addon/addons out/
+          (cd out && zip -qr ../godot-sandbox-addon.zip addons)
+          cp out/addons/godot_sandbox/bin/libgodot_riscv.* .
+          sha256sum libgodot_riscv.* godot-sandbox-addon.zip > SHA256SUMS
+          echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          digest=$(cd out && oras push "ghcr.io/v-sekai-fire/godot-sandbox:$tag" \
+            --artifact-type application/vnd.v-sekai.godot-sandbox.addon \
+            addons ../SHA256SUMS --format go-template='{{.digest}}')
+          gh release create "$tag" libgodot_riscv.* godot-sandbox-addon.zip SHA256SUMS \
+            --target "$GITHUB_SHA" --title "$tag" \
+            --notes "Built by nix build .#addon. ORAS: ghcr.io/v-sekai-fire/godot-sandbox@$digest"
