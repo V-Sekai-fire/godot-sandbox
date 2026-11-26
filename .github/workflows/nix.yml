@@ -3,13 +3,40 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
   packages: write
   actions: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  build:
+  breaker:
     runs-on: ubuntu-24.04
+    outputs:
+      closed: ${{ steps.breaker.outputs.closed }}
+    steps:
+      - id: breaker
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          failed=$(gh run list -R "$GITHUB_REPOSITORY" --workflow nix.yml \
+            --branch "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" --status completed --limit 20 \
+            --json conclusion --jq '[.[]|select(.conclusion=="success" or .conclusion=="failure")][0:3]
+              |map(select(.conclusion=="failure"))|length')
+          if [ "$failed" -ge 3 ] && [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+            echo closed=false >> "$GITHUB_OUTPUT"
+            echo "Circuit open: the last 3 builds on this branch failed. Run nix by hand after a fix." >> "$GITHUB_STEP_SUMMARY"
+            gh run cancel "$GITHUB_RUN_ID" -R "$GITHUB_REPOSITORY"
+          else
+            echo closed=true >> "$GITHUB_OUTPUT"
+          fi
+  build:
+    needs: breaker
+    if: needs.breaker.outputs.closed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
@@ -29,20 +56,15 @@ jobs:
       - if: github.event_name == 'push'
         uses: oras-project/setup-oras@v1
       - if: github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           tag="v0.0.0-$(date -u -d @"$(git show -s --format=%ct)" +%Y%m%d%H%M%S)-${GITHUB_SHA:0:12}"
           mkdir out
           cp -rL addon/addons out/
-          (cd out && zip -qr ../godot-sandbox-addon.zip addons)
-          cp out/addons/godot_sandbox/bin/libgodot_riscv.* .
-          sha256sum libgodot_riscv.* godot-sandbox-addon.zip > SHA256SUMS
+          cd out
+          find addons -type f | sort | xargs sha256sum > SHA256SUMS
           echo "${{ github.token }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
-          digest=$(cd out && oras push "ghcr.io/v-sekai-fire/godot-sandbox:$tag" \
+          digest=$(oras push "ghcr.io/v-sekai-fire/godot-sandbox:$tag" \
             --artifact-type application/vnd.v-sekai.godot-sandbox.addon \
-            addons ../SHA256SUMS --format go-template='{{.digest}}')
-          gh release create "$tag" libgodot_riscv.* godot-sandbox-addon.zip SHA256SUMS \
-            --target "$GITHUB_SHA" --title "$tag" \
-            --notes "Built by nix build .#addon. ORAS: ghcr.io/v-sekai-fire/godot-sandbox@$digest"
+            addons SHA256SUMS --format go-template='{{.digest}}')
+          echo "oras pull ghcr.io/v-sekai-fire/godot-sandbox@$digest ($tag)" >> "$GITHUB_STEP_SUMMARY"

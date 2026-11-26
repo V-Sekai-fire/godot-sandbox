@@ -8,6 +8,9 @@ on:
     paths: [src/sandbox_fail.h, tests/bench_error_path/**, .github/workflows/bench_error_path.yml]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   bench:
     strategy:
